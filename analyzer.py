@@ -2482,6 +2482,7 @@ def compute_matrix_coalescence_metrics(
     roi_box_px: Optional[Tuple[int, int, int, int]] = None,
     pixel_to_um_ratio: float = 1.0,
     contact_dilation_px: int = 3,
+    bubble_mask: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict]:
     """
     Quantify partial coalescence of matrix fat globules through a contact network (RAG).
@@ -2501,6 +2502,9 @@ def compute_matrix_coalescence_metrics(
             whose centroid falls inside the box are analysed.
         pixel_to_um_ratio: Spatial calibration in micrometers per pixel (um/px).
         contact_dilation_px: Maximum mask gap (pixels) still counted as physical contact.
+        bubble_mask: Optional binary/labeled air-bubble mask. Any globule whose centroid
+            falls inside a bubble is adsorbed fat and is excluded from the matrix network,
+            regardless of its (possibly stale) phase_class.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict]:
@@ -2622,6 +2626,23 @@ def compute_matrix_coalescence_metrics(
         cy = _finite_or_none(row.get("centroid_y"))
         if cx is None or cy is None:
             continue
+
+        # Hard geometric guard: a globule whose centroid lies INSIDE an air bubble is
+        # adsorbed fat and must never enter the matrix coalescence network, even if its
+        # phase_class became stale through manual edits or delayed Streamlit state.
+        if isinstance(bubble_mask, np.ndarray) and bubble_mask.size > 0:
+            bubble_2d = bubble_mask.squeeze() if bubble_mask.ndim == 3 else bubble_mask
+            if bubble_2d.ndim > 2:
+                bubble_2d = bubble_2d[..., 0]
+            iy_check = int(round(cy))
+            ix_check = int(round(cx))
+            if (
+                0 <= iy_check < bubble_2d.shape[0]
+                and 0 <= ix_check < bubble_2d.shape[1]
+                and bubble_2d[iy_check, ix_check] > 0
+            ):
+                continue
+
         area_um2 = _safe_float(row.get("area_um2"), 0.0)
         diameter_um = _finite_or_none(row.get("diameter_um"))
         if diameter_um is None or diameter_um <= 0:

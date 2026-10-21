@@ -994,6 +994,24 @@ def render_selected_bubbles_inspection_overlay(
                 thickness=font_thickness, lineType=cv2.LINE_AA,
             )
 
+    # Large bubble ID labels exactly at each bubble-mask centroid (drawn on top)
+    for b_id, b_mask in bubble_masks.items():
+        ys_b, xs_b = np.nonzero(b_mask)
+        if len(xs_b) > 0:
+            cx, cy = int(xs_b.mean()), int(ys_b.mean())
+            text = str(b_id)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            tx = int(np.clip(cx - tw // 2, 1, max(1, shape[1] - tw - 2)))
+            ty = int(np.clip(cy + th // 2, th + 1, shape[0] - 2))
+            cv2.putText(
+                rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 0, 0), 3, cv2.LINE_AA,
+            )
+            cv2.putText(
+                rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 2, cv2.LINE_AA,
+            )
+
     return rgb
 
 

@@ -19,6 +19,7 @@ import tifffile
 import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.ndimage import find_objects
 
 # Internal application modules
 from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan
@@ -223,6 +224,138 @@ def get_local_images(directory: str = "images") -> list:
         dir_path.mkdir(parents=True, exist_ok=True)
     supported_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
     return sorted([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in supported_exts])
+
+
+def _rasterize_manual_air_bubbles(
+    manual_items: Optional[list],
+    shape: Tuple[int, int],
+    phase_overrides: Optional[dict] = None,
+) -> np.ndarray:
+    """Rasterize manual objects classified as air bubbles into a boolean canvas."""
+    canvas = np.zeros(shape[:2], dtype=np.uint8)
+    if not manual_items:
+        return canvas.astype(bool)
+    overrides = phase_overrides or {}
+    for item in manual_items:
+        if not isinstance(item, dict):
+            continue
+        obj_id = item.get("id")
+        phase = str(
+            overrides.get(obj_id, item.get("assigned_class", "air_bubbles"))
+        ).lower()
+        if phase != "air_bubbles":
+            continue
+        polygon = item.get("polygon")
+        points = polygon.get("points") if isinstance(polygon, dict) else None
+        if points is None:
+            continue
+        try:
+            pts = np.asarray(points, dtype=np.float32)
+        except (TypeError, ValueError):
+            continue
+        if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+            continue
+        cv2.fillPoly(canvas, [np.round(pts[:, :2]).astype(np.int32)], 1)
+    return canvas.astype(bool)
+
+
+def _remove_nested_matryoshka_masks(
+    df_in: pd.DataFrame,
+    mask_arr: Optional[np.ndarray],
+    prior_occupied: Optional[np.ndarray] = None,
+    overlap_thresh: float = 0.50,
+) -> Tuple[pd.DataFrame, Optional[np.ndarray], np.ndarray]:
+    """Remove nested duplicate detections ("matryoshka" masks).
+
+    Auto objects (id < 10000) are processed from the largest to the smallest. For each
+    object the hole-filled external contour is compared with the canvas already occupied
+    by accepted bigger objects; if at least ``overlap_thresh`` of the filled footprint
+    lies inside that canvas, the object is discarded. Manual objects (id >= 10000) are
+    always preserved.
+
+    Args:
+        df_in: Metrics DataFrame with 'id' and 'area_um2'/'diameter_um'.
+        mask_arr: Optional labeled mask aligned with ``prior_occupied``.
+        prior_occupied: Optional boolean canvas of already accepted regions (e.g. manual
+            air bubbles) that should suppress auto detections lying inside them.
+        overlap_thresh: Rejection threshold on the filled-footprint overlap fraction.
+
+    Returns:
+        Tuple[pd.DataFrame, Optional[np.ndarray], np.ndarray]: cleaned DataFrame, cleaned
+        mask (rejected ids zeroed) and the updated occupied canvas.
+    """
+    if mask_arr is None:
+        occupied = (
+            prior_occupied.astype(bool, copy=True)
+            if prior_occupied is not None
+            else np.zeros((0, 0), dtype=bool)
+        )
+        return df_in, mask_arr, occupied
+
+    mask_2d = mask_arr.squeeze() if mask_arr.ndim == 3 else mask_arr
+    if not np.issubdtype(mask_2d.dtype, np.integer):
+        mask_2d = mask_2d.astype(np.int32)
+
+    if prior_occupied is not None and prior_occupied.shape[:2] == mask_2d.shape[:2]:
+        occupied = prior_occupied.astype(bool, copy=True)
+    else:
+        occupied = np.zeros(mask_2d.shape[:2], dtype=bool)
+
+    if df_in is None or df_in.empty:
+        return df_in, mask_arr, occupied
+
+    sort_col = "area_um2" if "area_um2" in df_in.columns else "diameter_um"
+    auto_df = df_in[df_in["id"] < 10000].sort_values(by=sort_col, ascending=False)
+    if auto_df.empty:
+        return df_in, mask_arr, occupied
+
+    try:
+        label_slices = find_objects(mask_2d)
+    except Exception:
+        label_slices = None
+
+    valid_auto_ids: set = set()
+    for _, row in auto_df.iterrows():
+        obj_id = int(row["id"])
+        sl = None
+        if label_slices is not None and 0 < obj_id <= len(label_slices):
+            sl = label_slices[obj_id - 1]
+        if sl is None:
+            full_mask = mask_2d == obj_id
+            if not np.any(full_mask):
+                continue
+            ys, xs = np.nonzero(full_mask)
+            sl = (
+                slice(int(ys.min()), int(ys.max()) + 1),
+                slice(int(xs.min()), int(xs.max()) + 1),
+            )
+
+        local = (mask_2d[sl] == obj_id).astype(np.uint8)
+        if not np.any(local):
+            continue
+        filled = np.zeros(local.shape, dtype=np.uint8)
+        contours, _ = cv2.findContours(local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+        filled_bool = filled.astype(bool)
+        filled_area = float(np.count_nonzero(filled_bool))
+        if filled_area <= 0:
+            continue
+
+        overlap_fraction = (
+            float(np.count_nonzero(filled_bool & occupied[sl])) / filled_area
+        )
+        if overlap_fraction >= float(overlap_thresh):
+            continue
+
+        valid_auto_ids.add(obj_id)
+        occupied[sl] |= filled_bool
+
+    manual_ids = set(df_in.loc[df_in["id"] >= 10000, "id"].tolist())
+    valid_ids = valid_auto_ids | manual_ids
+    df_out = df_in[df_in["id"].isin(valid_ids)].copy().reset_index(drop=True)
+    mask_out = np.where(np.isin(mask_2d, list(valid_ids)), mask_2d, 0)
+    return df_out, mask_out, occupied
 
 
 # ---------------- SIDEBAR CONFIGURATION ----------------
@@ -824,6 +957,11 @@ else:
     confirmed_air_ids = set()
     manual_air_ids = set()
     combined_bubble_mask = np.zeros(analysis_img.shape[:2], dtype=bool)
+    manual_air_canvas = _rasterize_manual_air_bubbles(
+        saved_manual_items,
+        analysis_img.shape[:2],
+        st.session_state.get("manual_phase_overrides", {}),
+    )
 
     def compute_cumulative_bubble_mask(auto_air_layer: Optional[np.ndarray]) -> np.ndarray:
         """
@@ -897,6 +1035,26 @@ else:
                 _air_df_pass = pd.DataFrame()
         else:
             _air_df_pass = pd.DataFrame()
+
+        # Pass 1 cleanup: no air bubble may live inside a bigger air bubble/manual bubble
+        (
+            _air_df_pass,
+            air_masks,
+            _air_occupied,
+        ) = _remove_nested_matryoshka_masks(
+            _air_df_pass,
+            air_masks,
+            prior_occupied=manual_air_canvas,
+            overlap_thresh=0.50,
+        )
+        masks = air_masks
+        confirmed_air_ids = (
+            set(
+                _air_df_pass[~_air_df_pass["id"].isin(active_excl)]["id"].tolist()
+            )
+            if not _air_df_pass.empty
+            else set()
+        )
         combined_bubble_mask = compute_cumulative_bubble_mask(air_masks)
     elif _is_two_pass:
         # ── Two-Pass: air first, fat second ──────────────────────────────────
@@ -929,6 +1087,25 @@ else:
             confirmed_air_ids = set(_air_df_pass[~_air_df_pass["id"].isin(active_excl)]["id"].tolist())
         else:
             _air_df_pass = pd.DataFrame()
+
+        # Pass 1 cleanup: air_masks and _air_df_pass must contain no nested bubbles
+        (
+            _air_df_pass,
+            air_masks,
+            _air_occupied,
+        ) = _remove_nested_matryoshka_masks(
+            _air_df_pass,
+            air_masks,
+            prior_occupied=manual_air_canvas,
+            overlap_thresh=0.50,
+        )
+        confirmed_air_ids = (
+            set(
+                _air_df_pass[~_air_df_pass["id"].isin(active_excl)]["id"].tolist()
+            )
+            if not _air_df_pass.empty
+            else set()
+        )
 
         # Build cumulative bubble mask (Rule 1): combines automated air_masks > 0 and ALL manual air_bubbles
         combined_bubble_mask = compute_cumulative_bubble_mask(air_masks)
@@ -994,6 +1171,123 @@ else:
         mask=masks,
         pixel_to_um_ratio=pixel_to_um_ratio,
     )
+
+    # 3b. Reject nested "matryoshka" double detections (small objects inside bigger ones).
+    #     The occupied canvas stores hole-filled footprints, so a smaller detection sitting
+    #     inside the hole of a donut-shaped parent is correctly flagged as an artifact.
+    if not raw_df.empty and masks is not None and np.any(masks > 0):
+        auto_df = raw_df[raw_df["id"] < 10000].sort_values(
+            by="area_um2", ascending=False
+        )
+        valid_auto_ids = []
+        occupied_canvas = np.zeros(masks.shape, dtype=bool)
+        masks_int = (
+            masks
+            if np.issubdtype(masks.dtype, np.integer)
+            else masks.astype(np.int32)
+        )
+        label_slices = None
+        try:
+            label_slices = find_objects(masks_int)
+        except Exception:
+            label_slices = None
+
+        for _, row in auto_df.iterrows():
+            obj_id = int(row["id"])
+            sl = None
+            if label_slices is not None and 0 < obj_id <= len(label_slices):
+                sl = label_slices[obj_id - 1]
+            if sl is None:
+                obj_mask_full = masks_int == obj_id
+                if not np.any(obj_mask_full):
+                    continue
+                ys, xs = np.nonzero(obj_mask_full)
+                sl = (
+                    slice(int(ys.min()), int(ys.max()) + 1),
+                    slice(int(xs.min()), int(xs.max()) + 1),
+                )
+            obj_mask = masks_int[sl] == obj_id
+            obj_area = float(np.count_nonzero(obj_mask))
+            if obj_area <= 0:
+                continue
+            overlap_area = float(np.count_nonzero(obj_mask & occupied_canvas[sl]))
+            # If the object lies more than 60% inside an already accepted bigger object,
+            # it is a "matryoshka" detection artifact and is skipped.
+            if overlap_area / obj_area < 0.60:
+                valid_auto_ids.append(obj_id)
+                filled = np.zeros(obj_mask.shape, dtype=np.uint8)
+                contours, _ = cv2.findContours(
+                    obj_mask.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                if contours:
+                    cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+                occupied_canvas[sl] |= filled.astype(bool)
+
+        # Keep valid auto objects and all manual objects (id >= 10000)
+        valid_all_ids = set(valid_auto_ids) | set(
+            raw_df[raw_df["id"] >= 10000]["id"].tolist()
+        )
+        if valid_all_ids:
+            raw_df = (
+                raw_df[raw_df["id"].isin(valid_all_ids)]
+                .copy()
+                .reset_index(drop=True)
+            )
+            # Clean the mask itself from rejected artifacts
+            masks = np.where(np.isin(masks, list(valid_all_ids)), masks, 0)
+
+    # 3c. Two-Pass safety net: Pass 2 (fat detector) must never recreate air bubbles.
+    #     Any auto Pass-2 object larger than max_fat_size that overlaps the cumulative
+    #     bubble mask by >=35% of its own area is a duplicate of the bubble floor.
+    if (
+        _is_two_pass
+        and not raw_df.empty
+        and masks is not None
+        and np.any(combined_bubble_mask)
+    ):
+        bubble_binary = combined_bubble_mask.astype(bool)
+        pass2_rejected_ids = set()
+        masks_int = (
+            masks if np.issubdtype(masks.dtype, np.integer) else masks.astype(np.int32)
+        )
+        try:
+            pass2_slices = find_objects(masks_int)
+        except Exception:
+            pass2_slices = None
+
+        for _, row in raw_df[raw_df["id"] < 10000].iterrows():
+            if float(row.get("diameter_um", 0.0)) <= float(max_fat_size):
+                continue
+            obj_id = int(row["id"])
+            sl = None
+            if pass2_slices is not None and 0 < obj_id <= len(pass2_slices):
+                sl = pass2_slices[obj_id - 1]
+            if sl is None:
+                full_mask = masks_int == obj_id
+                if not np.any(full_mask):
+                    continue
+                ys, xs = np.nonzero(full_mask)
+                sl = (
+                    slice(int(ys.min()), int(ys.max()) + 1),
+                    slice(int(xs.min()), int(xs.max()) + 1),
+                )
+            local = masks_int[sl] == obj_id
+            local_area = float(np.count_nonzero(local))
+            if local_area <= 0:
+                continue
+            overlap_area = float(np.count_nonzero(local & bubble_binary[sl]))
+            if overlap_area / local_area >= 0.35:
+                pass2_rejected_ids.add(obj_id)
+
+        if pass2_rejected_ids:
+            raw_df = (
+                raw_df[~raw_df["id"].isin(pass2_rejected_ids)]
+                .copy()
+                .reset_index(drop=True)
+            )
+            masks = np.where(np.isin(masks, list(pass2_rejected_ids)), 0, masks)
 
     # Re-synchronize manual objects with current spatial calibration
     saved_manual_items = st.session_state.get(manual_items_key, [])
@@ -1186,16 +1480,19 @@ else:
             classified_df["phase_class"] = pd.Series(dtype=str)
 
     elif _is_two_pass:
-        # Two-Pass: classify second-pass objects using full size boundaries, then combine with air pass
+        # Two-Pass: Pass 2 detects fat only — it may NEVER create 'air_bubbles'.
+        # All air bubbles come from Pass 1 (_air_df_pass); Pass-2 objects outside the
+        # fat size range are labelled 'Unclassified' (or fat if the user chose that).
         if not filtered_df.empty:
-            fat_classified = classify_by_size(
-                filtered_df,
-                min_air_size=min_air_size,
-                max_air_size=max_air_size,
-                min_fat_size=min_fat_size,
-                max_fat_size=max_fat_size,
-                overlap_priority=overlap_priority,
-                out_of_range_class=out_of_range_handling,
+            in_fat_size_pass2 = (
+                (filtered_df["diameter_um"] >= float(min_fat_size))
+                & (filtered_df["diameter_um"] <= float(max_fat_size))
+            )
+            oor = str(out_of_range_handling).lower()
+            oor_label = "fat_particles" if "fat" in oor else "Unclassified"
+            fat_classified = filtered_df.copy()
+            fat_classified["phase_class"] = np.where(
+                in_fat_size_pass2, "fat_particles", oor_label
             )
         else:
             fat_classified = filtered_df.copy()
@@ -1306,6 +1603,102 @@ else:
             )
 
         classified_df["is_partial_in_bubble"] = classified_df["phase_class"].astype(str).str.lower().eq("adsorbed_fat")
+
+    # Final air-bubble deduplication: drop smaller air bubbles that sit inside bigger ones
+    # (auto Pass 1, Pass 2 leftovers and manual bubbles; overlap >= 45% of filled area).
+    if not classified_df.empty and "phase_class" in classified_df.columns:
+        air_bubble_rows = classified_df[
+            classified_df["phase_class"].astype(str).str.lower() == "air_bubbles"
+        ].sort_values(by="area_um2", ascending=False)
+        if len(air_bubble_rows) > 1:
+            analysis_shape = analysis_img.shape[:2]
+            manual_poly_lookup = {}
+            for polygon in st.session_state.get("manual_polygons_list", []) or []:
+                if not isinstance(polygon, dict):
+                    continue
+                try:
+                    poly_id = int(polygon.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                pts = polygon.get("points")
+                if pts is None:
+                    continue
+                try:
+                    pts_arr = np.asarray(pts, dtype=np.float32)
+                except (TypeError, ValueError):
+                    continue
+                if pts_arr.ndim == 2 and pts_arr.shape[0] >= 3:
+                    manual_poly_lookup[poly_id] = pts_arr[:, :2]
+
+            def _bubble_binary_mask(bubble_id: int) -> Optional[np.ndarray]:
+                if bubble_id >= 10000:
+                    poly_pts = manual_poly_lookup.get(int(bubble_id))
+                    if poly_pts is None:
+                        return None
+                    canvas = np.zeros(analysis_shape, dtype=np.uint8)
+                    cv2.fillPoly(canvas, [np.round(poly_pts).astype(np.int32)], 1)
+                    return canvas
+                if filtered_air_masks is not None:
+                    air_mask = filtered_air_masks == bubble_id
+                    if np.any(air_mask):
+                        return air_mask.astype(np.uint8)
+                if filtered_masks is not None:
+                    fat_mask = filtered_masks == bubble_id
+                    if np.any(fat_mask):
+                        return fat_mask.astype(np.uint8)
+                return None
+
+            occupied_air = np.zeros(analysis_shape, dtype=bool)
+            rejected_air_ids = set()
+            for _, air_row in air_bubble_rows.iterrows():
+                air_id = int(air_row["id"])
+                air_mask = _bubble_binary_mask(air_id)
+                if air_mask is None:
+                    continue
+                filled_air = np.zeros(analysis_shape, dtype=np.uint8)
+                air_contours, _ = cv2.findContours(
+                    air_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                if air_contours:
+                    cv2.drawContours(
+                        filled_air, air_contours, -1, 1, thickness=cv2.FILLED
+                    )
+                filled_bool = filled_air.astype(bool)
+                filled_area = float(np.count_nonzero(filled_bool))
+                if filled_area <= 0:
+                    continue
+                overlap_fraction = (
+                    float(np.count_nonzero(filled_bool & occupied_air)) / filled_area
+                )
+                if overlap_fraction >= 0.45:
+                    rejected_air_ids.add(air_id)
+                else:
+                    occupied_air |= filled_bool
+
+            if rejected_air_ids:
+                classified_df = (
+                    classified_df[~classified_df["id"].isin(rejected_air_ids)]
+                    .copy()
+                    .reset_index(drop=True)
+                )
+                if filtered_masks is not None:
+                    filtered_masks = np.where(
+                        np.isin(filtered_masks, list(rejected_air_ids)),
+                        0,
+                        filtered_masks,
+                    )
+                if filtered_air_masks is not None:
+                    filtered_air_masks = np.where(
+                        np.isin(filtered_air_masks, list(rejected_air_ids)),
+                        0,
+                        filtered_air_masks,
+                    )
+                confirmed_air_ids = set(confirmed_air_ids) - rejected_air_ids
+                manual_air_ids = set(manual_air_ids) - rejected_air_ids
+                if not _air_df_pass.empty:
+                    _air_df_pass = _air_df_pass[
+                        ~_air_df_pass["id"].isin(rejected_air_ids)
+                    ].copy()
 
     # High-level statistics
     total_objects = len(classified_df)
@@ -2669,6 +3062,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             ),
                             use_container_width=True,
                         )
+                        buf_insp = io.BytesIO()
+                        Image.fromarray(inspection_img).save(buf_insp, format="PNG")
+                        st.download_button(
+                            "📥 Download Inspection Overlay (PNG)",
+                            data=buf_insp.getvalue(),
+                            file_name=f"Selected_Bubble_Inspection_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                        )
 
                         st.markdown("#### 🔍 Single Bubble Crop Inspector")
                         inspect_options = per_bubble_df["Bubble ID"].astype(int).tolist()
@@ -2717,8 +3119,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                 x0 = max(0, center_x - half_side)
                                 x1 = min(full_w, center_x + half_side)
                                 if y1 > y0 and x1 > x0:
+                                    crop_img = inspection_img[y0:y1, x0:x1]
                                     st.image(
-                                        inspection_img[y0:y1, x0:x1],
+                                        crop_img,
                                         caption=f"Bubble #{inspect_id} — close-up",
                                         use_container_width=True,
                                     )
@@ -2728,6 +3131,27 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                         f"θ = {_safe_ui_float(inspect_row.get('Mean Contact Angle θ (°)')):.1f}° · "
                                         f"Adsorbed globules: {int(_safe_ui_float(inspect_row.get('Adsorbed Count')))}"
                                     )
+                                    buf_crop = io.BytesIO()
+                                    Image.fromarray(crop_img).save(buf_crop, format="PNG")
+                                    c1, c2 = st.columns(2)
+                                    with c1:
+                                        st.download_button(
+                                            f"📥 Download Crop #{inspect_id} (PNG)",
+                                            data=buf_crop.getvalue(),
+                                            file_name=f"Bubble_Crop_{inspect_id}_{clean_stem}.png",
+                                            mime="image/png",
+                                            use_container_width=True,
+                                        )
+                                    with c2:
+                                        st.download_button(
+                                            f"📥 Download Data #{inspect_id} (CSV)",
+                                            data=pd.DataFrame([inspect_row])
+                                            .to_csv(index=False)
+                                            .encode("utf-8"),
+                                            file_name=f"Bubble_Data_{inspect_id}_{clean_stem}.csv",
+                                            mime="text/csv",
+                                            use_container_width=True,
+                                        )
 
                     with col_data:
                         st.markdown("#### 📋 Per-Bubble Interfacial Metrics")
@@ -2773,6 +3197,17 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             ax_theta.grid(alpha=0.25)
                             fig_theta.tight_layout()
                             st.pyplot(fig_theta, use_container_width=True)
+                            buf_theta = io.BytesIO()
+                            fig_theta.savefig(
+                                buf_theta, format="png", dpi=300, bbox_inches="tight"
+                            )
+                            st.download_button(
+                                "📥 Download Contact Angle Plot (PNG)",
+                                data=buf_theta.getvalue(),
+                                file_name=f"Contact_Angle_Distribution_{clean_stem}.png",
+                                mime="image/png",
+                                use_container_width=True,
+                            )
                             plt.close(fig_theta)
 
                         st.markdown("#### 🟡 Adsorbed Globule Detail")
@@ -2854,6 +3289,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 roi_box_px=roi_box_px,
                 pixel_to_um_ratio=float(pixel_to_um_ratio),
                 contact_dilation_px=int(contact_tol_px),
+                bubble_mask=combined_bubble_mask,
             )
 
             kpi_1, kpi_2, kpi_3, kpi_4, kpi_5 = st.columns(5)
@@ -2958,10 +3394,26 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             float((z_series >= 3).sum()) / total_z * 100.0,
                         ],
                     })
-                    st.bar_chart(
-                        z_share_df.set_index("Coordination (Z)"),
-                        height=230,
+                    fig_z, ax_z = plt.subplots(figsize=(6, 3), dpi=130)
+                    ax_z.bar(
+                        z_share_df["Coordination (Z)"],
+                        z_share_df["Share of Globules (%)"],
+                        color="#4c78a8",
                     )
+                    ax_z.set_ylabel("Share of Globules (%)")
+                    ax_z.set_title("Coordination Number Distribution")
+                    fig_z.tight_layout()
+                    st.pyplot(fig_z, use_container_width=True)
+                    buf_z = io.BytesIO()
+                    fig_z.savefig(buf_z, format="png", dpi=300, bbox_inches="tight")
+                    st.download_button(
+                        "📥 Download Z-Distribution Plot (PNG)",
+                        data=buf_z.getvalue(),
+                        file_name=f"Coordination_Number_Distribution_{clean_stem}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+                    plt.close(fig_z)
                     st.caption(
                         f"{int(z_series.size)} matrix globules analysed · "
                         f"{len(coalescence_edges)} contact bridges"
@@ -3030,8 +3482,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Air Bubbles Min Circularity": float(air_min_circularity),
             "Matrix Fat Min Circularity": float(fat_min_circularity),
             "Adsorbed Fat Min Circularity": float(ads_min_circularity),
-            "Excluded Particle IDs (Table Selected)": sorted(list(st.session_state.get("interactive_excluded_ids", set()))),
-            "Total Excluded IDs": sorted(list(active_excluded_ids)) if active_excluded_ids else "None",
             "Manual Phase Overrides": st.session_state.get("manual_phase_overrides", {}),
             "Show Air Bubbles": bool(show_air),
             "Show Fat Particles": bool(show_fat),
@@ -3052,12 +3502,36 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Unclassified Count": unclass_count,
         }
 
+        # Генерація гарно відформатованого тексту для експорту
+        manifest_text = "PhasePix Analysis Session Manifest\n"
+        manifest_text += "=" * 40 + "\n\n"
+        for key, value in session_meta.items():
+            # Якщо значення є списком або словником, робимо відступи для читабельності
+            if isinstance(value, (list, dict)):
+                manifest_text += f"{key}:\n"
+                if isinstance(value, list):
+                    for item in value:
+                        manifest_text += f"  - {item}\n"
+                else:  # dict
+                    for k, v in value.items():
+                        manifest_text += f"  - {k}: {v}\n"
+            else:
+                manifest_text += f"{key}: {value}\n"
+
         col_meta, col_dl = st.columns([2, 1])
         with col_meta:
             st.json(session_meta)
 
         with col_dl:
             st.markdown("#### Export Session Data")
+            st.download_button(
+                label="📥 Download Manifest (.txt)",
+                data=manifest_text.encode("utf-8"),
+                file_name=f"phasepix_session_manifest_{clean_stem}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                help="Download session parameters as a formatted text file.",
+            )
             if not classified_df.empty:
                 csv_bytes = classified_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
