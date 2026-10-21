@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Streamlit
+.streamlit/
+
+# Models and large cache
+models_cache/
+*.onnx
+*.pth
+*.pt
+
+# Temporary & scratch files
+scratch/
+Phasepix_code.txt
+
+# OS specific
+.DS_Store
