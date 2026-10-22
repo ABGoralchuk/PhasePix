@@ -558,13 +558,8 @@ with st.sidebar:
         # Internal defaults for hidden air bubble settings
         min_air_size = 10.0
         max_air_size = 100.0
-        overlap_priority = "Fat Particles"
-        out_of_range_handling = st.selectbox(
-            "Out-of-Range Particle Handling",
-            options=["Unclassified", "Fat Particles"],
-            index=0,
-            help="Classification for objects outside the Min/Max Fat size range.",
-        )
+        overlap_priority = "Air Bubbles"
+        out_of_range_handling = "Unclassified"
         st.caption(f"🟧 Fat: [{min_fat_size:.1f}, {max_fat_size:.1f}] µm")
 
     elif sample_type == "Foam":
@@ -597,12 +592,7 @@ with st.sidebar:
         min_fat_size = 0.20
         max_fat_size = 5.0
         overlap_priority = "Air Bubbles"
-        out_of_range_handling = st.selectbox(
-            "Out-of-Range Particle Handling",
-            options=["Unclassified", "Air Bubbles"],
-            index=0,
-            help="Classification for objects outside the Min/Max Air size range.",
-        )
+        out_of_range_handling = "Unclassified"
         st.caption(f"🟦 Air: [{min_air_size:.1f}, {max_air_size:.1f}] µm")
 
     else:
@@ -665,22 +655,8 @@ with st.sidebar:
                 help="Maximum equivalent diameter in micrometers for fat particles.",
             ))
 
-        col_res1, col_res2 = st.columns(2)
-        with col_res1:
-            overlap_priority = st.selectbox(
-                "Overlap Priority",
-                options=["Air Bubbles", "Fat Particles"],
-                index=0,
-                help="Determines priority when a particle's size satisfies both Air and Fat ranges.",
-            )
-        with col_res2:
-            out_of_range_handling = st.selectbox(
-                "Out-of-Range Particle Handling",
-                options=["Unclassified", "Fat Particles", "Air Bubbles"],
-                index=0,  # always defaults to Unclassified
-                help="Classification assigned to particles outside either specified range. "
-                     "Default: Unclassified — objects outside [Min, Max] are never mis-colored.",
-            )
+        overlap_priority = "Air Bubbles"
+        out_of_range_handling = "Unclassified"
 
         st.caption(
             f"🟦 Air: [{min_air_size:.1f}, {max_air_size:.1f}] µm | "
@@ -3131,6 +3107,36 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                         f"θ = {_safe_ui_float(inspect_row.get('Mean Contact Angle θ (°)')):.1f}° · "
                                         f"Adsorbed globules: {int(_safe_ui_float(inspect_row.get('Adsorbed Count')))}"
                                     )
+
+                                    # Фільтруємо адсорбовані частинки тільки для поточної бульбашки
+                                    inspect_particles = ads_particles_df[
+                                        pd.to_numeric(
+                                            ads_particles_df.get(
+                                                "parent_bubble_id", pd.Series(dtype=float)
+                                            ),
+                                            errors="coerce",
+                                        )
+                                        == inspect_id
+                                    ].copy()
+
+                                    st.markdown(
+                                        f"##### 🟡 Adsorbed Globules on Bubble #{inspect_id}"
+                                    )
+                                    st.dataframe(
+                                        inspect_particles,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=200,
+                                    )
+
+                                    # Формуємо комплексний CSV-протокол (Summary + Detail)
+                                    protocol_csv = "BUBBLE SUMMARY\n"
+                                    protocol_csv += pd.DataFrame([inspect_row]).to_csv(
+                                        index=False
+                                    )
+                                    protocol_csv += "\nADSORBED GLOBULES DETAIL\n"
+                                    protocol_csv += inspect_particles.to_csv(index=False)
+
                                     buf_crop = io.BytesIO()
                                     Image.fromarray(crop_img).save(buf_crop, format="PNG")
                                     c1, c2 = st.columns(2)
@@ -3144,13 +3150,12 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                         )
                                     with c2:
                                         st.download_button(
-                                            f"📥 Download Data #{inspect_id} (CSV)",
-                                            data=pd.DataFrame([inspect_row])
-                                            .to_csv(index=False)
-                                            .encode("utf-8"),
-                                            file_name=f"Bubble_Data_{inspect_id}_{clean_stem}.csv",
+                                            f"📥 Download Protocol #{inspect_id} (CSV)",
+                                            data=protocol_csv.encode("utf-8"),
+                                            file_name=f"Bubble_Protocol_{inspect_id}_{clean_stem}.csv",
                                             mime="text/csv",
                                             use_container_width=True,
+                                            help="Download a complete protocol containing bubble summary and specific globule data.",
                                         )
 
                     with col_data:

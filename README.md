@@ -47,6 +47,8 @@ PhasePix/
 ├── analyzer.py                  # Morphological, photometric & D[3,2]/D[4,3] feature extraction
 ├── app.py                       # Streamlit web application & UI dashboard
 ├── cellpose_model.py            # Cellpose inference wrapper with MPS / CPU handling
+├── install_python.txt           # Windows setup commands and dependency guide
+├── phasepix.bat                 # Quick launch script for Windows
 ├── phasepix_run.command         # Quick launch script for macOS Finder
 ├── Phasepix_code.txt            # Complete single-file code snapshot of the PhasePix codebase
 ├── requirements.txt             # Pinned project dependencies
@@ -59,6 +61,24 @@ PhasePix/
 
 ## Installation & Setup
 
+### Windows
+Follow the quick commands provided in [install_python.txt](install_python.txt):
+1. Install Python 3.11:
+   ```cmd
+   winget install -e --id Python.Python.3.11
+   ```
+2. Create & activate environment:
+   ```cmd
+   python -m venv .venv
+   .venv\Scripts\activate.bat
+   ```
+3. Install dependencies:
+   ```cmd
+   pip install -r requirements.txt
+   ```
+   *(For NVIDIA GPU acceleration: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121` prior to requirements)*
+
+### macOS / Linux
 1. **Clone or navigate to the project directory**:
    ```bash
    cd /path/to/PhasePix
@@ -79,17 +99,24 @@ PhasePix/
 
 ## Running the Application
 
-### Option 1: Quick Launch (macOS)
-Double-click the **`phasepix_run.command`** file in Finder, or run:
-```bash
-./phasepix_run.command
-```
+### Option 1: Quick Launch
+- **Windows**: Double-click the **`phasepix.bat`** file.
+- **macOS**: Double-click the **`phasepix_run.command`** file in Finder, or execute:
+  ```bash
+  ./phasepix_run.command
+  ```
 
 ### Option 2: Manual Terminal Launch
-```bash
-source .venv/bin/activate
-streamlit run app.py
-```
+- **Windows**:
+  ```cmd
+  .venv\Scripts\activate.bat
+  streamlit run app.py
+  ```
+- **macOS / Linux**:
+  ```bash
+  source .venv/bin/activate
+  streamlit run app.py
+  ```
 
 The application will automatically open in your default browser at `http://localhost:8501`.
 
