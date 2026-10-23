@@ -905,6 +905,7 @@ def parse_canvas_manual_objects_from_raster(
     start_id: int = 10001,
     min_area_px: float = 25.0,
     auto_snap_mode: Optional[Union[str, bool]] = "🧲 Smart Spline & Edge Snap (Irregular Shapes)",
+    invert_brightfield: bool = False,
     **kwargs,
 ) -> Tuple[list[dict], list[dict]]:
     """
@@ -920,6 +921,8 @@ def parse_canvas_manual_objects_from_raster(
         start_id: Starting integer ID for manual objects (defaults to 10001).
         min_area_px: Ignore tiny contour noise below this area (canvas pixels).
         auto_snap_mode: Selected refinement mode string or bool.
+        invert_brightfield: Brightfield-light-mode flag (accepted for API parity with
+            ``parse_canvas_manual_objects``; the raster fallback performs no AI inference).
 
     Returns:
         Tuple[list[dict], list[dict]]: (metrics_list, polygons_list)
@@ -1085,6 +1088,7 @@ def ai_segment_bubble_from_points(
     image_2d: np.ndarray,
     cellpose_model: Optional[Any] = None,
     num_spline_points: int = 140,
+    invert_brightfield: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Locally segment an air bubble/pore from user points using Local Normal Snapping,
@@ -1096,6 +1100,9 @@ def ai_segment_bubble_from_points(
         image_2d: 2D grayscale SEM micrograph array.
         cellpose_model: Optional initialized CellposeModel instance.
         num_spline_points: Number of points on output smooth regularized contour (default: 140).
+        invert_brightfield: When True (brightfield light microscopy), only the inverted
+            ROI polarity is tested — the physically correct one for dark-rim droplets —
+            which avoids a redundant second Cellpose pass.
 
     Returns:
         np.ndarray: (num_spline_points, 2) float32 coordinates of the refined contour, or None.
@@ -1207,7 +1214,10 @@ def ai_segment_bubble_from_points(
                 bub_diam = max(float(np.ptp(all_x)), float(np.ptp(all_y)))
                 cx_roi = int(round(float(center[0]) - x1_roi))
                 cy_roi = int(round(float(center[1]) - y1_roi))
-                for test_img in (roi_clahe, roi_inv):
+                # Brightfield droplets: the inverted polarity is the physically correct
+                # one, so skip the wrong polarity entirely in Light mode.
+                test_images = [roi_inv] if invert_brightfield else [roi_clahe, roi_inv]
+                for test_img in test_images:
                     m_res = run_inference(
                         model=cellpose_model,
                         image=test_img,
@@ -1298,6 +1308,7 @@ def segment_box_to_smooth_contour(
     target_phase: str = "air_bubbles",
     cellpose_model: Optional[Any] = None,
     num_points: int = 160,
+    invert_brightfield: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Convert a user-drawn bounding box ("Smart Box") into a smooth closed contour.
@@ -1316,6 +1327,8 @@ def segment_box_to_smooth_contour(
         target_phase: Phase hint forwarded to the segmenter (default: "air_bubbles").
         cellpose_model: Optional preloaded CellposeModel used by the fallback path.
         num_points: Number of output contour vertices (default: 160).
+        invert_brightfield: Forwarded to ``predict_interactive_box_mask``; when True the
+            fallback tests only the inverted ROI polarity (brightfield dark-rim droplets).
 
     Returns:
         Optional[np.ndarray]: (num_points, 2) float32 closed contour, or None when the
@@ -1364,6 +1377,7 @@ def segment_box_to_smooth_contour(
             box_xyxy=(x1, y1, x2, y2),
             target_phase=str(target_phase or "air_bubbles"),
             cellpose_model=cellpose_model,
+            invert_brightfield=bool(invert_brightfield),
         )
     except Exception:
         mask = None
@@ -1422,6 +1436,7 @@ def parse_canvas_manual_objects(
     drawing_mode_label: Optional[str] = None,
     max_air_size_um: Optional[float] = None,
     auto_snap_mode: Optional[Union[str, bool]] = None,
+    invert_brightfield: bool = False,
     **kwargs,
 ) -> Tuple[list[dict], list[dict]]:
     """
@@ -1454,6 +1469,9 @@ def parse_canvas_manual_objects(
         drawing_mode_label: Optional backward-compatible drawing mode string.
         max_air_size_um: Optional maximum air bubble size in um for bounding ray searches.
         auto_snap_mode: Optional backward-compatible snap mode.
+        invert_brightfield: True for brightfield light microscopy; forwarded down the AI
+            chain so only the inverted ROI polarity is evaluated (faster + more accurate
+            for dark-rim droplets).
 
     Returns:
         Tuple[list[dict], list[dict]]: (metrics_list, polygons_list)
@@ -1556,6 +1574,7 @@ def parse_canvas_manual_objects(
                 image_2d=img_2d,
                 cellpose_model=cellpose_model,
                 num_spline_points=140,
+                invert_brightfield=bool(invert_brightfield),
             )
             if refined_contour is not None and len(refined_contour) >= 3:
                 _commit_contour(refined_contour, "ai_bubble")
@@ -1618,6 +1637,7 @@ def parse_canvas_manual_objects(
                 image_2d=img_2d,
                 cellpose_model=cellpose_model,
                 num_spline_points=140,
+                invert_brightfield=bool(invert_brightfield),
             )
             if refined_contour is not None and len(refined_contour) >= 3:
                 _commit_contour(refined_contour, "ai_bubble")
@@ -1721,6 +1741,7 @@ def parse_canvas_manual_objects(
                         target_phase=str(target_phase or "air_bubbles"),
                         cellpose_model=cellpose_model,
                         num_points=160,
+                        invert_brightfield=bool(invert_brightfield),
                     )
                     if box_contour is not None and len(box_contour) >= 3:
                         _commit_contour(box_contour, "smart_box")
@@ -1731,6 +1752,7 @@ def parse_canvas_manual_objects(
             original_image=img_2d,
             pixel_to_um_ratio=pixel_to_um_ratio,
             start_id=start_id,
+            invert_brightfield=bool(invert_brightfield),
         )
         if raster_metrics:
             return raster_metrics, raster_polys

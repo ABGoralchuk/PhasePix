@@ -22,7 +22,7 @@ import seaborn as sns
 from scipy.ndimage import find_objects
 
 # Internal application modules
-from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan
+from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale
 from analyzer import (
     extract_metrics,
     calculate_granulometry_metrics,
@@ -38,6 +38,7 @@ from analyzer import (
 from visualizer import (
     classify_by_size,
     plot_single_phase_distribution,
+    compute_phase_histogram_table,
     PALETTE_COLORS,
     apply_footer_dimming,
     create_mask_overlay,
@@ -66,6 +67,88 @@ if not getattr(_image_utils, "_phasepix_patched", False):
 from streamlit_drawable_canvas import st_canvas
 
 
+# ---------------- LIGHT MICROSCOPY CALIBRATION PRESETS ----------------
+# Laboratory-validated objective coefficients for transmitted-light micrographs.
+# Stored values: um_per_px (physical size of one pixel) and the reference
+# stage-micrometer / scale-bar geometry used to derive it.
+DEFAULT_LIGHT_OBJECTIVES = {
+    "10x Objective": {"um_per_px": 0.72098, "scale_bar_um": 10.0, "scale_bar_px": 13.87},
+    "10x + 1.6x Objective": {"um_per_px": 0.45998, "scale_bar_um": 10.0, "scale_bar_px": 21.74},
+    "20x Objective": {"um_per_px": 0.35348, "scale_bar_um": 10.0, "scale_bar_px": 28.29},
+    "20x + 1.6x Objective": {"um_per_px": 0.22989, "scale_bar_um": 10.0, "scale_bar_px": 43.50},
+    "40x Objective": {"um_per_px": 0.17915, "scale_bar_um": 10.0, "scale_bar_px": 55.82},
+    "40x + 1.6x Objective": {"um_per_px": 0.11662, "scale_bar_um": 10.0, "scale_bar_px": 85.75},
+    "63x Objective": {"um_per_px": 0.11424, "scale_bar_um": 10.0, "scale_bar_px": 87.54},
+    "63x + 1.6x Objective": {"um_per_px": 0.07420, "scale_bar_um": 10.0, "scale_bar_px": 134.77},
+    "100x Objective": {"um_per_px": 0.07149, "scale_bar_um": 10.0, "scale_bar_px": 139.87},
+    "100x + 1.6x Objective": {"um_per_px": 0.04667, "scale_bar_um": 10.0, "scale_bar_px": 214.28},
+    "Custom Calibration": {"um_per_px": 0.200, "scale_bar_um": 10.0, "scale_bar_px": 50.0},
+}
+
+LIGHT_PRESETS_FILE = "light_calibration_presets.json"
+# Resolve relative to the application root so presets survive any working directory.
+LIGHT_PRESETS_PATH = Path(__file__).resolve().parent / LIGHT_PRESETS_FILE
+
+
+def load_light_presets() -> dict:
+    """
+    Load light-microscopy objective presets from ``light_calibration_presets.json``.
+
+    Defaults are always available; any user-saved / edited entries found in the
+    JSON file override their built-in counterparts. Malformed entries or a
+    corrupted file fall back silently to the built-in defaults so the UI never
+    breaks during a session.
+
+    Returns:
+        dict: Mapping ``objective name -> {"um_per_px", "scale_bar_um", "scale_bar_px"}``.
+    """
+    presets = {name: dict(values) for name, values in DEFAULT_LIGHT_OBJECTIVES.items()}
+
+    try:
+        if LIGHT_PRESETS_PATH.exists():
+            with open(LIGHT_PRESETS_PATH, "r", encoding="utf-8") as fh:
+                stored = json.load(fh)
+            if isinstance(stored, dict):
+                for name, values in stored.items():
+                    if not isinstance(values, dict):
+                        continue
+                    try:
+                        um_per_px = float(values.get("um_per_px"))
+                        scale_bar_um = float(values.get("scale_bar_um", 10.0))
+                        scale_bar_px = float(values.get("scale_bar_px", 10.0 / um_per_px))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        continue
+                    if um_per_px <= 0 or scale_bar_um <= 0 or scale_bar_px <= 0:
+                        continue
+                    presets[str(name)] = {
+                        "um_per_px": um_per_px,
+                        "scale_bar_um": scale_bar_um,
+                        "scale_bar_px": scale_bar_px,
+                    }
+    except (OSError, json.JSONDecodeError):
+        # Corrupted / unreadable file: keep the in-memory defaults.
+        pass
+
+    if "Custom Calibration" not in presets:
+        presets["Custom Calibration"] = dict(DEFAULT_LIGHT_OBJECTIVES["Custom Calibration"])
+
+    return presets
+
+
+def save_light_presets(presets: dict) -> None:
+    """
+    Persist light-microscopy objective presets to ``light_calibration_presets.json``.
+
+    Args:
+        presets: Mapping ``objective name -> {"um_per_px", "scale_bar_um", "scale_bar_px"}``.
+
+    Raises:
+        OSError: If the JSON file cannot be written (caller surfaces the message in the UI).
+    """
+    with open(LIGHT_PRESETS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(presets, fh, indent=2, ensure_ascii=False)
+
+
 def calculate_canvas_line_length(line_obj: dict) -> float:
     """Calculate Euclidean length of a line object from Fabric.js canvas JSON."""
     scale_x = float(line_obj.get("scaleX", 1.0))
@@ -81,7 +164,7 @@ def calculate_canvas_line_length(line_obj: dict) -> float:
 
 # Configure page layout and aesthetics
 st.set_page_config(
-    page_title="PhasePix - SEM Phase Analyzer",
+    page_title="PhasePix - Quantitative Microstructure & Colloid Analyzer",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -226,6 +309,39 @@ def get_local_images(directory: str = "images") -> list:
     return sorted([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in supported_exts])
 
 
+IMAGE_ROOT_DIR = Path("images")
+SEM_IMAGE_DIR = IMAGE_ROOT_DIR / "sem"
+LIGHT_IMAGE_DIR = IMAGE_ROOT_DIR / "light"
+
+
+def ensure_modality_image_folders() -> None:
+    """Create images/, images/sem/ and images/light/ automatically on startup."""
+    for _dir in (IMAGE_ROOT_DIR, SEM_IMAGE_DIR, LIGHT_IMAGE_DIR):
+        _dir.mkdir(parents=True, exist_ok=True)
+
+
+def get_modality_images(is_light_mode: bool) -> Tuple[list, str, bool]:
+    """
+    Return the image list for the active imaging modality.
+
+    Light Microscopy reads ``images/light/`` and SEM reads ``images/sem/``. If the
+    modality folder is empty, files directly under ``images/`` are listed instead
+    so existing projects keep working.
+
+    Args:
+        is_light_mode: Whether the sidebar modality switch is set to Light Microscopy.
+
+    Returns:
+        Tuple[list, str, bool]: (image_paths, primary_folder, used_legacy_fallback)
+    """
+    ensure_modality_image_folders()
+    primary_dir = LIGHT_IMAGE_DIR if is_light_mode else SEM_IMAGE_DIR
+    modality_files = get_local_images(str(primary_dir))
+    if modality_files:
+        return modality_files, str(primary_dir), False
+    return get_local_images(str(IMAGE_ROOT_DIR)), str(primary_dir), True
+
+
 def _rasterize_manual_air_bubbles(
     manual_items: Optional[list],
     shape: Tuple[int, int],
@@ -361,7 +477,7 @@ def _remove_nested_matryoshka_masks(
 # ---------------- SIDEBAR CONFIGURATION ----------------
 with st.sidebar:
     st.title("🔬 PhasePix Controls")
-    st.markdown("Automated SEM microstructural segmentation and phase quantification.")
+    st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
 
     # Hardware Acceleration Status
     device, is_gpu = get_device()
@@ -374,8 +490,31 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("0. Imaging Modality")
+    imaging_mode = st.radio(
+        "Microscopy Mode",
+        options=["🔬 SEM Micrograph", "💡 Light Microscopy"],
+        index=0,
+        horizontal=True,
+        key="imaging_modality_radio",
+        help=(
+            "**SEM Micrograph** — electron micrographs with an embedded databar / scale bar.  \n"
+            "**Light Microscopy** — transmitted-light images (e.g. emulsion fat droplets) "
+            "calibrated from a stored objective preset instead of the SEM scale bar."
+        ),
+    )
+    is_light_mode = (imaging_mode == "💡 Light Microscopy")
+
+    st.divider()
+
     st.subheader("1. Image Input")
-    available_images = get_local_images("images")
+    available_images, images_primary_dir, images_used_fallback = get_modality_images(is_light_mode)
+    _folder_hint = "light micrographs" if is_light_mode else "SEM micrographs"
+    st.caption(f"📁 Folder: {images_primary_dir}/ (drop {_folder_hint} here)")
+    if images_used_fallback and available_images:
+        st.caption(
+            f"↳ `{images_primary_dir}/` is empty — listing images from `images/` (legacy folder)."
+        )
 
     input_source = st.radio(
         "Source Method",
@@ -392,16 +531,20 @@ with st.sidebar:
                 f"Choose File ({len(available_images)} found)",
                 options=available_images,
                 format_func=lambda p: p.name,
-                help="Automatically lists all micrographs located in the local 'images/' directory.",
+                help=f"Automatically lists all micrographs located in the '{images_primary_dir}/' directory.",
             )
             if selected_path:
                 image_bytes = selected_path.read_bytes()
                 image_name = selected_path.name
         else:
-            st.warning("The 'images/' folder is currently empty. Drop your SEM images into 'images/'.")
-            if st.button("Generate Demo Sample in 'images/'", use_container_width=True):
+            st.warning(
+                f"No images found in `{images_primary_dir}/` or `images/`. "
+                "Drop your micrographs there to begin."
+            )
+            if st.button(f"Generate Demo Sample in '{images_primary_dir}/'", use_container_width=True):
                 demo_bytes = create_sample_sem_image()
-                Path("images/demo_sem_sample.png").write_bytes(demo_bytes)
+                Path(images_primary_dir).mkdir(parents=True, exist_ok=True)
+                (Path(images_primary_dir) / "demo_sem_sample.png").write_bytes(demo_bytes)
                 st.rerun()
     else:
         uploaded_file = st.file_uploader(
@@ -419,117 +562,311 @@ with st.sidebar:
     st.divider()
 
     st.subheader("2. Footer Panel Exclusion")
-    footer_height = int(
-        st.number_input(
-            "Footer Height (pixels)",
-            min_value=0,
-            value=70,
-            step=5,
-            help=(
-                "Height in pixels of the bottom SEM information panel. "
-                "Also used to locate the scale bar in the upper half of the banner."
-            ),
-            key="footer_height_input",
+    if is_light_mode:
+        # Light micrographs have no SEM databar — keep the panel collapsed and
+        # default the crop to 0 px so the full frame is analysed.
+        with st.expander("Optional Banner Crop (Light Mode)", expanded=False):
+            footer_height = int(
+                st.number_input(
+                    "Footer Height (pixels)",
+                    min_value=0,
+                    value=0,
+                    step=5,
+                    help=(
+                        "Optional: crop a bottom banner from the light micrograph. "
+                        "Leave at 0 for standard microscope camera images."
+                    ),
+                    key="light_footer_height_input",
+                )
+            )
+    else:
+        footer_height = int(
+            st.number_input(
+                "Footer Height (pixels)",
+                min_value=0,
+                value=70,
+                step=5,
+                help=(
+                    "Height in pixels of the bottom SEM information panel. "
+                    "Also used to locate the scale bar in the upper half of the banner."
+                ),
+                key="footer_height_input",
+            )
         )
-    )
 
     st.divider()
 
     st.subheader("3. Spatial Calibration")
 
-    # Detect scale bar in UPPER-RIGHT banner only (avoids table separator line)
-    detected_bar_pixels = 0
-    scale_preview = None
-    if image_bytes is not None:
-        try:
-            probe_img = decode_image_bytes(image_bytes)
-            detected_bar_pixels, scale_preview, _ = detect_scale_bar(
-                probe_img, footer_height=max(10, int(footer_height) or 70)
-            )
-        except Exception:
-            detected_bar_pixels = 0
-            scale_preview = None
+    # Objective preset chosen in Light Microscopy mode (None while in SEM mode)
+    selected_objective: Optional[str] = None
 
-    # Auto-fill Real Scale Bar Size (µm) from filename patterns like _5um_ / _200um_
-    filename_scale_um = extract_scale_um_from_filename(image_name)
-    default_scale_um = float(filename_scale_um) if filename_scale_um > 0 else 200.0
-
-    # Reset widget defaults when the active image changes
-    if st.session_state.get("calib_image_name") != image_name:
-        st.session_state["calib_image_name"] = image_name
-        st.session_state["scale_bar_um_input"] = default_scale_um
-        st.session_state["scale_bar_length_px_input"] = (
-            float(detected_bar_pixels) if detected_bar_pixels > 0 else 200.0
-        )
-
-    if "scale_bar_um_input" not in st.session_state:
-        st.session_state["scale_bar_um_input"] = default_scale_um
-    if "scale_bar_length_px_input" not in st.session_state:
-        st.session_state["scale_bar_length_px_input"] = (
-            float(detected_bar_pixels) if detected_bar_pixels > 0 else 200.0
-        )
-
-    if detected_bar_pixels > 0:
-        st.success(f"Detected scale bar: **{detected_bar_pixels} pixels**", icon="📏")
-    elif image_bytes is not None:
-        st.caption("No prominent scale bar line detected in bottom-right region.")
-
-    if filename_scale_um > 0:
-        st.caption(f"Filename scale hint: **{filename_scale_um:g} µm** parsed from `{image_name}`")
-
-    if scale_preview is not None and detected_bar_pixels > 0:
-        st.image(
-            scale_preview,
-            caption=f"Detected scale-bar line preview ({detected_bar_pixels} px)",
-            use_container_width=True,
-        )
-
-    scale_bar_um = st.number_input(
-        "Real Scale Bar Size (µm)",
-        min_value=0.1,
-        max_value=5000.0,
-        step=0.5,
-        help="Physical length corresponding to the scale bar marked on the SEM micrograph. Auto-filled from filename when possible (e.g. _5um_).",
-        key="scale_bar_um_input",
-    )
-
-    scale_bar_length_px = st.number_input(
-        "Scale Bar Length (pixels)",
-        min_value=1.0,
-        max_value=20000.0,
-        step=1.0,
-        help="Detected (or manually corrected) length of the scale bar line in pixels.",
-        key="scale_bar_length_px_input",
-    )
-
-    # Calibration: pixel_to_um_ratio = scale_bar_um / scale_bar_length_px
-    if float(scale_bar_length_px) > 0 and float(scale_bar_um) > 0:
-        pixel_to_um_ratio = float(scale_bar_um) / float(scale_bar_length_px)
-        pixels_per_um = float(scale_bar_length_px) / float(scale_bar_um)
-        use_auto_scale = detected_bar_pixels > 0 and abs(
-            float(scale_bar_length_px) - float(detected_bar_pixels)
-        ) < 0.5
-        st.info(
-            f"Active Scale: **{pixels_per_um:.3f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)  \n"
-            f"`pixel_to_um_ratio = {float(scale_bar_um):g} / {float(scale_bar_length_px):g}`"
-        )
-    else:
+    if is_light_mode:
+        # ── Light Microscopy: objective-preset calibration ───────────────────
+        # Light micrographs carry no SEM databar/scale-bar line, therefore
+        # detect_scale_bar() is never invoked in this mode.
+        detected_bar_pixels = 0
+        scale_preview = None
         use_auto_scale = False
-        pixels_per_um = 5.0
-        pixel_to_um_ratio = 1.0 / pixels_per_um
-        st.warning("Enter valid Real Scale Bar Size (µm) and Scale Bar Length (pixels).")
+
+        light_presets = load_light_presets()
+        preset_names = list(light_presets.keys())
+        _default_objective = "40x Objective"
+        _default_objective_idx = (
+            preset_names.index(_default_objective) if _default_objective in preset_names else 0
+        )
+
+        selected_objective = st.selectbox(
+            "Microscope Objective Preset",
+            options=preset_names,
+            index=_default_objective_idx,
+            key="light_objective_preset",
+            help=(
+                "Laboratory-validated objective calibration (µm per pixel). "
+                "Pick 'Custom Calibration' for an arbitrary coefficient."
+            ),
+        )
+
+        _active_preset = light_presets.get(
+            selected_objective, DEFAULT_LIGHT_OBJECTIVES["Custom Calibration"]
+        )
+        _preset_um_per_px = float(_active_preset.get("um_per_px", 0.2))
+        _preset_bar_um = float(_active_preset.get("scale_bar_um", 10.0))
+        _preset_bar_px = float(_active_preset.get("scale_bar_px", 50.0))
+
+        # Widget state for keys that disappear from the layout (e.g. after
+        # switching to SEM mode and back) is discarded by Streamlit, therefore
+        # both the objective change AND missing keys are handled here.
+        calib_input_style = st.radio(
+            "Calibration Input Method",
+            ["Direct Ratio (µm/px)", "Known Scale (µm / pixels)"],
+            horizontal=True,
+            key="light_calib_input_style",
+        )
+
+        _objective_changed = st.session_state.get("light_preset_tracker") != selected_objective
+        if _objective_changed:
+            st.session_state["light_preset_tracker"] = selected_objective
+            st.session_state["light_um_per_px_input"] = _preset_um_per_px
+            st.session_state["light_scale_bar_um_input"] = _preset_bar_um
+            st.session_state["light_scale_bar_px_input"] = _preset_bar_px
+
+        if calib_input_style == "Direct Ratio (µm/px)":
+            if "light_um_per_px_input" not in st.session_state:
+                st.session_state["light_um_per_px_input"] = _preset_um_per_px
+            pixel_to_um_ratio = float(
+                st.number_input(
+                    "Calibration Factor (µm / pixel)",
+                    min_value=0.001,
+                    max_value=100.0,
+                    step=0.001,
+                    format="%.5f",
+                    help="Physical size represented by a single pixel at the selected objective.",
+                    key="light_um_per_px_input",
+                )
+            )
+            pixels_per_um = 1.0 / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 5.0
+            # Manifest compatibility: emulate a nominal 10 µm reference scale bar
+            scale_bar_um = 10.0
+            scale_bar_length_px = (
+                scale_bar_um / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 50.0
+            )
+        else:
+            if "light_scale_bar_um_input" not in st.session_state:
+                st.session_state["light_scale_bar_um_input"] = _preset_bar_um
+            if "light_scale_bar_px_input" not in st.session_state:
+                st.session_state["light_scale_bar_px_input"] = _preset_bar_px
+            scale_bar_um = float(
+                st.number_input(
+                    "Real Stage Micrometer / Scale Size (µm)",
+                    min_value=0.1,
+                    max_value=5000.0,
+                    step=0.5,
+                    help="Known physical length of the stage micrometer division or embedded scale bar.",
+                    key="light_scale_bar_um_input",
+                )
+            )
+            scale_bar_length_px = float(
+                st.number_input(
+                    "Measured Length (pixels)",
+                    min_value=1.0,
+                    max_value=20000.0,
+                    step=1.0,
+                    help="Length of that same reference distance measured in pixels.",
+                    key="light_scale_bar_px_input",
+                )
+            )
+            if scale_bar_length_px > 0 and scale_bar_um > 0:
+                pixel_to_um_ratio = float(scale_bar_um) / float(scale_bar_length_px)
+                pixels_per_um = float(scale_bar_length_px) / float(scale_bar_um)
+            else:
+                pixel_to_um_ratio = 1.0 / 5.0
+                pixels_per_um = 5.0
+                st.warning("Enter valid reference size (µm) and measured length (pixels).")
+
+        st.info(
+            f"Active Scale: **{pixels_per_um:.3f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)"
+        )
+
+        if st.button(
+            "💾 Save Current Value to Objective Preset",
+            use_container_width=True,
+            key="light_save_preset_btn",
+        ):
+            light_presets[selected_objective] = {
+                "um_per_px": float(pixel_to_um_ratio),
+                "scale_bar_um": float(scale_bar_um),
+                "scale_bar_px": float(scale_bar_length_px),
+            }
+            try:
+                save_light_presets(light_presets)
+                st.success(
+                    f"Saved **{selected_objective}** → "
+                    f"{float(pixel_to_um_ratio):.5f} µm/px "
+                    f"({pixels_per_um:.3f} px/µm → `{LIGHT_PRESETS_FILE}`)",
+                    icon="💾",
+                )
+                st.toast(f"Preset saved: {selected_objective}", icon="💾")
+            except OSError as exc:
+                st.error(f"Could not write `{LIGHT_PRESETS_FILE}`: {exc}")
+
+    else:
+        # ── SEM Mode: unchanged automatic scale-bar detection ────────────────
+        # Detect scale bar in UPPER-RIGHT banner only (avoids table separator line)
+        detected_bar_pixels = 0
+        scale_preview = None
+        if image_bytes is not None:
+            try:
+                probe_img = decode_image_bytes(image_bytes)
+                detected_bar_pixels, scale_preview, _ = detect_scale_bar(
+                    probe_img, footer_height=max(10, int(footer_height) or 70)
+                )
+            except Exception:
+                detected_bar_pixels = 0
+                scale_preview = None
+
+        # Auto-fill Real Scale Bar Size (µm) from filename patterns like _5um_ / _200um_
+        filename_scale_um = extract_scale_um_from_filename(image_name)
+        default_scale_um = float(filename_scale_um) if filename_scale_um > 0 else 200.0
+
+        # Reset widget defaults when the active image changes
+        if st.session_state.get("calib_image_name") != image_name:
+            st.session_state["calib_image_name"] = image_name
+            st.session_state["scale_bar_um_input"] = default_scale_um
+            st.session_state["scale_bar_length_px_input"] = (
+                float(detected_bar_pixels) if detected_bar_pixels > 0 else 200.0
+            )
+
+        if "scale_bar_um_input" not in st.session_state:
+            st.session_state["scale_bar_um_input"] = default_scale_um
+        if "scale_bar_length_px_input" not in st.session_state:
+            st.session_state["scale_bar_length_px_input"] = (
+                float(detected_bar_pixels) if detected_bar_pixels > 0 else 200.0
+            )
+
+        if detected_bar_pixels > 0:
+            st.success(f"Detected scale bar: **{detected_bar_pixels} pixels**", icon="📏")
+        elif image_bytes is not None:
+            st.caption("No prominent scale bar line detected in bottom-right region.")
+
+        if filename_scale_um > 0:
+            st.caption(f"Filename scale hint: **{filename_scale_um:g} µm** parsed from `{image_name}`")
+
+        if scale_preview is not None and detected_bar_pixels > 0:
+            st.image(
+                scale_preview,
+                caption=f"Detected scale-bar line preview ({detected_bar_pixels} px)",
+                use_container_width=True,
+            )
+
+        scale_bar_um = st.number_input(
+            "Real Scale Bar Size (µm)",
+            min_value=0.1,
+            max_value=5000.0,
+            step=0.5,
+            help="Physical length corresponding to the scale bar marked on the SEM micrograph. Auto-filled from filename when possible (e.g. _5um_).",
+            key="scale_bar_um_input",
+        )
+
+        scale_bar_length_px = st.number_input(
+            "Scale Bar Length (pixels)",
+            min_value=1.0,
+            max_value=20000.0,
+            step=1.0,
+            help="Detected (or manually corrected) length of the scale bar line in pixels.",
+            key="scale_bar_length_px_input",
+        )
+
+        # Calibration: pixel_to_um_ratio = scale_bar_um / scale_bar_length_px
+        if float(scale_bar_length_px) > 0 and float(scale_bar_um) > 0:
+            pixel_to_um_ratio = float(scale_bar_um) / float(scale_bar_length_px)
+            pixels_per_um = float(scale_bar_length_px) / float(scale_bar_um)
+            use_auto_scale = detected_bar_pixels > 0 and abs(
+                float(scale_bar_length_px) - float(detected_bar_pixels)
+            ) < 0.5
+            st.info(
+                f"Active Scale: **{pixels_per_um:.3f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)  \n"
+                f"`pixel_to_um_ratio = {float(scale_bar_um):g} / {float(scale_bar_length_px):g}`"
+            )
+        else:
+            use_auto_scale = False
+            pixels_per_um = 5.0
+            pixel_to_um_ratio = 1.0 / pixels_per_um
+            st.warning("Enter valid Real Scale Bar Size (µm) and Scale Bar Length (pixels).")
 
     st.divider()
 
     st.subheader("4. Phase Classification")
-    sample_type = st.radio(
-        "Sample Type",
-        options=["Emulsion", "Whipped Emulsion", "Foam"],
-        index=1,
-        help="Select 'Emulsion' for single-phase fat droplets, 'Whipped Emulsion' for multi-phase air and fat sorting, or 'Foam' for single-phase air bubbles.",
-    )
 
-    if sample_type == "Emulsion":
+    if is_light_mode:
+        # Phase classification is locked in light mode; the radio is hidden.
+        sample_type = "Emulsion"
+    else:
+        sample_type = st.radio(
+            "Sample Type",
+            options=["Emulsion", "Whipped Emulsion", "Foam"],
+            index=1,
+            help="Select 'Emulsion' for single-phase fat droplets, 'Whipped Emulsion' for multi-phase air and fat sorting, or 'Foam' for single-phase air bubbles.",
+        )
+
+    if is_light_mode:
+        # ── Light Microscopy: phase locked to single-phase Emulsion ──────────
+        detection_focus = None
+        st.info(
+            "🟠 **Light Microscopy Mode: Emulsion (Fat Droplets Analysis)** — "
+            "phase classification is locked to fat droplet sizing.",
+            icon="🔒",
+        )
+        st.markdown("**Fat Particle Size Range (µm):**")
+        col_fat1, col_fat2 = st.columns(2)
+        with col_fat1:
+            min_fat_size = float(st.number_input(
+                "Min Fat Particle Size (µm)",
+                min_value=0.0,
+                max_value=5000.0,
+                value=0.50,
+                step=0.05,
+                help="Minimum equivalent diameter in micrometers for fat droplets.",
+                key="light_min_fat_size_input",
+            ))
+        with col_fat2:
+            max_fat_size = float(st.number_input(
+                "Max Fat Particle Size (µm)",
+                min_value=0.0,
+                max_value=5000.0,
+                value=50.0,
+                step=0.5,
+                help="Maximum equivalent diameter in micrometers for fat droplets.",
+                key="light_max_fat_size_input",
+            ))
+        # Internal defaults for hidden air bubble settings
+        min_air_size = 10.0
+        max_air_size = 100.0
+        overlap_priority = "Air Bubbles"
+        out_of_range_handling = "Unclassified"
+        st.caption(f"🟧 Fat: [{min_fat_size:.2f}, {max_fat_size:.2f}] µm")
+
+    elif sample_type == "Emulsion":
         detection_focus = None  # Not applicable for single-phase Emulsion
         st.info(
             "🟠 **Sample Type: Emulsion** — Objects within Min/Max Fat size become Fat Particles; "
@@ -676,6 +1013,27 @@ with st.sidebar:
     st.divider()
 
     st.subheader("5. Cellpose AI Segmentation")
+
+    # Emulsion optical profile (Light Microscopy only)
+    emulsion_profile = "N/A (SEM Mode)"
+    is_crystallized_mode = False
+    if is_light_mode:
+        emulsion_profile = st.radio(
+            "Emulsion Droplet Profile",
+            options=[
+                "💧 Liquid Fat (Smooth Globules)",
+                "❄️ Crystallized Fat (Textured / Internal Crystals)",
+            ],
+            index=1,
+            help=(
+                "**Liquid Fat:** Standard inference for smooth, homogeneous droplets.\n"
+                "**Crystallized Fat:** Applies edge-preserving smoothing to erase internal crystal lines "
+                "so Cellpose does not split globules into fragments, and enforces stricter convexity (Solidity)."
+            ),
+            key="light_emulsion_profile_radio",
+        )
+        is_crystallized_mode = emulsion_profile.startswith("❄️")
+
     model_type = st.selectbox(
         "Pretrained Model",
         options=["cyto2", "nuclei", "Custom Model File..."],
@@ -712,11 +1070,37 @@ with st.sidebar:
         and detection_focus == "\U0001fae7+\U0001f7e0 Both Air Bubbles & Fat Particles (Two-Pass)"
     )
 
+    expected_droplet_um: Optional[float] = None
+
     if sample_type == "Emulsion":
-        ref_um = float(min_fat_size) * 1.25 if float(min_fat_size) > 0 else 1.0
-        calc_px = ref_um / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 30.0
-        eff_diameter = float(np.clip(calc_px, 18.0, 45.0))
-        st.caption(f"\U0001f3af Auto Cellpose diameter: **{eff_diameter:.1f} px** (fat-optimised)")
+        if is_light_mode:
+            # Physical (µm) target scale — automatically converted to pixels using the
+            # active objective calibration, and no longer capped at 45 px so large
+            # crystallized globules are captured whole instead of split into shards.
+            default_cp_um = 9.0 if is_crystallized_mode else 5.0
+            expected_droplet_um = float(
+                st.slider(
+                    "🎯 Typical Droplet Diameter for AI (µm)",
+                    min_value=1.0,
+                    max_value=40.0,
+                    value=default_cp_um,
+                    step=0.5,
+                    help=(
+                        "Physical diameter (µm) of typical droplets you want AI to focus on. "
+                        "Automatically converted to pixels using your active objective calibration. "
+                        "Set higher (e.g., 8–14 µm) for large crystallized globules so AI captures them whole instead of splitting internal crystal lines."
+                    ),
+                )
+            )
+            eff_diameter = float(np.clip(expected_droplet_um / max(pixel_to_um_ratio, 1e-6), 12.0, 220.0))
+            st.caption(
+                f"🎯 AI Target Scale: **{expected_droplet_um:.1f} µm** → **{eff_diameter:.0f} px** (at {pixels_per_um:.2f} px/µm)"
+            )
+        else:
+            ref_um = float(min_fat_size) * 1.25 if float(min_fat_size) > 0 else 1.0
+            calc_px = ref_um / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 30.0
+            eff_diameter = float(np.clip(calc_px, 18.0, 45.0))
+            st.caption(f"\U0001f3af Auto Cellpose diameter: **{eff_diameter:.1f} px** (fat-optimised)")
     elif sample_type == "Foam" or _whipped_air_only:
         _air_target = float(np.clip(
             math.sqrt(max(float(min_air_size), 0.5) * max(float(max_air_size), 1.0))
@@ -767,25 +1151,81 @@ with st.sidebar:
         help="Cell probability detection threshold. Negative values (e.g. -1.0 to -2.0) drastically increase detection of low-contrast pores and bubbles (default: -1.0).",
     )
 
-    air_min_circularity = st.slider(
-        "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05
-    )
-    fat_min_circularity = st.slider(
-        "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.05
-    )
-    ads_min_circularity = st.slider("🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05)
+    fat_min_solidity = 0.0
+    crystal_smooth_strength = 0
+    enable_multiscale_crystal = False
+
+    if is_light_mode:
+        # Light microscopy (single-phase emulsion): air-bubble / adsorbed-fat
+        # controls are irrelevant, so they stay hidden with safe internal values.
+        air_min_circularity = 0.50
+        ads_min_circularity = 0.30
+        enable_deepscan = False
+        fat_min_circularity = st.slider(
+            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.05
+        )
+        default_solidity = 0.84 if is_crystallized_mode else 0.72
+        fat_min_solidity = float(
+            st.slider(
+                "🛡️ Matrix Fat Min Solidity (Convexity — rejects shards)",
+                min_value=0.50,
+                max_value=0.98,
+                value=default_solidity,
+                step=0.02,
+                help="Ratio of droplet area to its convex hull area. True spherical/oval droplets have Solidity > 0.84; crescent shards and inter-droplet background fragments have low solidity and are rejected.",
+            )
+        )
+        if is_crystallized_mode:
+            crystal_smooth_strength = int(
+                st.slider(
+                    "❄️ Internal Crystal Smoothing Strength",
+                    min_value=0,
+                    max_value=4,
+                    value=3,
+                    help="0 = off. 2–3 smooths out internal crystal needles before AI segmentation so whole globules are detected intact.",
+                )
+            )
+            enable_multiscale_crystal = st.checkbox(
+                "🔍 Multi-Scale Globule Detection (Large + Small Globules)",
+                value=True,
+                help="Runs a coarse AI pass for large crystallized globules (preventing internal splitting) and a fine pass for small globules, merging intact droplets.",
+            )
+        st.caption("ℹ️ Light Microscopy: only fat-droplet circularity/convexity filtering is applied.")
+    else:
+        air_min_circularity = st.slider(
+            "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05
+        )
+        fat_min_circularity = st.slider(
+            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.05
+        )
+        ads_min_circularity = st.slider("🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05)
+        enable_deepscan = st.checkbox(
+            "🔬 Deep-Scan Adsorbed Fat inside Bubbles",
+            value=False,
+            help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
+        )
+        st.caption("ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat.")
+
     min_circularity = fat_min_circularity  # Fallback alias for backward compatibility
 
-    enable_deepscan = st.checkbox(
-        "🔬 Deep-Scan Adsorbed Fat inside Bubbles",
-        value=False,
-        help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
-    )
-    st.caption("ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat.")
+    # Optical preprocessing for transmitted-light (brightfield) micrographs
+    invert_brightfield = False
+    if is_light_mode:
+        invert_brightfield = st.checkbox(
+            "💡 Invert Brightfield (Dark-Rim Droplets)",
+            value=not is_crystallized_mode,
+            help=(
+                "Inverts the image before segmentation. Essential for brightfield light "
+                "microscopy where fat droplets have a dark refraction halo against a bright "
+                "background. This helps Cellpose capture the true outer boundary. "
+                "Crystallized profiles default to OFF because packed globules have bright "
+                "bodies separated by dark borders."
+            ),
+        )
 
     enable_clahe = st.checkbox(
         "Enable CLAHE Preprocessing",
-        value=True,
+        value=not is_light_mode,
         help="Applies Contrast Limited Adaptive Histogram Equalization with OpenCV (clipLimit=2.0, tileGridSize=(8,8)) to boost contrast for faint pores before segmentation.",
     )
 
@@ -808,7 +1248,6 @@ with st.sidebar:
         )
         fat_opacity = 0.0
         z_order = "Air over Fat"
-        show_labels = True
 
     elif sample_type == "Emulsion":
         show_air = False
@@ -825,7 +1264,6 @@ with st.sidebar:
             help="Transparency level for fat particles overlay layer (0.0=fully transparent, 1.0=fully opaque).",
         )
         z_order = "Fat over Air"
-        show_labels = True
 
     else:
         col_vis1, col_vis2, col_vis3 = st.columns(3)
@@ -870,24 +1308,47 @@ with st.sidebar:
             help="Layering priority: 'Fat over Air' renders fat particles on top of air bubbles; 'Air over Fat' renders air bubbles on top.",
         )
 
-        show_labels = st.checkbox(
-            "🔢 Show Particle ID Numbers",
-            value=True,
-            key="show_particle_labels_toggle",
-            help="Uncheck to hide ID numbers and get a clean color-coded phase distribution map for publications/reports.",
-        )
+    # Universal for all sample types (Foam / Emulsion / Whipped Emulsion)
+    show_labels = st.checkbox(
+        "🔢 Show Particle ID Numbers",
+        value=True,
+        key="show_particle_labels_toggle",
+        help="Uncheck to hide ID numbers and get a clean color-coded phase distribution map for publications/reports."
+    )
+
+    st.markdown("**📏 Burn-in Scale Bar (Image Export)**")
+    draw_scale_bar = st.checkbox("Draw Scale Bar on Images", value=False)
+
+    if draw_scale_bar:
+        col_sb1, col_sb2, col_sb3 = st.columns([1.2, 1.2, 1.0])
+        with col_sb1:
+            sb_length = st.number_input("Length (µm)", min_value=0.1, max_value=5000.0, value=10.0, step=1.0)
+        with col_sb2:
+            sb_color = st.selectbox("Color", ["White", "Black", "Yellow", "Red"], index=0)
+        with col_sb3:
+            sb_thick = st.slider("Thickness", min_value=1, max_value=10, value=3)
 
 
 # ---------------- MAIN APPLICATION DISPLAY ----------------
-st.title("PhasePix: Quantitative SEM Microstructure Analyzer")
-st.markdown(
-    "High-throughput segmentation of SEM phases using Cellpose deep learning with instant phase sorting and size distribution."
-)
+if is_light_mode:
+    st.title("PhasePix: Quantitative Light Microscopy Emulsion Analyzer")
+    st.markdown(
+        "Automated brightfield & crystallized fat droplet segmentation, granulometry ($D[3,2], D[4,3]$), and coalescence network analytics."
+    )
+else:
+    st.title("PhasePix: Quantitative SEM Microstructure Analyzer")
+    st.markdown(
+        "High-throughput segmentation of SEM phases using Cellpose deep learning with instant phase sorting and size distribution."
+    )
 
 if image_bytes is None:
     st.info("👆 Please select an image from the 'images/' folder or upload one via the sidebar to begin analysis.")
 else:
     clean_stem = Path(image_name).stem
+
+    # Single-phase Emulsion (incl. Light Microscopy) hides all air-bubble /
+    # adsorbed-fat UI controls, since those phases cannot exist in this mode.
+    is_emulsion_ui = (sample_type == "Emulsion") or is_light_mode
 
     # 1. Decode original full micrograph
     original_img = decode_image_bytes(image_bytes)
@@ -1125,15 +1586,39 @@ else:
     else:
         # ── Standard single-pass (Emulsion) ──────────────────────────────────
         with st.spinner("Executing AI particle segmentation..."):
-            masks = cached_segmentation(
-                image=analysis_img,
-                model_name=model_type,
-                custom_model_path=custom_model_path,
-                diameter=eff_diameter,
-                flow_threshold=float(flow_threshold),
-                cellprob_threshold=float(cellprob_threshold),
-                enable_clahe=enable_clahe,
-            )
+            if is_light_mode and is_crystallized_mode and enable_multiscale_crystal:
+                # Two-scale hierarchical pass: intact large crystallized globules +
+                # small droplets, merged with shard rejection.
+                masks = cached_segment_crystallized_multiscale(
+                    image=analysis_img,
+                    base_diameter_px=eff_diameter,
+                    model_name=model_type,
+                    custom_model_path=custom_model_path,
+                    flow_threshold=float(flow_threshold),
+                    cellprob_threshold=float(cellprob_threshold),
+                    enable_clahe=enable_clahe,
+                    smooth_strength=int(crystal_smooth_strength),
+                    invert_brightfield=bool(invert_brightfield),
+                )
+            else:
+                seg_input = analysis_img.copy()
+                if is_light_mode and is_crystallized_mode and crystal_smooth_strength > 0:
+                    from cellpose_model import smooth_internal_crystals
+                    seg_input = smooth_internal_crystals(
+                        seg_input, strength=int(crystal_smooth_strength)
+                    )
+                if is_light_mode and invert_brightfield:
+                    seg_input = cv2.bitwise_not(seg_input)
+
+                masks = cached_segmentation(
+                    image=seg_input,
+                    model_name=model_type,
+                    custom_model_path=custom_model_path,
+                    diameter=eff_diameter,
+                    flow_threshold=float(flow_threshold),
+                    cellprob_threshold=float(cellprob_threshold),
+                    enable_clahe=enable_clahe,
+                )
         _air_df_pass = pd.DataFrame()
         air_masks = None
         combined_bubble_mask = compute_cumulative_bubble_mask(None)
@@ -1350,10 +1835,21 @@ else:
         )
         partial_ids = set(raw_df.loc[is_partial, "id"].tolist())
 
-        # Outside bubbles: standard shape filtering by circularity threshold
+        # Outside bubbles: standard shape filtering by circularity threshold.
+        # Light Microscopy additionally enforces a convexity (solidity) gate for
+        # fat-range objects, which rejects crescent shards and inter-droplet wedges.
+        if is_light_mode and float(fat_min_solidity) > 0 and "solidity" in raw_df.columns:
+            solidity_ok = np.where(
+                in_fat_size_range,
+                raw_df["solidity"] >= float(fat_min_solidity),
+                True,
+            )
+        else:
+            solidity_ok = True
+
         circ_ok_outside = np.where(
             in_fat_size_range,
-            raw_df["circularity"] >= float(fat_min_circularity),
+            (raw_df["circularity"] >= float(fat_min_circularity)) & solidity_ok,
             np.where(
                 in_air_size_range,
                 raw_df["circularity"] >= float(air_min_circularity),
@@ -1784,8 +2280,39 @@ else:
             ads_particles_df=ads_particles_df_global,
         )
 
+    # Apply burn-in scale bar if requested
+    if draw_scale_bar:
+        try:
+            try:
+                from visualizer import burn_in_scale_bar
+            except ImportError:
+                # A Streamlit server already running before visualizer.py gained this
+                # helper keeps the old module cached in sys.modules; reload it once.
+                import importlib
+                import visualizer as _vis_sb
+                importlib.reload(_vis_sb)
+                burn_in_scale_bar = _vis_sb.burn_in_scale_bar
+
+            base_display_img = burn_in_scale_bar(
+                image=base_display_img,
+                length_um=float(sb_length),
+                pixels_per_um=float(pixels_per_um),
+                color_name=sb_color,
+                thickness=int(sb_thick),
+                footer_height=effective_footer
+            )
+            overlay = burn_in_scale_bar(
+                image=overlay,
+                length_um=float(sb_length),
+                pixels_per_um=float(pixels_per_um),
+                color_name=sb_color,
+                thickness=int(sb_thick),
+                footer_height=effective_footer
+            )
+        except Exception as e:
+            st.warning(f"Could not draw scale bar: {e}")
+
     # Summary KPI Metric cards
-    # Mean Diameter only for Emulsion (fat phase) / Foam (air phase) — never for Whipped Emulsion
     def _phase_mean_diameter(phase_key: str) -> float:
         if classified_df.empty:
             return 0.0
@@ -1801,51 +2328,64 @@ else:
         avg_diam = 0.0
 
     show_adsorbed_card = (adsorbed_fat_count > 0)
-    metric_cols = 3 + (1 if unclass_count > 0 else 0) + (1 if show_mean_diam else 0) + (1 if show_adsorbed_card else 0)
+
+    # Dynamic column counting (Drop Air Bubbles card for Emulsion entirely)
+    base_cols = 2 if sample_type in ("Emulsion", "Foam") else 3
+    metric_cols = base_cols + (1 if unclass_count > 0 else 0) + (1 if show_mean_diam else 0) + (1 if show_adsorbed_card else 0)
     cols = st.columns(metric_cols)
-    cols[0].metric("Total Objects", f"{total_objects:,}")
+
+    c_idx = 0
+    cols[c_idx].metric("Total Objects", f"{total_objects:,}")
+    c_idx += 1
+
     if sample_type == "Emulsion":
-        cols[1].metric("Air Bubbles", "0", "Disabled (Emulsion)")
-        cols[2].metric(
-            "Fat Particles",
+        fat_label = "Fat Droplets" if ('is_light_mode' in locals() and is_light_mode) else "Fat Particles"
+        cols[c_idx].metric(
+            fat_label,
             f"{fat_count:,}",
             f"{(fat_count / max(total_objects, 1) * 100):.1f}%",
         )
+        c_idx += 1
     elif sample_type == "Foam":
-        cols[1].metric(
+        cols[c_idx].metric(
             "Air Bubbles",
             f"{air_count:,}",
             f"{(air_count / max(total_objects, 1) * 100):.1f}%",
         )
-        cols[2].metric("Fat Particles", "0", "Disabled (Foam)")
+        c_idx += 1
     else:
-        cols[1].metric(
+        cols[c_idx].metric(
             "Air Bubbles",
             f"{air_count:,}",
             f"{(air_count / max(total_objects, 1) * 100):.1f}%",
         )
-        cols[2].metric(
+        c_idx += 1
+        cols[c_idx].metric(
             "Fat Particles",
             f"{fat_count:,}",
             f"{(fat_count / max(total_objects, 1) * 100):.1f}%",
         )
-    next_idx = 3
+        c_idx += 1
+
     if unclass_count > 0:
-        cols[next_idx].metric(
+        cols[c_idx].metric(
             "Unclassified",
             f"{unclass_count:,}",
             f"{(unclass_count / max(total_objects, 1) * 100):.1f}%",
         )
-        next_idx += 1
+        c_idx += 1
+
     if show_adsorbed_card:
-        cols[next_idx].metric(
+        cols[c_idx].metric(
             "Adsorbed Fat",
             f"{adsorbed_fat_count:,}",
             "Excluded from PSD",
         )
-        next_idx += 1
+        c_idx += 1
+
     if show_mean_diam:
-        cols[next_idx].metric("Mean Diameter", f"{avg_diam:.2f} µm")
+        cols[c_idx].metric("Mean Diameter", f"{avg_diam:.2f} µm")
+        c_idx += 1
 
     # Navigation View Bar
     tab_options = [
@@ -1857,6 +2397,9 @@ else:
         "🍇 Matrix Coalescence",
         "💾 Reproducibility & Export",
     ]
+    if is_light_mode:
+        # Single-phase emulsion light micrographs contain no air bubbles.
+        tab_options = [t for t in tab_options if t != "🛡️ Interfacial Analytics"]
     active_tab = st.segmented_control(
         "Navigation",
         options=tab_options,
@@ -1903,6 +2446,16 @@ else:
                     + (f", {effective_footer}px Footer Dimmed)" if effective_footer > 0 else ")"),
                     use_container_width=True,
                 )
+                # Export raw micrograph (with the burned-in scale bar when enabled)
+                buf_raw = io.BytesIO()
+                Image.fromarray(base_display_img).save(buf_raw, format="PNG")
+                st.download_button(
+                    label="📥 Download Raw Micrograph (PNG)",
+                    data=buf_raw.getvalue(),
+                    file_name=f"raw_micrograph_{clean_stem}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
 
         # Column 2: Filtered Metrics Table & Interactive Exclusion
         with col_df:
@@ -1924,6 +2477,14 @@ else:
                 ]].copy()
                 editor_df.insert(0, "Excluded", False)
 
+                # Single-phase modes only expose their physically possible phases
+                if is_emulsion_ui:
+                    phase_class_options = ["fat_particles", "Unclassified"]
+                elif sample_type == "Foam":
+                    phase_class_options = ["air_bubbles", "Unclassified"]
+                else:
+                    phase_class_options = ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
+
                 edited_table = st.data_editor(
                     editor_df,
                     column_config={
@@ -1935,8 +2496,8 @@ else:
                         "id": st.column_config.NumberColumn("ID", format="%d", disabled=True),
                         "phase_class": st.column_config.SelectboxColumn(
                             "Phase Class",
-                            help="Manually reclassify object between air_bubbles, fat_particles, adsorbed_fat (adsorbed on bubble wall, excluded from PSD), or Unclassified.",
-                            options=["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"],
+                            help="Manually reclassify this object (options depend on the selected Sample Type).",
+                            options=phase_class_options,
                             required=True,
                         ),
                         "diameter_um": st.column_config.NumberColumn("Diameter (µm)", format="%.2f", disabled=True),
@@ -1967,69 +2528,101 @@ else:
                     n_unclass_out_bub = len(unclass_out_bub)
 
                     st.markdown(f"**⚡ Smart Group Bulk Actions for {unclass_count} Unclassified Particles:**")
-                    # Row 1: Smart Spatial 1-Click Actions (4 buttons)
-                    b_col1, b_col2, b_col3, b_col4 = st.columns(4)
-                    with b_col1:
-                        if st.button(
-                            f"✨ Smart Auto-Split All ({unclass_count})",
-                            use_container_width=True,
-                            help="Reclassifies all Unclassified inside bubbles to adsorbed_fat and outside bubbles to fat_particles.",
-                        ):
-                            if "manual_phase_overrides" not in st.session_state:
-                                st.session_state["manual_phase_overrides"] = {}
-                            for u_id in unclass_in_bub["id"]:
-                                st.session_state["manual_phase_overrides"][int(u_id)] = "adsorbed_fat"
-                            for u_id in unclass_out_bub["id"]:
-                                st.session_state["manual_phase_overrides"][int(u_id)] = "fat_particles"
-                            editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
-                            for k in editor_keys:
-                                del st.session_state[k]
-                            st.rerun()
+                    if is_emulsion_ui:
+                        # Single-phase Emulsion: no air/adsorbed phases exist
+                        e_col1, e_col2 = st.columns(2)
+                        with e_col1:
+                            if st.button(
+                                f"🟧 Assign All Unclassified ({unclass_count}) → Fat Droplets",
+                                use_container_width=True,
+                                help="Reclassifies every Unclassified object as a fat droplet.",
+                            ):
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                for u_id in unclass_df["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = "fat_particles"
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
+                        with e_col2:
+                            if st.button(
+                                f"🗑️ Delete All Unclassified ({unclass_count})",
+                                use_container_width=True,
+                                help="Removes all Unclassified particles as artifacts.",
+                            ):
+                                unclass_ids = set(unclass_df["id"].tolist())
+                                if "interactive_excluded_ids" not in st.session_state:
+                                    st.session_state["interactive_excluded_ids"] = set()
+                                st.session_state["interactive_excluded_ids"].update(unclass_ids)
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
+                    else:
+                        # Row 1: Smart Spatial 1-Click Actions (4 buttons)
+                        b_col1, b_col2, b_col3, b_col4 = st.columns(4)
+                        with b_col1:
+                            if st.button(
+                                f"✨ Smart Auto-Split All ({unclass_count})",
+                                use_container_width=True,
+                                help="Reclassifies all Unclassified inside bubbles to adsorbed_fat and outside bubbles to fat_particles.",
+                            ):
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                for u_id in unclass_in_bub["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = "adsorbed_fat"
+                                for u_id in unclass_out_bub["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = "fat_particles"
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
 
-                    with b_col2:
-                        if st.button(
-                            f"🟨 In Bubbles ({n_unclass_in_bub}) → Adsorbed Fat",
-                            use_container_width=True,
-                            help="Reclassifies only Unclassified particles whose centroid is inside an air bubble to adsorbed_fat.",
-                        ):
-                            if "manual_phase_overrides" not in st.session_state:
-                                st.session_state["manual_phase_overrides"] = {}
-                            for u_id in unclass_in_bub["id"]:
-                                st.session_state["manual_phase_overrides"][int(u_id)] = "adsorbed_fat"
-                            editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
-                            for k in editor_keys:
-                                del st.session_state[k]
-                            st.rerun()
+                        with b_col2:
+                            if st.button(
+                                f"🟨 In Bubbles ({n_unclass_in_bub}) → Adsorbed Fat",
+                                use_container_width=True,
+                                help="Reclassifies only Unclassified particles whose centroid is inside an air bubble to adsorbed_fat.",
+                            ):
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                for u_id in unclass_in_bub["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = "adsorbed_fat"
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
 
-                    with b_col3:
-                        if st.button(
-                            f"🟧 Outside ({n_unclass_out_bub}) → Matrix Fat",
-                            use_container_width=True,
-                            help="Reclassifies only Unclassified particles outside air bubble regions to fat_particles.",
-                        ):
-                            if "manual_phase_overrides" not in st.session_state:
-                                st.session_state["manual_phase_overrides"] = {}
-                            for u_id in unclass_out_bub["id"]:
-                                st.session_state["manual_phase_overrides"][int(u_id)] = "fat_particles"
-                            editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
-                            for k in editor_keys:
-                                del st.session_state[k]
-                            st.rerun()
+                        with b_col3:
+                            if st.button(
+                                f"🟧 Outside ({n_unclass_out_bub}) → Matrix Fat",
+                                use_container_width=True,
+                                help="Reclassifies only Unclassified particles outside air bubble regions to fat_particles.",
+                            ):
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                for u_id in unclass_out_bub["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = "fat_particles"
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
 
-                    with b_col4:
-                        if st.button(
-                            "🗑️ Delete All Unclassified",
-                            use_container_width=True,
-                            help="Removes all Unclassified particles as artifacts.",
-                        ):
-                            unclass_ids = set(unclass_df["id"].tolist())
-                            if "interactive_excluded_ids" not in st.session_state:
-                                st.session_state["interactive_excluded_ids"] = set()
-                            st.session_state["interactive_excluded_ids"].update(unclass_ids)
-                            editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
-                            for k in editor_keys:
-                                del st.session_state[k]
-                            st.rerun()
+                        with b_col4:
+                            if st.button(
+                                "🗑️ Delete All Unclassified",
+                                use_container_width=True,
+                                help="Removes all Unclassified particles as artifacts.",
+                            ):
+                                unclass_ids = set(unclass_df["id"].tolist())
+                                if "interactive_excluded_ids" not in st.session_state:
+                                    st.session_state["interactive_excluded_ids"] = set()
+                                st.session_state["interactive_excluded_ids"].update(unclass_ids)
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
 
                     # Row 2: Grouping Unclassified by Size Range in a compact expander
                     with st.expander("📏 Group & Assign Unclassified by Size Range (µm)"):
@@ -2057,7 +2650,11 @@ else:
                         with col_g3:
                             grp_target = st.selectbox(
                                 "Assign to",
-                                options=["fat_particles", "adsorbed_fat", "air_bubbles", "Delete"],
+                                options=(
+                                    ["fat_particles", "Delete"]
+                                    if is_emulsion_ui
+                                    else ["fat_particles", "adsorbed_fat", "air_bubbles", "Delete"]
+                                ),
                                 index=0,
                                 key="grp_unclass_target",
                             )
@@ -2130,13 +2727,56 @@ else:
         # Full-width Size Distribution section beneath image + table
         st.subheader("3. Size Distribution")
 
+        # Fixed physical bar width (∆µm): every bar covers the same diameter interval, so
+        # bar heights (% of that phase) stay directly comparable between micrographs with
+        # very different particle counts (e.g. n = 3176 fat particles).
+        if sample_type == "Emulsion":
+            # Single-phase: only the fat histogram exists — no unused air column
+            fat_bin_width = st.select_slider(
+                "🟧 Fat Histogram Step (∆µm)",
+                options=[0.2, 0.25, 0.5, 1.0, 2.0],
+                value=0.5,
+                key=f"fat_bin_width_{clean_stem}",
+                help=(
+                    "Width of each fat-particle histogram bar. 0.5 µm resolves fine emulsion "
+                    "globules while keeping every bar comparable (all bars sum to 100%)."
+                ),
+            )
+            air_bin_width = 10.0
+        else:
+            col_bin_fat, col_bin_air = st.columns(2)
+            with col_bin_fat:
+                fat_bin_width = st.select_slider(
+                    "🟧 Fat Histogram Step (∆µm)",
+                    options=[0.2, 0.25, 0.5, 1.0, 2.0],
+                    value=0.5,
+                    key=f"fat_bin_width_{clean_stem}",
+                    help=(
+                        "Width of each fat-particle histogram bar. 0.5 µm resolves fine emulsion "
+                        "globules while keeping every bar comparable (all bars sum to 100%)."
+                    ),
+                )
+            with col_bin_air:
+                air_bin_width = st.select_slider(
+                    "🟦 Air Histogram Step (∆µm)",
+                    options=[2.0, 5.0, 10.0, 15.0, 20.0],
+                    value=10.0,
+                    key=f"air_bin_width_{clean_stem}",
+                    help=(
+                        "Width of each air-bubble histogram bar. Bubble diameters span a much "
+                        "wider range, so a coarser step (10 µm by default) avoids hundreds of bins."
+                    ),
+                )
+
         def _render_phase_distribution(phase_key: str, title: str, png_name: str, csv_name: str, dl_prefix: str):
             phase_csv = classified_df[classified_df["phase_class"] == phase_key] if not classified_df.empty else classified_df
+            bin_width = float(fat_bin_width if phase_key == "fat_particles" else air_bin_width)
             fig_phase, _ = plot_single_phase_distribution(
                 classified_df,
                 phase_class=phase_key,
                 title=title,
                 color=PALETTE_COLORS.get(phase_key),
+                bin_width=bin_width,
             )
             st.pyplot(fig_phase, use_container_width=True)
             buf_png = io.BytesIO()
@@ -2159,6 +2799,42 @@ else:
                     use_container_width=True,
                     key=f"dl_csv_{phase_key}_{clean_stem}",
                 )
+
+            # Exact binned percentage table (Σ = 100%) mirroring the rendered bars
+            binned_table = compute_phase_histogram_table(
+                classified_df,
+                phase_class=phase_key,
+                bin_width=bin_width,
+            )
+            with st.expander(
+                f"📊 View Exact Binned Percentage Table — {dl_prefix} (Σ = 100%)",
+                expanded=False,
+            ):
+                if binned_table.empty:
+                    st.info(
+                        f"No {dl_prefix.lower()} objects are available for a binned percentage table."
+                    )
+                else:
+                    st.caption(
+                        f"∆ = {bin_width:g} µm · "
+                        f"n = {int(binned_table['Count (n)'].sum()):,} · "
+                        f"Σ = 100% of the {dl_prefix.lower()} population · "
+                        f"{len(binned_table)} intervals"
+                    )
+                    st.dataframe(
+                        binned_table,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=260,
+                    )
+                    st.download_button(
+                        label=f"📥 Download {dl_prefix} Binned Table (CSV)",
+                        data=binned_table.to_csv(index=False).encode("utf-8"),
+                        file_name=f"phasepix_{phase_key}_binned_table_{clean_stem}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"dl_binned_{phase_key}_{clean_stem}",
+                    )
 
         if sample_type == "Whipped Emulsion":
             col_plot_fat, col_plot_air = st.columns(2)
@@ -2267,23 +2943,35 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             # Row 2: Target Phase Assignment (Col 1) and Action Buttons (Col 2)
             t_row2_col1, t_row2_col2 = st.columns([1.6, 1.2])
             with t_row2_col1:
-                default_manual_phase = st.radio(
-                    "Assign New Manual Objects As",
-                    options=["air_bubbles", "fat_particles", "adsorbed_fat", "Auto (by Min/Max Size)"],
-                    index=0,
-                    horizontal=True,
-                    help=(
-                        "By default, manually added pores/bubbles are locked as air_bubbles regardless of their size, "
-                        "so small or huge pores are never misclassified as fat or Unclassified."
-                    ),
-                )
+                if is_emulsion_ui:
+                    default_manual_phase = st.radio(
+                        "Assign New Manual Objects As",
+                        options=["fat_particles", "Auto (by Min/Max Size)"],
+                        index=0,
+                        horizontal=True,
+                        help=(
+                            "Single-phase emulsion: manual objects are fat droplets, or classified "
+                            "automatically by the Min/Max Fat size range."
+                        ),
+                    )
+                else:
+                    default_manual_phase = st.radio(
+                        "Assign New Manual Objects As",
+                        options=["air_bubbles", "fat_particles", "adsorbed_fat", "Auto (by Min/Max Size)"],
+                        index=0,
+                        horizontal=True,
+                        help=(
+                            "By default, manually added pores/bubbles are locked as air_bubbles regardless of their size, "
+                            "so small or huge pores are never misclassified as fat or Unclassified."
+                        ),
+                    )
             with t_row2_col2:
                 if assist_mode.startswith("📦 AI Smart Box"):
                     btn_add_label = "➕ Detect & Add from Box(es)"
                 elif assist_mode.startswith("🪄 1-Click"):
-                    btn_add_label = "➕ Add Bubble"
+                    btn_add_label = "➕ Add Droplet" if is_emulsion_ui else "➕ Add Bubble"
                 else:
-                    btn_add_label = "➕ Add Manual Bubble"
+                    btn_add_label = "➕ Add Manual Droplet" if is_emulsion_ui else "➕ Add Manual Bubble"
 
                 col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.0, 1.0])
                 with col_btn1:
@@ -2381,16 +3069,26 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         canvas_bg = Image.fromarray(canvas_bg_np)
 
         # Informative captions and full-size tips
-        st.caption(
-            "🟢 **Thin Teal Outline** = Already detected by AI &nbsp;|&nbsp; "
-            "🔵/🟠/🟡/🟢 **Solid Fill** = Manual Additions (Blue: Air, Orange: Fat, Gold: Adsorbed Fat, Green: Unclassified) &nbsp;|&nbsp; "
-            "💡 **Pro-Tip:** Collapse the left sidebar (**<<** at top-left) to view the micrograph in full native 100% resolution. The floating toolbar stays pinned to the top as you scroll!"
-        )
+        if is_emulsion_ui:
+            st.caption(
+                "🟢 **Thin Teal Outline** = Already detected by AI &nbsp;|&nbsp; "
+                "🟠/🟢 **Solid Fill** = Manual Additions (Orange: Fat Droplets, Green: Unclassified) &nbsp;|&nbsp; "
+                "💡 **Pro-Tip:** Collapse the left sidebar (**<<** at top-left) to view the micrograph in full native 100% resolution. The floating toolbar stays pinned to the top as you scroll!"
+            )
+        else:
+            st.caption(
+                "🟢 **Thin Teal Outline** = Already detected by AI &nbsp;|&nbsp; "
+                "🔵/🟠/🟡/🟢 **Solid Fill** = Manual Additions (Blue: Air, Orange: Fat, Gold: Adsorbed Fat, Green: Unclassified) &nbsp;|&nbsp; "
+                "💡 **Pro-Tip:** Collapse the left sidebar (**<<** at top-left) to view the micrograph in full native 100% resolution. The floating toolbar stays pinned to the top as you scroll!"
+            )
 
         if assist_mode.startswith("📦 AI Smart Box"):
             st.caption("💡 **Tip:** Drag one or more rectangles around bubbles/particles, then click **Detect & Add from Box(es)**. SAM AI (or the Scale-Normalized Cellpose fallback) fits the real SEM boundary.")
         elif assist_mode.startswith("🪄 1-Click"):
-            st.caption("💡 **Tip:** Click once in the dark center of each missed bubble/pore, then click **Add Bubble**.")
+            st.caption(
+                f"💡 **Tip:** Click once in the dark center of each missed {'droplet' if is_emulsion_ui else 'bubble/pore'}, "
+                f"then click **{'Add Droplet' if is_emulsion_ui else 'Add Bubble'}**."
+            )
         else:
             st.caption("💡 **Tip:** Click points around the particle. PhasePix will smoothly interpolate exactly through your points (0.0 px shift).")
 
@@ -2491,6 +3189,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     cellpose_model=cp_model,
                     max_air_size_um=max_air_size,
                     target_phase=default_manual_phase,
+                    invert_brightfield=(
+                        invert_brightfield if 'invert_brightfield' in locals() else False
+                    ),
                 )
 
                 if parsed_metrics:
@@ -2531,9 +3232,17 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 if assist_mode.startswith("📦 AI Smart Box"):
                     st.info("Canvas is empty. Draw a rectangle around a bubble/particle, then click '➕ Detect & Add from Box(es)'.", icon="💡")
                 elif assist_mode.startswith("🪄 1-Click"):
-                    st.info("Canvas is empty. Click in the center of one or more dark bubbles, then click '➕ Add Bubble'.", icon="💡")
+                    st.info(
+                        f"Canvas is empty. Click in the center of one or more {'droplets' if is_emulsion_ui else 'dark bubbles'}, "
+                        f"then click '➕ {'Add Droplet' if is_emulsion_ui else 'Add Bubble'}'.",
+                        icon="💡",
+                    )
                 else:
-                    st.info("Canvas is empty. Click points on the image, then click '➕ Add Manual Bubble'.", icon="💡")
+                    st.info(
+                        f"Canvas is empty. Click points on the image, then click "
+                        f"'➕ {'Add Manual Droplet' if is_emulsion_ui else 'Add Manual Bubble'}'.",
+                        icon="💡",
+                    )
 
         # Two-column layout beneath the full-width canvas
         st.markdown("---")
@@ -2564,10 +3273,16 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     area = cf_lookup.get(obj_id, {}).get("area_um2", float(m.get("area_um2", 0.0)))
                     curr_phase = cf_lookup.get(obj_id, {}).get(
                         "phase_class",
-                        st.session_state.get("manual_phase_overrides", {}).get(obj_id, "air_bubbles"),
+                        st.session_state.get("manual_phase_overrides", {}).get(
+                            obj_id, "fat_particles" if is_emulsion_ui else "air_bubbles"
+                        ),
                     )
                     if str(curr_phase).lower() == "unclassified":
                         curr_phase = "Unclassified"
+                    elif is_emulsion_ui:
+                        # Single-phase Emulsion only allows fat droplets / Unclassified
+                        if curr_phase not in ["fat_particles", "Unclassified"]:
+                            curr_phase = "fat_particles"
                     elif curr_phase not in ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]:
                         curr_phase = "air_bubbles"
 
@@ -2606,9 +3321,13 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         ),
                         "phase_class": st.column_config.SelectboxColumn(
                             "Phase Class",
-                            options=["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"],
+                            options=(
+                                ["fat_particles", "Unclassified"]
+                                if is_emulsion_ui
+                                else ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
+                            ),
                             required=True,
-                            help="Select phase class for this manual object. 'adsorbed_fat' = adsorbed globule on bubble wall (excluded from PSD stats).",
+                            help="Select phase class for this manual object (options depend on the selected Sample Type).",
                         ),
                     },
                     disabled=["id", "diameter_um", "area_um2"],
@@ -2769,7 +3488,10 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
 
         with col_measure:
             st.markdown("### Caliper Measurement")
-            st.info(f"📏 Scale: **{pixels_per_um:.2f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)")
+            scale_label = f"📏 Scale: **{pixels_per_um:.2f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)"
+            if 'is_light_mode' in locals() and is_light_mode and 'selected_objective' in locals():
+                scale_label += f" | 💡 Preset: **{selected_objective}**"
+            st.info(scale_label)
 
             measured_lines = []
             if canvas_result is not None and canvas_result.json_data is not None:
@@ -3467,6 +4189,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         session_meta = {
             "Analysis Timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "Source Image": image_name,
+            "Imaging Modality": imaging_mode,
+            "Objective Preset": selected_objective if is_light_mode else "N/A (SEM Scale Bar)",
             "Full Micrograph Dimensions (px)": f"{img_w}x{img_h}",
             "Footer Height Excluded (px)": effective_footer,
             "Analysis Region Dimensions (px)": f"{analysis_img.shape[1]}x{analysis_img.shape[0]}",
@@ -3486,6 +4210,17 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Out-of-Range Handling": out_of_range_handling,
             "Air Bubbles Min Circularity": float(air_min_circularity),
             "Matrix Fat Min Circularity": float(fat_min_circularity),
+            "Matrix Fat Min Solidity": float(fat_min_solidity),
+            "Emulsion Droplet Profile": emulsion_profile,
+            "Typical Droplet Diameter for AI (µm)": (
+                float(expected_droplet_um) if expected_droplet_um is not None else "N/A (SEM Mode)"
+            ),
+            "Multi-Scale Globule Detection": (
+                bool(enable_multiscale_crystal) if is_light_mode else "N/A (SEM Mode)"
+            ),
+            "Internal Crystal Smoothing": (
+                int(crystal_smooth_strength) if is_light_mode else "N/A (SEM Mode)"
+            ),
             "Adsorbed Fat Min Circularity": float(ads_min_circularity),
             "Manual Phase Overrides": st.session_state.get("manual_phase_overrides", {}),
             "Show Air Bubbles": bool(show_air),
@@ -3498,6 +4233,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Flow Threshold": float(flow_threshold),
             "Cell Probability Threshold": float(cellprob_threshold),
             "CLAHE Preprocessing": enable_clahe,
+            "Brightfield Inversion": (
+                bool(invert_brightfield) if is_light_mode else "N/A (SEM Mode)"
+            ),
             "Hardware Accelerator": f"{device} (GPU: {is_gpu})",
             "Total Segmented Objects (Raw)": len(raw_df),
             "Retained Objects (After Filters)": total_objects,

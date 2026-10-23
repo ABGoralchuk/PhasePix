@@ -58,6 +58,27 @@ def apply_clahe(
     return clahe.apply(img_uint8)
 
 
+def smooth_internal_crystals(image: np.ndarray, strength: int = 2) -> np.ndarray:
+    """
+    Suppress internal crystal needle/fibril lines inside crystallized fat globules
+    while preserving the dark outer droplet boundaries (edge-preserving filtering).
+    """
+    img_2d = image.squeeze() if image.ndim == 3 else image
+    if img_2d.dtype != np.uint8:
+        min_v, max_v = float(img_2d.min()), float(img_2d.max())
+        img_u8 = np.clip(((img_2d - min_v) / max(max_v - min_v, 1e-6)) * 255.0, 0, 255).astype(np.uint8)
+    else:
+        img_u8 = img_2d.copy()
+
+    s = max(1, int(strength))
+    # 1. Median filter wipes out thin dark crystal striations inside droplets
+    k_med = 2 * s + 1  # e.g., 5x5 for strength=2, 7x7 for strength=3
+    med = cv2.medianBlur(img_u8, k_med)
+    # 2. Bilateral filter homogenizes droplet interiors while keeping outer rims sharp
+    smooth = cv2.bilateralFilter(med, d=9, sigmaColor=35 * s, sigmaSpace=7 * s)
+    return smooth
+
+
 def get_device() -> Tuple[torch.device, bool]:
     """
     Detect and return the optimal compute device.
@@ -937,11 +958,112 @@ def _radial_rim_mask(
     return rim_mask
 
 
+@st.cache_data(show_spinner="❄️ Running Multi-Scale Crystallized Globule AI segmentation...")
+def cached_segment_crystallized_multiscale(
+    image: np.ndarray,
+    base_diameter_px: float,
+    model_name: str = "cyto2",
+    custom_model_path: Optional[str] = None,
+    flow_threshold: float = 0.7,
+    cellprob_threshold: float = -1.0,
+    enable_clahe: bool = False,
+    smooth_strength: int = 3,
+    invert_brightfield: bool = False,
+) -> np.ndarray:
+    """
+    Two-scale hierarchical segmentation for polydisperse crystallized emulsions:
+    1. Coarse Pass (1.75x diameter, stronger crystal smoothing): captures large crystallized
+       globules intact without splitting along internal crystal needles.
+    2. Standard Pass (1.0x diameter): captures medium/small globules in the remaining matrix.
+    3. Merges both passes: large globules take priority; small detections overlapping >25%
+       with an accepted large globule are discarded as internal crystal shards.
+    """
+    model = get_cellpose_model(model_type=model_name, custom_model_path=custom_model_path)
+    img_2d = image.squeeze() if image.ndim == 3 else image
+
+    # Pass A: Large globules (stronger smoothing + 1.75x diameter)
+    s_large = max(int(smooth_strength), 2) + 1
+    img_large = smooth_internal_crystals(img_2d, strength=s_large)
+    if invert_brightfield:
+        img_large = cv2.bitwise_not(img_large)
+    d_large = float(np.clip(base_diameter_px * 1.75, 30.0, 240.0))
+    masks_large = run_inference(
+        model=model,
+        image=img_large,
+        diameter=d_large,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        enable_clahe=enable_clahe,
+    )
+
+    # Pass B: Standard/small globules (1.0x diameter)
+    img_small = smooth_internal_crystals(img_2d, strength=max(int(smooth_strength), 1)) if smooth_strength > 0 else img_2d.copy()
+    if invert_brightfield:
+        img_small = cv2.bitwise_not(img_small)
+    d_small = float(np.clip(base_diameter_px, 14.0, 180.0))
+    masks_small = run_inference(
+        model=model,
+        image=img_small,
+        diameter=d_small,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        enable_clahe=enable_clahe,
+    )
+
+    # Merge: keep all hole-filled large globules with solidity >= 0.78 first, then add non-overlapping small globules
+    combined = np.zeros(img_2d.shape[:2], dtype=np.int32)
+    occupied = np.zeros(img_2d.shape[:2], dtype=bool)
+    next_id = 1
+
+    for lbl in np.unique(masks_large):
+        if lbl == 0:
+            continue
+        region = (masks_large == lbl).astype(np.uint8)
+        area = float(np.count_nonzero(region))
+        if area < 36:
+            continue
+        cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        main_cnt = max(cnts, key=cv2.contourArea)
+        hull_area = float(cv2.contourArea(cv2.convexHull(main_cnt)))
+        solidity = area / max(hull_area, 1.0)
+        if solidity < 0.76:
+            continue
+        filled = np.zeros_like(region)
+        cv2.drawContours(filled, [main_cnt], -1, 1, thickness=cv2.FILLED)
+        filled_bool = filled.astype(bool)
+        combined[filled_bool] = next_id
+        occupied |= filled_bool
+        next_id += 1
+
+    for lbl in np.unique(masks_small):
+        if lbl == 0:
+            continue
+        region = (masks_small == lbl)
+        area = float(np.count_nonzero(region))
+        if area < 12:
+            continue
+        overlap = float(np.count_nonzero(region & occupied)) / area
+        if overlap >= 0.25:
+            # Reject internal shard inside an already-captured large globule!
+            continue
+        clean_region = region & (~occupied)
+        if np.count_nonzero(clean_region) < 12:
+            continue
+        combined[clean_region] = next_id
+        occupied |= clean_region
+        next_id += 1
+
+    return combined
+
+
 def predict_interactive_box_mask(
     image_2d: np.ndarray,
     box_xyxy: Tuple[float, float, float, float],
     target_phase: str = "air_bubbles",
     cellpose_model=None,
+    invert_brightfield: bool = False,
 ) -> np.ndarray:
     """
     Instant interactive segmentation of an object drawn with a bounding box.
@@ -955,8 +1077,9 @@ def predict_interactive_box_mask(
         with a 5x5 ellipse to cut thin necks to neighbouring particles.
 
     Step B (fallback: Cellpose in the box + Elliptical Rim Snapper):
-        - A padded crop of the box is segmented with Cellpose (direct + inverted CLAHE)
-          using diameter = 0.85 * min(bw, bh), cellprob_threshold = -1.8 and
+        - A padded crop of the box is segmented with Cellpose (direct + inverted CLAHE;
+          in brightfield mode only the inverted polarity is tested) using
+          diameter = 0.85 * min(bw, bh), cellprob_threshold = -1.8 and
           flow_threshold = 0.8. A centre object filling 30-88% of the box is kept as a
           base mask and contributes its boundary to the rim-snapping edge hint.
         - 72 rays from the box center search the brightness-gradient peak inside the
@@ -972,6 +1095,9 @@ def predict_interactive_box_mask(
                         The current pipeline is phase-agnostic: absolute-gradient rim
                         snapping works for dark pores and bright fat globules alike.
         cellpose_model: Optional preloaded CellposeModel used by the fallback path.
+        invert_brightfield: When True (brightfield light microscopy), the fallback only
+                        tests the inverted ROI polarity — the correct one for dark-rim
+                        droplets — instead of running Cellpose twice.
 
     Returns:
         np.ndarray: 2D uint8 binary mask (0/1) with shape ``image_2d.shape[:2]``.
@@ -1089,7 +1215,10 @@ def predict_interactive_box_mask(
         try:
             if cellpose_model is None:
                 cellpose_model = get_cellpose_model()
-            for test_img in (roi_clahe, roi_inv):
+            # Brightfield droplets: only the inverted polarity is meaningful, so skip
+            # the wrong polarity entirely (halves inference time in Light mode).
+            test_images = [roi_inv] if invert_brightfield else [roi_clahe, roi_inv]
+            for test_img in test_images:
                 m_res = run_inference(
                     model=cellpose_model,
                     image=test_img,

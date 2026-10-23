@@ -6,6 +6,7 @@ and plots comparative kernel density estimations (KDE).
 
 from typing import Optional, Tuple
 import logging
+import math
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,6 +24,11 @@ PALETTE_COLORS = {
     "Unclassified": "#32cd32",   # Lime Green for unclassified particles (RGB 50, 205, 50)
     "unclassified": "#32cd32",   # Lime Green alias
 }
+
+# Number of histogram bars used when the caller supplies no binning preference.
+# A fixed default (instead of bins="auto") keeps bar heights comparable across
+# micrographs with different particle counts.
+DEFAULT_HIST_BINS = 15
 
 
 def classify_by_size(
@@ -149,18 +155,162 @@ def split_by_intensity(
     return air_df, fat_df
 
 
+def _extract_phase_diameters(df: pd.DataFrame, phase_class: str) -> pd.Series:
+    """
+    Return the cleaned numeric equivalent diameters that belong to a single phase.
+
+    Adsorbed fat globules are strictly excluded from the ``fat_particles`` PSD, and so
+    are particles clipped by a bubble wall (``is_partial_in_bubble``), because their
+    visible cap would bias the distribution towards smaller apparent diameters.
+
+    Args:
+        df: DataFrame with 'diameter_um' and (optionally) 'phase_class' columns.
+        phase_class: Target phase key ('fat_particles' or 'air_bubbles').
+
+    Returns:
+        pd.Series: Float Series of diameters in µm (empty when nothing matches).
+    """
+    if df is None or df.empty or "diameter_um" not in df.columns:
+        return pd.Series(dtype=float)
+
+    phase_key = str(phase_class).strip().lower()
+    data = df
+
+    if "phase_class" in data.columns:
+        classes = data["phase_class"].astype(str).str.lower()
+        if phase_key == "fat_particles":
+            # PSD strictly excludes adsorbed_fat globules to prevent size underestimation
+            mask = (classes == "fat_particles") & (~classes.isin(["adsorbed_fat"]))
+            if "is_partial_in_bubble" in data.columns:
+                mask = mask & (~data["is_partial_in_bubble"].fillna(False).astype(bool))
+        else:
+            mask = classes == phase_key
+        series = data.loc[mask, "diameter_um"]
+    else:
+        series = data["diameter_um"]
+
+    return pd.to_numeric(series, errors="coerce").dropna()
+
+
+def _resolve_hist_binning(
+    values: np.ndarray,
+    bin_width: Optional[float] = None,
+    num_bins: Optional[int] = None,
+) -> Tuple[dict, str]:
+    """
+    Translate binning preferences into seaborn histplot kwargs plus a readable note.
+
+    Priority: ``bin_width`` (physical bar width) > ``num_bins`` > DEFAULT_HIST_BINS.
+    For ``bin_width`` the aligned ``binrange`` (multiples of the width) is passed as
+    well, which keeps the real bar width equal to the requested ∆µm instead of the
+    ``int(round(range / binwidth))`` approximation seaborn 0.13 would otherwise use.
+
+    Args:
+        values: 1D array of numeric diameters in µm.
+        bin_width: Requested bar width in µm (must be > 0 to be used).
+        num_bins: Requested number of bars (must be > 0 to be used).
+
+    Returns:
+        Tuple[dict, str]: (kwargs for sns.histplot, human readable binning note).
+    """
+    if bin_width is not None:
+        try:
+            candidate_width = float(bin_width)
+        except (TypeError, ValueError):
+            candidate_width = 0.0
+        if math.isfinite(candidate_width) and candidate_width > 0:
+            edges = _resolve_bin_edges(values, bin_width=candidate_width)
+            if edges.size >= 2:
+                return (
+                    {
+                        "binwidth": candidate_width,
+                        "binrange": (float(edges[0]), float(edges[-1])),
+                    },
+                    f"Δ = {candidate_width:g} µm per bar",
+                )
+
+    if num_bins is not None:
+        try:
+            candidate_bins = int(num_bins)
+        except (TypeError, ValueError):
+            candidate_bins = 0
+        if candidate_bins > 0:
+            return {"bins": candidate_bins}, f"{candidate_bins} bins"
+
+    return {"bins": DEFAULT_HIST_BINS}, f"{DEFAULT_HIST_BINS} bins (default)"
+
+
+def _resolve_bin_edges(
+    values: np.ndarray,
+    bin_width: Optional[float] = None,
+    num_bins: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Build the exact histogram edges used by sns.histplot for the same settings.
+
+    When ``bin_width`` is given the range is aligned to multiples of that width
+    (0.0 – 0.5 – 1.0 µm ...) so every bar covers a *true* physical interval. The
+    aligned range is also handed to seaborn as ``binrange`` by
+    :func:`_resolve_hist_binning`, which makes the percentage table and the
+    rendered bars describe byte-identical intervals regardless of seaborn version.
+
+    Args:
+        values: 1D array of numeric diameters in µm.
+        bin_width: Requested bar width in µm (must be > 0 to be used).
+        num_bins: Requested number of bars (must be > 0 to be used).
+
+    Returns:
+        np.ndarray: Monotonically increasing bin edges (empty for empty input).
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.array([], dtype=float)
+
+    data_min = float(values.min())
+    data_max = float(values.max())
+
+    if bin_width is not None:
+        try:
+            width = float(bin_width)
+        except (TypeError, ValueError):
+            width = 0.0
+        if math.isfinite(width) and width > 0:
+            start = math.floor(data_min / width) * width
+            stop = math.ceil(data_max / width) * width
+            if stop <= start:
+                stop = start + width
+            steps = max(1, int(round((stop - start) / width)))
+            return np.round(np.linspace(start, start + steps * width, steps + 1), 10)
+
+    if num_bins is not None:
+        try:
+            bins = int(num_bins)
+        except (TypeError, ValueError):
+            bins = 0
+        if bins > 0:
+            return np.histogram_bin_edges(values, bins=bins)
+
+    return np.histogram_bin_edges(values, bins=DEFAULT_HIST_BINS)
+
+
 def plot_single_phase_distribution(
     df: pd.DataFrame,
     phase_class: str,
     title: Optional[str] = None,
     color: Optional[str] = None,
     figsize: Tuple[int, int] = (8, 4.5),
+    bin_width: Optional[float] = None,
+    num_bins: Optional[int] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Plot size distribution for a single phase with Y-axis as percentage of particles.
 
-    Uses sns.histplot(..., stat="percent", kde=True, bins="auto") so the Y axis
-    shows Percentage of Particles (%) within that phase (not probability density).
+    Uses sns.histplot(..., stat="percent") so the Y axis shows the Percentage of
+    Particles (%) within that phase and every bar sum to exactly 100%. Bars use a
+    fixed physical width (``bin_width``) whenever supplied, which replaces the
+    count-dependent ``bins="auto"`` behaviour that produced ~0.12 µm wide bars and
+    artificially low percentages for large populations.
 
     Args:
         df: DataFrame with 'diameter_um' and 'phase_class' columns.
@@ -168,6 +318,9 @@ def plot_single_phase_distribution(
         title: Optional plot title.
         color: Optional matplotlib/seaborn color; defaults from PALETTE_COLORS.
         figsize: Figure dimensions (width, height) in inches.
+        bin_width: Optional physical bar width in µm (e.g. 0.5 or 1.0 for fat
+            particles, 5.0 or 10.0 for air bubbles). Takes priority over ``num_bins``.
+        num_bins: Optional fixed number of bars, used when ``bin_width`` is not given.
 
     Returns:
         Tuple[plt.Figure, plt.Axes]: Matplotlib Figure and Axes objects.
@@ -191,22 +344,9 @@ def plot_single_phase_distribution(
         fig.tight_layout()
         return fig, ax
 
-    data = df.copy()
-    if "phase_class" in data.columns:
-        if phase_key.lower() == "fat_particles":
-            # PSD strictly excludes adsorbed_fat globules to prevent size underestimation
-            valid_mask = (data["phase_class"].astype(str).str.lower() == "fat_particles") & (
-                ~data["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])
-            )
-            if "is_partial_in_bubble" in data.columns:
-                valid_mask = valid_mask & (~data["is_partial_in_bubble"].fillna(False).astype(bool))
-            phase_data = data[valid_mask]["diameter_um"].dropna()
-        else:
-            phase_data = data[
-                data["phase_class"].astype(str).str.lower() == phase_key.lower()
-            ]["diameter_um"].dropna()
-    else:
-        phase_data = data["diameter_um"].dropna()
+    # The shared helper keeps adsorbed_fat globules (and bubble-clipped caps) out of
+    # the fat_particles PSD, so plot and percentage table always share one population.
+    phase_data = _extract_phase_diameters(df, phase_class)
 
     if len(phase_data) == 0:
         ax.text(
@@ -220,28 +360,43 @@ def plot_single_phase_distribution(
         fig.tight_layout()
         return fig, ax
 
+    legend_label = f"{display_name} (n={len(phase_data):,}, Σ=100%)"
+    hist_kwargs, binning_note = _resolve_hist_binning(
+        phase_data.to_numpy(dtype=float), bin_width, num_bins
+    )
+
     if len(phase_data) == 1 or phase_data.nunique() == 1:
         single_val = float(phase_data.iloc[0])
         ax.bar([single_val], [100.0], width=max(single_val * 0.05, 0.2),
                color=plot_color, alpha=0.55, edgecolor=plot_color,
-               label=f"{display_name} (n={len(phase_data)})")
+               label=legend_label)
         ax.axvline(single_val, color=plot_color, linestyle="--", linewidth=1.5)
     else:
         sns.histplot(
             data=phase_data,
             stat="percent",
             kde=True,
-            bins="auto",
+            **hist_kwargs,
             color=plot_color,
             edgecolor="white",
             linewidth=0.6,
             alpha=0.55,
             ax=ax,
-            label=f"{display_name} (n={len(phase_data)})",
+            label=legend_label,
         )
 
+    # Subtitle documents the active binning and confirms the mass balance (Σ = 100%)
+    ax.text(
+        0.5, 1.01,
+        f"{binning_note} · {len(ax.patches)} bars · n={len(phase_data):,} · "
+        f"Σ = 100% of {display_name}",
+        transform=ax.transAxes,
+        ha="center", va="bottom",
+        fontsize=9, color="#555555",
+    )
+
     ax.legend(frameon=True, loc="upper right", fontsize=10)
-    ax.set_title(plot_title, fontsize=13, weight="bold", pad=12)
+    ax.set_title(plot_title, fontsize=13, weight="bold", pad=24)
     ax.set_xlabel("Equivalent Diameter (µm)", fontsize=11, labelpad=8)
     ax.set_ylabel("Percentage of Particles (%)", fontsize=11, labelpad=8)
     ax.grid(True, linestyle=":", alpha=0.6)
@@ -249,6 +404,70 @@ def plot_single_phase_distribution(
     ax.set_xlim(left=max(0.0, current_xlim[0]))
     fig.tight_layout()
     return fig, ax
+
+
+def compute_phase_histogram_table(
+    df: pd.DataFrame,
+    phase_class: str,
+    bin_width: Optional[float] = None,
+    num_bins: Optional[int] = None,
+    max_rows: int = 200,
+) -> pd.DataFrame:
+    """
+    Build an exact binned percentage table (Σ = 100%) for a single phase.
+
+    The intervals are produced with the very same edges seaborn uses for the
+    matching ``plot_single_phase_distribution`` call, so the table always explains
+    the rendered bars. Adsorbed fat globules are excluded from ``fat_particles``
+    exactly as in the plot.
+
+    Args:
+        df: DataFrame with 'diameter_um' and (optionally) 'phase_class' columns.
+        phase_class: Target phase key ('fat_particles' or 'air_bubbles').
+        bin_width: Optional physical bar width in µm; takes priority over ``num_bins``.
+        num_bins: Optional fixed number of bars.
+        max_rows: When more bins than this are produced (wide outliers), only
+            non-empty intervals are kept so the table stays readable.
+
+    Returns:
+        pd.DataFrame: Columns 'Size Interval (µm)', 'Count (n)', 'Percentage (%)'
+        and 'Cumulative (%)' (the final row closes at exactly 100.0%).
+    """
+    columns = ["Size Interval (µm)", "Count (n)", "Percentage (%)", "Cumulative (%)"]
+    values = _extract_phase_diameters(df, phase_class).to_numpy(dtype=float)
+    if values.size == 0:
+        return pd.DataFrame(columns=columns)
+
+    bin_edges = _resolve_bin_edges(values, bin_width=bin_width, num_bins=num_bins)
+    if bin_edges.size < 2:
+        return pd.DataFrame(columns=columns)
+
+    counts, edges = np.histogram(values, bins=bin_edges)
+    total = int(counts.sum())
+    if total <= 0:
+        return pd.DataFrame(columns=columns)
+
+    percentages = counts.astype(float) / float(total) * 100.0
+    cumulative = np.cumsum(percentages)
+
+    rows = []
+    for idx in range(len(edges) - 1):
+        rows.append(
+            {
+                "Size Interval (µm)": f"{edges[idx]:.2f} – {edges[idx + 1]:.2f}",
+                "Count (n)": int(counts[idx]),
+                "Percentage (%)": round(float(percentages[idx]), 2),
+                "Cumulative (%)": round(float(cumulative[idx]), 2),
+            }
+        )
+
+    table = pd.DataFrame(rows, columns=columns)
+    if not table.empty:
+        # Percentages are rounded per row, so pin the closing balance to exactly 100%
+        table.loc[table.index[-1], "Cumulative (%)"] = 100.0
+    if len(table) > max_rows:
+        table = table[table["Count (n)"] > 0].reset_index(drop=True)
+    return table
 
 
 def plot_size_distribution(
@@ -1197,6 +1416,73 @@ def render_coalescence_network_overlay(
                 cv2.circle(rgb, point, 2, (235, 245, 255), -1, lineType=cv2.LINE_AA)
 
     return rgb
+
+
+def burn_in_scale_bar(
+    image: np.ndarray,
+    length_um: float,
+    pixels_per_um: float,
+    color_name: str,
+    thickness: int,
+    footer_height: int = 0
+) -> np.ndarray:
+    """Draws a scale bar with text in the bottom right corner of the image."""
+    if length_um <= 0 or pixels_per_um <= 0:
+        return image
+
+    color_map = {
+        "White": (255, 255, 255),
+        "Black": (0, 0, 0),
+        "Yellow": (255, 255, 0),
+        "Red": (255, 0, 0)
+    }
+    color = color_map.get(color_name, (255, 255, 255))
+
+    # Ensure image is contiguous and writable
+    img = np.ascontiguousarray(image.copy())
+    h, w = img.shape[:2]
+
+    length_px = int(round(length_um * pixels_per_um))
+    if length_px > w - 40:
+        length_px = w - 40  # prevent drawing outside bounds
+
+    margin_x = max(20, int(w * 0.03))
+
+    # Text sizing
+    text = f"{length_um:g} um"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.4, 0.45 + (w / 3000.0))
+    text_thick = max(1, thickness - 1)
+
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, text_thick)
+
+    # Ensure the bar doesn't get clipped into the footer or the bottom edge
+    margin_y = max(20, int(h * 0.03)) + th + 15
+    base_y = int(h - footer_height - margin_y)
+
+    # Safety clamp for y
+    base_y = max(th + 20, min(base_y, h - 20))
+
+    x2 = w - margin_x
+    x1 = x2 - length_px
+
+    # Safety clamp for x
+    x1 = max(10, x1)
+
+    # Draw line with flat ends
+    cv2.line(img, (x1, base_y), (x2, base_y), color, thickness, cv2.LINE_AA)
+
+    tx = x1 + (length_px - tw) // 2
+    # Safety clamp for the label so it can never leave the image on short bars
+    tx = max(5, min(tx, max(5, w - tw - 5)))
+    ty = base_y - 12  # hover slightly above the line
+
+    # Draw text shadow/outline for readability against any background
+    shadow_color = (0, 0, 0) if color != (0, 0, 0) else (255, 255, 255)
+    cv2.putText(img, text, (tx, ty), font, font_scale, shadow_color, text_thick + 2, cv2.LINE_AA)
+    cv2.putText(img, text, (tx, ty), font, font_scale, color, text_thick, cv2.LINE_AA)
+
+    return img
 
 
 if __name__ == "__main__":
