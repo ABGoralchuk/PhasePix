@@ -80,9 +80,13 @@ The batch script automatically:
 - Syncs the latest updates directly from GitHub (`git fetch --all && git reset --hard origin/main`) **inline in the same window** — the launcher is never re-spawned through `cmd /c`, so the terminal can no longer close on its own.
 - Verifies that Docker Desktop is active (clear message + `pause` instead of a silent exit).
 - Ensures required host directories (`images\sem`, `images\light`, `models_cache`) and preset JSON files exist.
-- Builds and starts the container, trying NVIDIA GPU passthrough first (`docker-compose.yml`) and falling back automatically to `docker-compose.cpu.yml` when no GPU is available (`if errorlevel 1` + `goto`, never a parenthesised `if` block).
+- Starts the cached image with a plain `docker compose up -d` — **no `--build`, no `--force-recreate`**. Because every Python source file is bind-mounted, the `git reset` above already updates the code inside the container, so launches take seconds instead of re-downloading the ~2 GB PyTorch layer.
+- Rebuilds the image **only when it is genuinely needed**: the first launch, or after `Dockerfile` / `requirements.txt` change. A `.phasepix_image_stamp` file (git-ignored) stores the signature of those two files, so a normal launch skips the build entirely.
+- Tries NVIDIA GPU passthrough first (`docker-compose.yml`) and falls back automatically to `docker-compose.cpu.yml` when no GPU is available (`if errorlevel 1` + `goto`, never a parenthesised `if` block).
 - Launches the application in your default browser at `http://localhost:8501`.
 - Streams the live container log and then **always** hits `pause`, so the window stays open on every success and every error path.
+
+> `docker compose up` still reconciles configuration changes on its own: if you edit a volume mount in a compose file, Compose recreates the container automatically — `--force-recreate` is not required for that.
 
 The runtime is pinned in `requirements.txt` to **Streamlit 1.39.0**, the last release that still exposes `streamlit.elements.image.image_to_url` with the positional signature `streamlit-drawable-canvas==0.9.3` uses for its background micrograph. That keeps the **Manual Correction** canvas natively working — no monkey-patching, no data-URL workarounds. The Dockerfile asserts this pairing during the build and fails loudly if a future image ever breaks it.
 

@@ -24,3 +24,6 @@ scratch/
 # OS specific
 .DS_Store
 *.rtf
+
+# Docker image build stamp (written by run_windows_docker.bat)
+.phasepix_image_stamp
