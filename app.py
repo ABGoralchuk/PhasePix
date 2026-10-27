@@ -99,6 +99,7 @@ from streamlit_drawable_canvas import st_canvas
 
 def safe_st_canvas(**kwargs):
     """Universal wrapper for st_canvas resilient to missing or altered keyword arguments across versions."""
+    cleaned_kwargs = dict(kwargs)
     try:
         sig = inspect.signature(st_canvas)
         has_var_kw = any(
@@ -106,15 +107,23 @@ def safe_st_canvas(**kwargs):
             for p in sig.parameters.values()
         )
         if not has_var_kw:
-            kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            cleaned_kwargs = {k: v for k, v in cleaned_kwargs.items() if k in sig.parameters}
     except Exception:
         pass
     try:
-        return st_canvas(**kwargs)
+        return st_canvas(**cleaned_kwargs)
     except TypeError as exc:
-        if "display_toolbar" in str(exc) and "display_toolbar" in kwargs:
-            kwargs.pop("display_toolbar", None)
-            return st_canvas(**kwargs)
+        err_str = str(exc)
+        if "unexpected keyword argument" in err_str:
+            import re
+            m = re.search(r"unexpected keyword argument '([^']+)'", err_str)
+            if m:
+                bad_arg = m.group(1)
+                cleaned_kwargs.pop(bad_arg, None)
+                return st_canvas(**cleaned_kwargs)
+        if "display_toolbar" in cleaned_kwargs:
+            cleaned_kwargs.pop("display_toolbar", None)
+            return st_canvas(**cleaned_kwargs)
         raise
 
 
@@ -2210,15 +2219,28 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
+    st.caption("📦 **Build: 2026.10.27 (v1.3 - Docker & Canvas Patched)**")
 
     # Hardware Acceleration Status
     device, is_gpu = get_device()
     if is_gpu and device.type == "mps":
         st.success("⚡ Hardware Acceleration: **Apple Silicon (MPS)** active", icon="🍏")
     elif is_gpu:
-        st.success(f"⚡ Hardware Acceleration: **CUDA ({device})** active", icon="🚀")
+        try:
+            device_name = torch.cuda.get_device_name(0)
+            st.success(f"⚡ Hardware Acceleration: **CUDA ({device_name})** active", icon="🚀")
+        except Exception:
+            st.success(f"⚡ Hardware Acceleration: **CUDA ({device})** active", icon="🚀")
     else:
         st.info("💻 Hardware Backend: **CPU**", icon="⚙️")
+        with st.expander("ℹ️ GPU Acceleration Guide", expanded=False):
+            st.markdown(
+                "PhasePix is currently running on **CPU**.\n\n"
+                "**To enable NVIDIA GPU acceleration:**\n"
+                "1. **Host Drivers:** Ensure NVIDIA Game Ready or Studio Drivers are installed on Windows.\n"
+                "2. **Docker Desktop:** Open *Settings* → *General* → ensure **'Use the WSL 2 based engine'** is checked.\n"
+                "3. **Native Alternative:** You can also run natively on Windows via `phasepix.bat` (Python directly utilizes CUDA).\n"
+            )
 
     st.divider()
 
