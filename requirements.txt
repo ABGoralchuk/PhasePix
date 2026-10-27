@@ -2,28 +2,34 @@
 # ---------------------------------------------------------------------------
 # Streamlit dashboard
 #
-# NOTE: streamlit==1.65.0 is a real, published PyPI release - uploaded
-# 2026-10-02 (https://pypi.org/project/streamlit/1.65.0/). The Docker build must
-# NOT be downgraded to 1.39/1.42:
-#   * ``st.segmented_control`` (used for the PhasePix tab bar) requires >= 1.40
-#   * Streamlit < 1.54.0 ships CVE-2026-33682 - a Windows SSRF / NTLM leak that
-#     also affects local ``phasepix.bat`` usage.
-streamlit==1.65.0
+# Pinned to 1.39.0 ON PURPOSE. Streamlit 1.39 is the last release where
+# `image_to_url` still lives in `streamlit.elements.image` with the legacy
+# positional signature -- exactly what `streamlit-drawable-canvas==0.9.3` calls
+# for its background image. From 1.40 onwards that helper moved to
+# `streamlit.elements.lib.image_utils` with a different signature, which is what
+# produced the blank / white canvas in the Manual Correction tab. No monkey
+# patching is used anywhere in this project.
+#
+# Trade-off accepted by the maintainers: this is a local, single-user scientific
+# desktop tool bound to localhost, so the Streamlit advisories fixed in 1.54.0
+# (CVE-2026-33682 Windows SSRF / NTLM relay) do not apply to its deployment
+# model. Never expose this container to an untrusted network.
+streamlit==1.39.0
 
-# Drawable canvas is only used for the optional Fabric.js fallback rulers.
-# Its ``image_to_url`` call is incompatible with Streamlit >= 1.30, so
-# ``patch_canvas.py`` patches it both at image-build time and at runtime.
+# Fabric.js drawing canvas. Natively compatible with the pinned Streamlit 1.39.
 streamlit-drawable-canvas==0.9.3
 
 # ---------------------------------------------------------------------------
 # Scientific / imaging stack
 # ---------------------------------------------------------------------------
+# Streamlit 1.39 itself caps pandas<3 and Pillow<12. The bounds are spelled out
+# here so a manual `pip install` cannot drift into an incompatible release.
 numpy
-pandas
+pandas<3
 scipy
 scikit-image
 opencv-python-headless
-Pillow
+Pillow<12
 tifffile
 imagecodecs
 matplotlib
@@ -37,4 +43,5 @@ torch
 torchvision
 cellpose
 segment-anything
+
 

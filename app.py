@@ -7,6 +7,7 @@ phase classification (air bubbles vs. fat particles), and comparative KDE size d
 from typing import Optional, Tuple
 from pathlib import Path
 import base64
+import inspect
 import io
 import json
 import math
@@ -49,50 +50,59 @@ from visualizer import (
 )
 from scale_detector import detect_scale_bar_pixels, detect_scale_bar
 
-# Compatibility layer for streamlit-drawable-canvas on modern Streamlit.
-#
-# ``streamlit-drawable-canvas==0.9.3`` calls the long-removed private helper
-# ``streamlit.elements.image.image_to_url`` with a legacy positional signature,
-# which leaves the canvas background blank (or raises) on Streamlit >= 1.30.
-# ``patch_canvas`` re-installs a local PNG data-URL encoder on every module the
-# package might resolve - and it must run BEFORE the canvas import below so the
-# module-level ``st_image`` reference is already patched.
-import patch_canvas  # noqa: E402  (local helper module)
-
-try:
-    patch_canvas.install()
-except Exception as _patch_canvas_error:  # pragma: no cover - never block startup
-    print(f"[PhasePix] canvas compatibility patch failed: {_patch_canvas_error}")
-
+# Drawable canvas used by the "Manual Correction" tab. On the pinned Streamlit
+# 1.39 this widget is fully native: `streamlit.elements.image.image_to_url` still
+# exists with the positional signature the component expects, so the background
+# micrograph is served through Streamlit's own MediaFileManager - no patching.
 from streamlit_drawable_canvas import st_canvas
 
 
 def safe_st_canvas(**kwargs):
-    """Call ``st_canvas`` while tolerating signature changes across releases.
+    """Call ``st_canvas`` while tolerating keyword changes across releases.
 
-    ``streamlit-drawable-canvas`` still declares ``streamlit>=0.63`` but its
-    keyword list changed several times. Instead of letting one removed keyword
-    crash an entire tab, unsupported keywords are dropped one at a time - as
-    reported by ``TypeError`` - and the call is retried.
+    Only unsupported keyword *names* are removed (``display_toolbar`` is the one
+    that differs between streams of the component). Every value - in particular
+    ``background_image``, which stays the untouched PIL image handed in by the
+    caller - is forwarded exactly as supplied, so Streamlit keeps encoding the
+    micrograph natively through ``image_to_url``.
     """
     cleaned_kwargs = dict(kwargs)
-    for _ in range(6):
+    try:
+        parameters = inspect.signature(st_canvas).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_var_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if parameters and not accepts_var_kwargs:
+        cleaned_kwargs = {
+            name: value
+            for name, value in cleaned_kwargs.items()
+            if name in parameters
+        }
+    for _ in range(4):
         try:
             return st_canvas(**cleaned_kwargs)
         except TypeError as exc:
-            message = str(exc)
-            match = re.search(r"unexpected keyword argument '([^']+)'", message)
-            if match and match.group(1) in cleaned_kwargs:
-                cleaned_kwargs.pop(match.group(1), None)
-                continue
-            if "display_toolbar" in cleaned_kwargs:
-                cleaned_kwargs.pop("display_toolbar", None)
-                continue
-            if "update_streamlit" in cleaned_kwargs:
-                cleaned_kwargs.pop("update_streamlit", None)
-                continue
-            raise
+            match = re.search(r"unexpected keyword argument '([^']+)'", str(exc))
+            if not match or match.group(1) not in cleaned_kwargs:
+                raise
+            cleaned_kwargs.pop(match.group(1))
     return st_canvas(**cleaned_kwargs)
+
+
+# Streamlit 1.39 sizes images with ``use_column_width``; 1.40 renamed it to
+# ``use_container_width`` for ``st.image``. Detect the supported keyword once so
+# every ``st.image`` call below renders full-width on both APIs.
+try:
+    _FULL_WIDTH_IMAGE_KWARGS = (
+        {"use_container_width": True}
+        if "use_container_width" in inspect.signature(st.image).parameters
+        else {"use_column_width": True}
+    )
+except (TypeError, ValueError):
+    _FULL_WIDTH_IMAGE_KWARGS = {"use_column_width": True}
 
 
 # ---------------- LIGHT MICROSCOPY CALIBRATION PRESETS ----------------
@@ -3014,7 +3024,7 @@ with st.sidebar:
             st.image(
                 scale_preview,
                 caption=f"Detected scale-bar line preview ({detected_bar_pixels} px)",
-                use_container_width=True,
+                **_FULL_WIDTH_IMAGE_KWARGS,
             )
 
         scale_bar_um = st.number_input(
@@ -4935,14 +4945,19 @@ else:
     if is_light_mode:
         # Single-phase emulsion light micrographs contain no air bubbles.
         tab_options = [t for t in tab_options if t != "🛡️ Interfacial Analytics"]
-    active_tab = st.segmented_control(
+    # Streamlit 1.39 has no `st.segmented_control` (added in 1.40), so the tab bar
+    # is a horizontal radio group - same look, same "always one tab active"
+    # semantics, supported by every Streamlit release from 1.10 onwards.
+    _default_tab = "📊 Interactive Dashboard"
+    active_tab = st.radio(
         "Navigation",
         options=tab_options,
-        default="📊 Interactive Dashboard",
+        index=tab_options.index(_default_tab) if _default_tab in tab_options else 0,
+        horizontal=True,
         label_visibility="collapsed",
     )
-    if active_tab is None:
-        active_tab = "📊 Interactive Dashboard"
+    if not active_tab:
+        active_tab = _default_tab
 
     # Active Smart Box SAM backbone (persisted across tabs for the session manifest).
     _sam_backbone_state = str(st.session_state.get("sam_backbone_select", "vit_b"))
@@ -4968,7 +4983,7 @@ else:
                     overlay,
                     caption=f"{image_name} — Labeled Objects: {total_objects}"
                     + (f" ({effective_footer}px footer excluded)" if effective_footer > 0 else ""),
-                    use_container_width=True,
+                    **_FULL_WIDTH_IMAGE_KWARGS,
                 )
                 # Export segmented overlay button directly beneath
                 buf_overlay = io.BytesIO()
@@ -4985,7 +5000,7 @@ else:
                     base_display_img,
                     caption=f"{image_name} (Full SEM Micrograph"
                     + (f", {effective_footer}px Footer Dimmed)" if effective_footer > 0 else ")"),
-                    use_container_width=True,
+                    **_FULL_WIDTH_IMAGE_KWARGS,
                 )
                 # Export raw micrograph (with the burned-in scale bar when enabled)
                 buf_raw = io.BytesIO()
@@ -6003,7 +6018,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             st.image(
                 overlay,
                 caption=f"Composite Preview with {len(current_saved_items)} manual objects",
-                use_container_width=True,
+                **_FULL_WIDTH_IMAGE_KWARGS,
             )
 
     # ---------------- TAB 3: VISUAL RULER ----------------
@@ -6199,7 +6214,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             mid_x, mid_y = int((cal_x1 + cal_x2) / 2), int((cal_y1 + cal_y2) / 2)
             cv2.putText(preview_arr, f"{cal_dist_um:.1f} um ({cal_dist_px:.0f} px)", (mid_x - 40, max(25, mid_y - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(preview_arr, f"{cal_dist_um:.1f} um ({cal_dist_px:.0f} px)", (mid_x - 40, max(25, mid_y - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
-            st.image(preview_arr, caption=f"Precision Caliper Line ({cal_dist_um:.2f} µm)", use_container_width=True)
+            st.image(preview_arr, caption=f"Precision Caliper Line ({cal_dist_um:.2f} µm)", **_FULL_WIDTH_IMAGE_KWARGS)
 
     # ---------------- TAB 3: DETAILED METRICS & TABLES ----------------
     elif active_tab == "🔬 Metrics":
@@ -6434,7 +6449,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                 "Cyan: verified bubbles · Gold: adsorbed fat · "
                                 "Labels: apparent contact angle θ"
                             ),
-                            use_container_width=True,
+                            **_FULL_WIDTH_IMAGE_KWARGS,
                         )
                         buf_insp = io.BytesIO()
                         Image.fromarray(inspection_img).save(buf_insp, format="PNG")
@@ -6497,7 +6512,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                     st.image(
                                         crop_img,
                                         caption=f"Bubble #{inspect_id} — close-up",
-                                        use_container_width=True,
+                                        **_FULL_WIDTH_IMAGE_KWARGS,
                                     )
                                     st.caption(
                                         f"Coverage {_safe_ui_float(inspect_row.get('Surface Coverage (%)')):.1f}% · "
@@ -6764,7 +6779,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             else ""
                         )
                     ),
-                    use_container_width=True,
+                    **_FULL_WIDTH_IMAGE_KWARGS,
                 )
                 buf_network = io.BytesIO()
                 Image.fromarray(network_img).save(buf_network, format="PNG")

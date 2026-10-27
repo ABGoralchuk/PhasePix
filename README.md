@@ -57,7 +57,6 @@ PhasePix/
 ├── analyzer.py                       # Morphological, photometric & D[3,2]/D[4,3] feature extraction
 ├── app.py                            # Streamlit web application & UI dashboard
 ├── cellpose_model.py                 # Cellpose inference wrapper with MPS / CUDA / CPU handling
-├── patch_canvas.py                   # streamlit-drawable-canvas compatibility patch (build-time + runtime)
 ├── scale_detector.py                 # Automated SEM scale bar detection
 ├── visualizer.py                     # Size-based phase sorting, overlay rendering & KDE visualization
 ├── install_python.txt                # Native Windows setup commands and dependency guide
@@ -85,7 +84,7 @@ The batch script automatically:
 - Launches the application in your default browser at `http://localhost:8501`.
 - Streams the live container log and then **always** hits `pause`, so the window stays open on every success and every error path.
 
-During `docker build`, `patch_canvas.py` rewrites `streamlit_drawable_canvas/__init__.py` inside `site-packages` so the canvas encodes its background image locally as `data:image/png;base64,...` and never calls Streamlit's removed private `image_to_url` API. `app.py` imports the same module again at runtime, giving two independent layers of protection.
+The runtime is pinned in `requirements.txt` to **Streamlit 1.39.0**, the last release that still exposes `streamlit.elements.image.image_to_url` with the positional signature `streamlit-drawable-canvas==0.9.3` uses for its background micrograph. That keeps the **Manual Correction** canvas natively working — no monkey-patching, no data-URL workarounds. The Dockerfile asserts this pairing during the build and fails loudly if a future image ever breaks it.
 
 ### macOS / Linux (Docker Compose)
 
