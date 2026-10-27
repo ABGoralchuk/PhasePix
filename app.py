@@ -6,6 +6,7 @@ phase classification (air bubbles vs. fat particles), and comparative KDE size d
 
 from typing import Optional, Tuple
 from pathlib import Path
+import base64
 import io
 import json
 import math
@@ -17,6 +18,7 @@ import pandas as pd
 from PIL import Image
 import tifffile
 import streamlit as st
+import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.ndimage import find_objects
@@ -47,84 +49,50 @@ from visualizer import (
 )
 from scale_detector import detect_scale_bar_pixels, detect_scale_bar
 
-# Compatibility shim: adapt image_to_url for streamlit_drawable_canvas across all Streamlit versions
-import inspect
-from types import SimpleNamespace
+# Compatibility layer for streamlit-drawable-canvas on modern Streamlit.
+#
+# ``streamlit-drawable-canvas==0.9.3`` calls the long-removed private helper
+# ``streamlit.elements.image.image_to_url`` with a legacy positional signature,
+# which leaves the canvas background blank (or raises) on Streamlit >= 1.30.
+# ``patch_canvas`` re-installs a local PNG data-URL encoder on every module the
+# package might resolve - and it must run BEFORE the canvas import below so the
+# module-level ``st_image`` reference is already patched.
+import patch_canvas  # noqa: E402  (local helper module)
 
 try:
-    import streamlit.elements.image as _sei
-except Exception:
-    _sei = None
-
-try:
-    import streamlit.elements.lib.image_utils as _image_utils
-except Exception:
-    _image_utils = None
-
-if _sei is not None:
-    _orig_func = getattr(_sei, "image_to_url", None)
-    if _orig_func is None and _image_utils is not None:
-        _orig_func = getattr(_image_utils, "image_to_url", None)
-
-    def _compat_image_to_url(image, layout_config=None, *args, **kwargs):
-        if isinstance(layout_config, (int, float)) or layout_config is None:
-            w = int(layout_config) if layout_config is not None else -1
-            layout_config = SimpleNamespace(width=w)
-        if _orig_func is not None:
-            try:
-                return _orig_func(image, layout_config, *args, **kwargs)
-            except Exception:
-                pass
-        try:
-            import io
-            import base64
-            buf = io.BytesIO()
-            if hasattr(image, "save"):
-                image.save(buf, format="PNG")
-                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                return f"data:image/png;base64,{b64}"
-        except Exception:
-            pass
-        return ""
-
-    if not hasattr(_sei, "image_to_url") or not getattr(_sei, "_phasepix_patched", False):
-        _sei.image_to_url = _compat_image_to_url
-        _sei._phasepix_patched = True
-    if _image_utils is not None and (not hasattr(_image_utils, "image_to_url") or not getattr(_image_utils, "_phasepix_patched", False)):
-        _image_utils.image_to_url = _compat_image_to_url
-        _image_utils._phasepix_patched = True
+    patch_canvas.install()
+except Exception as _patch_canvas_error:  # pragma: no cover - never block startup
+    print(f"[PhasePix] canvas compatibility patch failed: {_patch_canvas_error}")
 
 from streamlit_drawable_canvas import st_canvas
 
 
 def safe_st_canvas(**kwargs):
-    """Universal wrapper for st_canvas resilient to missing or altered keyword arguments across versions."""
+    """Call ``st_canvas`` while tolerating signature changes across releases.
+
+    ``streamlit-drawable-canvas`` still declares ``streamlit>=0.63`` but its
+    keyword list changed several times. Instead of letting one removed keyword
+    crash an entire tab, unsupported keywords are dropped one at a time - as
+    reported by ``TypeError`` - and the call is retried.
+    """
     cleaned_kwargs = dict(kwargs)
-    try:
-        sig = inspect.signature(st_canvas)
-        has_var_kw = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in sig.parameters.values()
-        )
-        if not has_var_kw:
-            cleaned_kwargs = {k: v for k, v in cleaned_kwargs.items() if k in sig.parameters}
-    except Exception:
-        pass
-    try:
-        return st_canvas(**cleaned_kwargs)
-    except TypeError as exc:
-        err_str = str(exc)
-        if "unexpected keyword argument" in err_str:
-            import re
-            m = re.search(r"unexpected keyword argument '([^']+)'", err_str)
-            if m:
-                bad_arg = m.group(1)
-                cleaned_kwargs.pop(bad_arg, None)
-                return st_canvas(**cleaned_kwargs)
-        if "display_toolbar" in cleaned_kwargs:
-            cleaned_kwargs.pop("display_toolbar", None)
+    for _ in range(6):
+        try:
             return st_canvas(**cleaned_kwargs)
-        raise
+        except TypeError as exc:
+            message = str(exc)
+            match = re.search(r"unexpected keyword argument '([^']+)'", message)
+            if match and match.group(1) in cleaned_kwargs:
+                cleaned_kwargs.pop(match.group(1), None)
+                continue
+            if "display_toolbar" in cleaned_kwargs:
+                cleaned_kwargs.pop("display_toolbar", None)
+                continue
+            if "update_streamlit" in cleaned_kwargs:
+                cleaned_kwargs.pop("update_streamlit", None)
+                continue
+            raise
+    return st_canvas(**cleaned_kwargs)
 
 
 # ---------------- LIGHT MICROSCOPY CALIBRATION PRESETS ----------------
@@ -1778,6 +1746,508 @@ def calculate_canvas_line_length(line_obj: dict) -> float:
     w = float(line_obj.get("width", 0.0)) * scale_x
     h = float(line_obj.get("height", 0.0)) * scale_y
     return float(np.hypot(w, h))
+
+
+# ---------------------------------------------------------------------------
+# Visual Ruler: self-contained HTML5 caliper (no websocket, zero latency)
+# ---------------------------------------------------------------------------
+# The template is rendered with ``st.components.v1.html`` and therefore lives
+# entirely in the browser: dragging a line never triggers a Streamlit rerun, so
+# the measurement appears instantly and cannot be lost by a websocket hiccup.
+#
+# __NATIVE_W__ / __NATIVE_H__ are the *native* micrograph dimensions,
+# __BITMAP_W__ / __BITMAP_H__ the embedded PNG dimensions and __UM_PER_PX__ the
+# active calibration. Because every pointer event is mapped from CSS pixels to
+# bitmap pixels and then to native pixels, the µm value is exact regardless of
+# browser zoom, canvas downscaling or CSS responsiveness.
+_VISUAL_RULER_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #fafafa; -webkit-font-smoothing: antialiased;
+  }
+  .pp-ruler {
+    max-width: __DISPLAY_W__px; margin: 0 auto; background: #161a24;
+    border: 1px solid #2b3242; border-radius: 12px; padding: 12px;
+  }
+  .pp-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-bottom: 11px; }
+  .pp-card { background: #10141d; border: 1px solid #2b3242; border-radius: 10px; padding: 8px 11px; }
+  .pp-label { font-size: 10.5px; letter-spacing: .045em; text-transform: uppercase; color: #8b97ad; }
+  .pp-value { font-size: 20px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .pp-value.um { color: #00e07a; }
+  .pp-value.px { color: #6fb2ff; }
+  .pp-value.min { color: #ffcf5c; }
+  .pp-value.max { color: #ff9d5c; }
+  .pp-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .pp-row label { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: #c9d1e2; }
+  input[type="color"] {
+    width: 34px; height: 26px; padding: 0; border: 1px solid #3a4356;
+    border-radius: 6px; background: #0e1117; cursor: pointer;
+  }
+  input[type="range"] { width: 104px; accent-color: #00e07a; cursor: pointer; }
+  .pp-width-val { font-variant-numeric: tabular-nums; color: #8b97ad; min-width: 34px; }
+  button {
+    font-size: 12.5px; font-weight: 600; color: #fafafa; background: #232a38;
+    border: 1px solid #3a4356; border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { background: #2d3546; }
+  button.danger { border-color: #7a2f38; background: #3a1c22; }
+  button.danger:hover { background: #4a222a; }
+  .pp-hint { font-size: 11.5px; color: #8b97ad; }
+  .pp-stage {
+    position: relative; line-height: 0; border-radius: 10px; overflow: hidden;
+    border: 1px solid #2b3242; background: #000;
+  }
+  canvas { display: block; width: 100%; height: auto; cursor: crosshair; touch-action: none; }
+  .pp-badge {
+    position: absolute; transform: translate(-50%, -135%); pointer-events: none;
+    background: rgba(8, 12, 18, .93); border: 1px solid #00e07a; border-radius: 8px;
+    padding: 3px 8px; font-size: 13px; font-weight: 700; color: #00e07a;
+    white-space: nowrap; line-height: 1.3; opacity: 0;
+    transition: opacity .07s linear; box-shadow: 0 4px 14px rgba(0, 0, 0, .45);
+  }
+  .pp-badge-px { color: #9fb3cc; font-weight: 600; font-size: 10.5px; }
+  .pp-table-wrap {
+    margin-top: 11px; max-height: 178px; overflow-y: auto;
+    border: 1px solid #2b3242; border-radius: 10px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid #222a37; }
+  th {
+    position: sticky; top: 0; background: #1b2130; color: #9fb3cc; font-weight: 600;
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #1b2130; }
+  .pp-empty { color: #8b97ad; font-size: 12px; padding: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="pp-ruler">
+  <div class="pp-cards">
+    <div class="pp-card"><div class="pp-label">Measured Length (µm)</div><div class="pp-value um" id="v-um">0.00 µm</div></div>
+    <div class="pp-card"><div class="pp-label">Measured Length (px)</div><div class="pp-value px" id="v-px">0.0 px</div></div>
+    <div class="pp-card"><div class="pp-label">Suggested Min Size (80%)</div><div class="pp-value min" id="v-min">0.00 µm</div></div>
+    <div class="pp-card"><div class="pp-label">Suggested Max Size (120%)</div><div class="pp-value max" id="v-max">0.00 µm</div></div>
+  </div>
+  <div class="pp-row">
+    <label>Line color <input type="color" id="line-color" value="#00ff66" /></label>
+    <label>Width <input type="range" id="line-width" min="1" max="10" step="1" value="3" /><span class="pp-width-val" id="line-width-val">3 px</span></label>
+    <button type="button" id="btn-undo">&#8630; Undo Last Line</button>
+    <button type="button" id="btn-clear" class="danger">Clear All Lines</button>
+    <span class="pp-hint" id="hint">Click and drag across a bubble, pore or fat droplet.</span>
+  </div>
+  <div class="pp-stage">
+    <canvas id="ruler-canvas"></canvas>
+    <div class="pp-badge" id="badge">
+      <span id="badge-um">0.00 µm</span><br />
+      <span class="pp-badge-px" id="badge-px">0.0 px</span>
+    </div>
+  </div>
+  <div class="pp-table-wrap">
+    <table>
+      <thead>
+        <tr><th>Line #</th><th>Length (px)</th><th>Length (µm)</th><th>Suggested Min (µm)</th><th>Suggested Max (µm)</th></tr>
+      </thead>
+      <tbody id="history"></tbody>
+    </table>
+    <div class="pp-empty" id="empty">No measurements yet - draw your first line on the micrograph above.</div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  // ---- Native micrograph geometry & calibration (injected by app.py) --------
+  var NATIVE_W = __NATIVE_W__;
+  var NATIVE_H = __NATIVE_H__;
+  var BITMAP_W = __BITMAP_W__;
+  var BITMAP_H = __BITMAP_H__;
+  var UM_PER_PX = __UM_PER_PX__;
+  var IMAGE_SRC = "__IMAGE_SRC__";
+
+  var canvas = document.getElementById("ruler-canvas");
+  var stage = canvas.parentNode;
+  var ctx = canvas.getContext("2d");
+  var badge = document.getElementById("badge");
+  var badgeUm = document.getElementById("badge-um");
+  var badgePx = document.getElementById("badge-px");
+  var historyBody = document.getElementById("history");
+  var emptyRow = document.getElementById("empty");
+  var hint = document.getElementById("hint");
+  var colorInput = document.getElementById("line-color");
+  var widthInput = document.getElementById("line-width");
+  var widthLabel = document.getElementById("line-width-val");
+
+  var lines = [];
+  var drag = null;
+  var preview = null;
+  var lineSeq = 0;
+  var bgReady = false;
+  var bg = new Image();
+
+  canvas.width = BITMAP_W;
+  canvas.height = BITMAP_H;
+
+  // ---- Geometry helpers ----------------------------------------------------
+  // CSS pixel -> canvas bitmap pixel.
+  function toBitmap(evt) {
+    var rect = canvas.getBoundingClientRect();
+    var scaleX = rect.width ? canvas.width / rect.width : 1;
+    var scaleY = rect.height ? canvas.height / rect.height : 1;
+    return {
+      x: (evt.clientX - rect.left) * scaleX,
+      y: (evt.clientY - rect.top) * scaleY
+    };
+  }
+
+  // Bitmap pixel delta -> native micrograph pixel length.
+  // X and Y are scaled independently so a non-square canvas / downscaled bitmap
+  // can never skew the result.
+  function nativePx(dxBitmap, dyBitmap) {
+    var dx = dxBitmap * (NATIVE_W / BITMAP_W);
+    var dy = dyBitmap * (NATIVE_H / BITMAP_H);
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function fmt(value, digits) {
+    var number = Number(value);
+    if (!isFinite(number)) { return (0).toFixed(digits); }
+    return number.toFixed(digits);
+  }
+
+  // ---- Live dashboard ------------------------------------------------------
+  function updateDashboard(pixelLength) {
+    var um = pixelLength * UM_PER_PX;
+    document.getElementById("v-um").textContent = fmt(um, 2) + " µm";
+    document.getElementById("v-px").textContent = fmt(pixelLength, 1) + " px";
+    document.getElementById("v-min").textContent = fmt(um * 0.8, 2) + " µm";
+    document.getElementById("v-max").textContent = fmt(um * 1.2, 2) + " µm";
+    return um;
+  }
+
+  function updateBadge(evt, pixelLength, um) {
+    if (!(um > 0)) { hideBadge(); return; }
+    var rect = stage.getBoundingClientRect();
+    badge.style.left = (evt.clientX - rect.left) + "px";
+    badge.style.top = (evt.clientY - rect.top) + "px";
+    badge.style.opacity = "1";
+    badgeUm.textContent = fmt(um, 2) + " µm";
+    badgePx.textContent = fmt(pixelLength, 1) + " px";
+  }
+
+  function hideBadge() { badge.style.opacity = "0"; }
+
+  // Keep stroke thickness visually constant even when the bitmap is downscaled.
+  function strokeWidth() {
+    var requested = parseFloat(widthInput.value) || 3;
+    var bitmapScale = BITMAP_W / Math.max(360, Math.min(BITMAP_W, 900));
+    return Math.max(1, requested * bitmapScale);
+  }
+
+  // ---- Rendering -----------------------------------------------------------
+  function drawScaleBar() {
+    if (!(UM_PER_PX > 0)) { return; }
+    var candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000];
+    var target = BITMAP_W * 0.16;
+    var chosen = candidates[0];
+    for (var i = 0; i < candidates.length; i++) {
+      var candidatePx = (candidates[i] / UM_PER_PX) * (BITMAP_W / NATIVE_W);
+      if (candidatePx <= target) { chosen = candidates[i]; }
+    }
+    var barPx = (chosen / UM_PER_PX) * (BITMAP_W / NATIVE_W);
+    var pad = Math.max(9, BITMAP_W * 0.012);
+    var y = BITMAP_H - pad;
+    var fontSize = Math.max(11, Math.round(BITMAP_W * 0.015));
+
+    ctx.save();
+    ctx.lineCap = "butt";
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+    ctx.lineWidth = Math.max(4, BITMAP_W * 0.006);
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(pad + barPx, y); ctx.stroke();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(2, BITMAP_W * 0.0025);
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(pad + barPx, y); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(pad, y - fontSize * 0.45); ctx.lineTo(pad, y + fontSize * 0.45);
+    ctx.moveTo(pad + barPx, y - fontSize * 0.45); ctx.lineTo(pad + barPx, y + fontSize * 0.45);
+    ctx.stroke();
+    ctx.font = "bold " + fontSize + "px sans-serif";
+    ctx.textBaseline = "bottom";
+    var label = chosen + " µm";
+    ctx.lineWidth = Math.max(2, BITMAP_W * 0.0035);
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+    ctx.strokeText(label, pad, y - fontSize * 0.7);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(label, pad, y - fontSize * 0.7);
+    ctx.restore();
+  }
+
+  function drawSegment(segment, isPreview) {
+    var lw = strokeWidth();
+    ctx.save();
+    ctx.strokeStyle = segment.color;
+    ctx.fillStyle = segment.color;
+    ctx.lineWidth = lw;
+    ctx.lineCap = "round";
+    if (isPreview) { ctx.setLineDash([lw * 2.4, lw * 2.0]); }
+    ctx.beginPath();
+    ctx.moveTo(segment.x1, segment.y1);
+    ctx.lineTo(segment.x2, segment.y2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    var radius = Math.max(2.5, lw * 1.25);
+    ctx.beginPath(); ctx.arc(segment.x1, segment.y1, radius, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(segment.x2, segment.y2, radius, 0, Math.PI * 2); ctx.fill();
+
+    if (!isPreview) {
+      var fontSize = Math.max(12, Math.round(BITMAP_W * 0.017));
+      var text = fmt(segment.um, 2) + " µm";
+      var midX = (segment.x1 + segment.x2) / 2;
+      var midY = (segment.y1 + segment.y2) / 2 - fontSize * 0.85;
+      ctx.font = "bold " + fontSize + "px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      var textWidth = ctx.measureText(text).width;
+      var padX = fontSize * 0.4;
+      var boxHeight = fontSize * 1.5;
+      ctx.fillStyle = "rgba(8, 12, 18, 0.82)";
+      ctx.fillRect(
+        midX - textWidth / 2 - padX, midY - boxHeight / 2,
+        textWidth + padX * 2, boxHeight
+      );
+      ctx.fillStyle = segment.color;
+      ctx.fillText(text, midX, midY);
+    }
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (bgReady) { ctx.drawImage(bg, 0, 0, BITMAP_W, BITMAP_H); }
+    drawScaleBar();
+    for (var i = 0; i < lines.length; i++) { drawSegment(lines[i], false); }
+    if (preview) { drawSegment(preview, true); }
+  }
+
+  // ---- Measurement history -------------------------------------------------
+  function renderHistory() {
+    historyBody.innerHTML = "";
+    emptyRow.style.display = lines.length ? "none" : "block";
+    for (var i = lines.length - 1; i >= 0; i--) {
+      var line = lines[i];
+      var cells = [
+        "#" + line.id,
+        fmt(line.px, 1),
+        fmt(line.um, 2),
+        fmt(line.um * 0.8, 2),
+        fmt(line.um * 1.2, 2)
+      ];
+      var row = document.createElement("tr");
+      for (var c = 0; c < cells.length; c++) {
+        var cell = document.createElement("td");
+        cell.textContent = cells[c];
+        row.appendChild(cell);
+      }
+      historyBody.appendChild(row);
+    }
+  }
+
+  // ---- Interaction ---------------------------------------------------------
+  function finishDrag(evt) {
+    if (!drag) { return; }
+    var pixelLength = nativePx(drag.x2 - drag.x1, drag.y2 - drag.y1);
+    if (pixelLength >= 1.5) {
+      lineSeq += 1;
+      lines.push({
+        id: lineSeq,
+        x1: drag.x1, y1: drag.y1, x2: drag.x2, y2: drag.y2,
+        px: pixelLength,
+        um: pixelLength * UM_PER_PX,
+        color: colorInput.value
+      });
+      updateDashboard(pixelLength);
+      renderHistory();
+    }
+    drag = null;
+    preview = null;
+    hideBadge();
+    draw();
+    if (evt && evt.preventDefault) { evt.preventDefault(); }
+  }
+
+  canvas.addEventListener("pointerdown", function (evt) {
+    if (evt.button !== undefined && evt.button > 0) { return; }
+    var point = toBitmap(evt);
+    drag = { x1: point.x, y1: point.y, x2: point.x, y2: point.y };
+    preview = { x1: point.x, y1: point.y, x2: point.x, y2: point.y, color: colorInput.value };
+    if (canvas.setPointerCapture) {
+      try { canvas.setPointerCapture(evt.pointerId); } catch (err) { /* ignore */ }
+    }
+    updateDashboard(0);
+    hideBadge();
+    draw();
+    evt.preventDefault();
+  });
+
+  canvas.addEventListener("pointermove", function (evt) {
+    if (!drag) { return; }
+    var point = toBitmap(evt);
+    drag.x2 = point.x;
+    drag.y2 = point.y;
+    preview.x2 = point.x;
+    preview.y2 = point.y;
+    var pixelLength = nativePx(drag.x2 - drag.x1, drag.y2 - drag.y1);
+    var um = updateDashboard(pixelLength);
+    updateBadge(evt, pixelLength, um);
+    draw();
+    evt.preventDefault();
+  });
+
+  canvas.addEventListener("pointerup", finishDrag);
+  canvas.addEventListener("pointercancel", function () {
+    drag = null; preview = null; hideBadge(); draw();
+  });
+  canvas.addEventListener("pointerleave", function () {
+    if (!drag) { hideBadge(); }
+  });
+
+  document.getElementById("btn-undo").addEventListener("click", function () {
+    if (lines.length) { lines.pop(); }
+    renderHistory();
+    if (lines.length) {
+      updateDashboard(lines[lines.length - 1].px);
+    } else {
+      updateDashboard(0);
+    }
+    hideBadge();
+    draw();
+  });
+
+  document.getElementById("btn-clear").addEventListener("click", function () {
+    lines = [];
+    lineSeq = 0;
+    renderHistory();
+    updateDashboard(0);
+    hideBadge();
+    draw();
+  });
+
+  colorInput.addEventListener("input", function () { draw(); });
+  widthInput.addEventListener("input", function () {
+    widthLabel.textContent = widthInput.value + " px";
+    draw();
+  });
+
+  // ---- Boot ----------------------------------------------------------------
+  bg.onload = function () {
+    bgReady = true;
+    hint.textContent = "Drag across a feature. Suggested bounds = 80% / 120% of the measured size.";
+    draw();
+  };
+  bg.onerror = function () {
+    hint.textContent = "Background micrograph could not be loaded - the caliper still measures correctly.";
+    draw();
+  };
+  bg.src = IMAGE_SRC;
+
+  renderHistory();
+  updateDashboard(0);
+  draw();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def build_visual_ruler_html(
+    image_src: str,
+    native_w: int,
+    native_h: int,
+    bitmap_w: int,
+    bitmap_h: int,
+    um_per_px: float,
+    display_w: int,
+) -> str:
+    """Render the self-contained HTML5 caliper for the Visual Ruler tab.
+
+    Args:
+        image_src: ``data:image/png;base64,...`` URL of the analysis micrograph.
+        native_w: Native micrograph width in calibration pixels.
+        native_h: Native micrograph height in calibration pixels.
+        bitmap_w: Width of the embedded PNG (after optional downscaling).
+        bitmap_h: Height of the embedded PNG.
+        um_per_px: Active calibration factor (micrometres per native pixel).
+        display_w: Preferred CSS width of the component in pixels.
+
+    Returns:
+        A complete HTML document string for ``st.components.v1.html``.
+    """
+    replacements = {
+        "__NATIVE_W__": str(int(native_w)),
+        "__NATIVE_H__": str(int(native_h)),
+        "__BITMAP_W__": str(int(bitmap_w)),
+        "__BITMAP_H__": str(int(bitmap_h)),
+        "__UM_PER_PX__": repr(float(um_per_px)),
+        "__IMAGE_SRC__": image_src,
+        "__DISPLAY_W__": str(int(display_w)),
+    }
+    html = _VISUAL_RULER_HTML
+    for token, value in replacements.items():
+        html = html.replace(token, value)
+    return html
+
+
+def encode_png_data_url(
+    image: np.ndarray,
+    max_width: int = 1400,
+) -> Tuple[str, int, int]:
+    """Encode a micrograph as a self-contained ``data:image/png;base64,...`` URL.
+
+    The image is optionally downscaled so the HTML component payload stays small.
+    The returned bitmap dimensions are used by the browser-side caliper to convert
+    dragged (CSS) distances back into *native* micrograph pixels, so downscaling
+    never changes the physical measurement.
+
+    Args:
+        image: Grayscale (H, W) or colour (H, W, 3/4) uint8 array.
+        max_width: Downscale ceiling for the embedded bitmap; ``0`` disables it.
+
+    Returns:
+        ``(data_url, bitmap_width, bitmap_height)``.
+    """
+    array = np.asarray(image)
+    if array.ndim == 2:
+        pil_image = Image.fromarray(array).convert("RGB")
+    else:
+        pil_image = Image.fromarray(array[:, :, :3])
+
+    if max_width and pil_image.width > max_width:
+        ratio = max_width / float(pil_image.width)
+        new_size = (
+            int(max_width),
+            max(1, int(round(pil_image.height * ratio))),
+        )
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        pil_image = pil_image.resize(new_size, resample)
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
+    data_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(buffer.getvalue()).decode("ascii")
+    )
+    return data_url, int(pil_image.width), int(pil_image.height)
 
 
 def _extract_ruler_segments_px(
@@ -5540,48 +6010,105 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
     elif active_tab == "📏 Visual Ruler":
         st.subheader("📏 Visual Ruler: Interactive Microstructural Caliper")
         st.markdown(
-            "Draw a line across any bubble, pore, or fat droplet to measure its physical dimension. "
-            "Use the measured length to accurately set the Min/Max size boundaries in the sidebar."
+            "Drag a line across any bubble, pore, or fat droplet and read its physical size "
+            "**instantly**. The caliper below runs entirely in your browser - no server round-trip, "
+            "no websocket dependency - so it behaves identically on Windows Docker, macOS and Linux."
         )
 
         # Convert analysis_img (RGB or grayscale) to PIL Image
         if len(analysis_img.shape) == 2:
             ruler_pil = Image.fromarray(analysis_img).convert("RGB")
         else:
-            ruler_pil = Image.fromarray(analysis_img)
+            ruler_pil = Image.fromarray(analysis_img[:, :, :3])
 
         ruler_w, ruler_h = ruler_pil.size
-        # Responsive canvas sizing fitting browser view
-        max_canvas_width = 750
-        scale_ratio = min(1.0, max_canvas_width / float(ruler_w))
-        target_w = int(ruler_w * scale_ratio)
-        target_h = int(ruler_h * scale_ratio)
-        canvas_bg = ruler_pil.resize((target_w, target_h)) if scale_ratio < 1.0 else ruler_pil
 
-        col_canvas, col_measure = st.columns([2.0, 1.0])
+        ruler_scale_cols = st.columns(3)
+        with ruler_scale_cols[0]:
+            st.metric("Active Scale", f"{pixels_per_um:.2f} px/µm")
+        with ruler_scale_cols[1]:
+            st.metric("Calibration Factor", f"{pixel_to_um_ratio:.4f} µm/px")
+        with ruler_scale_cols[2]:
+            if 'is_light_mode' in locals() and is_light_mode and 'selected_objective' in locals():
+                st.metric("Objective Preset", str(selected_objective))
+            else:
+                st.metric("Analysis Frame", f"{ruler_w} × {ruler_h} px")
 
-        with col_canvas:
+        # ---- PRIMARY: self-contained HTML5 caliper (zero latency) ----
+        # Everything happens client-side: the micrograph is embedded as a base64
+        # PNG and the measurement maths use the exact native/bitmap ratio, so a
+        # downscaled preview can never distort the reported micrometres.
+        try:
+            (
+                ruler_data_url,
+                ruler_bitmap_w,
+                ruler_bitmap_h,
+            ) = encode_png_data_url(analysis_img, max_width=1400)
+            ruler_display_w = int(min(880, ruler_bitmap_w))
+            ruler_display_h = max(
+                90,
+                int(round(ruler_display_w * ruler_bitmap_h / float(ruler_bitmap_w))),
+            )
+            components.html(
+                build_visual_ruler_html(
+                    image_src=ruler_data_url,
+                    native_w=int(ruler_w),
+                    native_h=int(ruler_h),
+                    bitmap_w=int(ruler_bitmap_w),
+                    bitmap_h=int(ruler_bitmap_h),
+                    um_per_px=float(pixel_to_um_ratio),
+                    display_w=int(ruler_display_w),
+                ),
+                height=int(ruler_display_h + 440),
+                scrolling=False,
+            )
+            st.caption(
+                f"Native measurement frame: **{ruler_w} × {ruler_h} px** at "
+                f"**{pixel_to_um_ratio:.4f} µm/px** (0.1 pixel drag resolution ≈ "
+                f"{pixel_to_um_ratio * 0.1:.3f} µm). Use browser zoom for finer placement."
+            )
+        except Exception as ruler_exc:
+            st.error(f"The interactive canvas caliper could not be rendered: {ruler_exc}")
+            st.info("Use the precision coordinate caliper at the bottom of this tab instead.")
+
+        # ---- SECONDARY: Fabric.js drawable canvas (optional cross-check) ----
+        with st.expander("🖌️ Fabric.js Drawable Canvas - optional cross-check", expanded=False):
+            st.caption(
+                "Legacy `streamlit-drawable-canvas` caliper. It needs a websocket round-trip, so "
+                "lines can lag or fail to arrive on some Windows/browser combinations - the HTML5 "
+                "caliper above is authoritative."
+            )
             col_tools1, col_tools2 = st.columns(2)
             with col_tools1:
                 line_color = st.color_picker("Ruler Color", "#00FF66", help="Color of the caliper measurement line.")
             with col_tools2:
                 line_width = st.slider("Line Width", min_value=1, max_value=8, value=3)
 
-            canvas_result = safe_st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=line_width,
-                stroke_color=line_color,
-                background_image=canvas_bg,
-                update_streamlit=True,
-                height=target_h,
-                width=target_w,
-                drawing_mode="line",
-                display_toolbar=True,
-                key=f"visual_ruler_{image_name}",
-            )
+            # Responsive canvas sizing fitting browser view
+            max_canvas_width = 750
+            scale_ratio = min(1.0, max_canvas_width / float(ruler_w))
+            target_w = max(1, int(ruler_w * scale_ratio))
+            target_h = max(1, int(ruler_h * scale_ratio))
+            canvas_bg = ruler_pil.resize((target_w, target_h)) if scale_ratio < 1.0 else ruler_pil
 
-        with col_measure:
-            st.markdown("### Caliper Measurement")
+            canvas_result = None
+            try:
+                canvas_result = safe_st_canvas(
+                    fill_color="rgba(0, 0, 0, 0)",
+                    stroke_width=line_width,
+                    stroke_color=line_color,
+                    background_image=canvas_bg,
+                    update_streamlit=True,
+                    height=target_h,
+                    width=target_w,
+                    drawing_mode="line",
+                    display_toolbar=True,
+                    key=f"visual_ruler_{image_name}",
+                )
+            except Exception as canvas_exc:
+                st.warning(f"Fabric.js drawable canvas unavailable: {canvas_exc}")
+
+            st.markdown("#### Fallback Caliper Measurement")
             scale_label = f"📏 Scale: **{pixels_per_um:.2f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)"
             if 'is_light_mode' in locals() and is_light_mode and 'selected_objective' in locals():
                 scale_label += f" | 💡 Preset: **{selected_objective}**"
@@ -5612,29 +6139,29 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     delta=f"{latest_px:.1f} px",
                 )
 
-                min_suggest = max(0.1, round(latest_um * 0.8, 1))
-                max_suggest = round(latest_um * 1.2, 1)
+                min_suggest = max(0.1, round(latest_um * 0.8, 2))
+                max_suggest = round(latest_um * 1.2, 2)
 
                 st.success(
                     f"💡 **Suggested Sidebar Boundary Range:**\n\n"
-                    f"- **Min Size:** `{min_suggest:.1f} µm` (80%)\n"
-                    f"- **Max Size:** `{max_suggest:.1f} µm` (120%)"
+                    f"- **Min Size:** `{min_suggest:.2f} µm` (80%)\n"
+                    f"- **Max Size:** `{max_suggest:.2f} µm` (120%)"
                 )
 
-                if len(measured_segments) > 1:
-                    st.markdown("#### Measurement History")
-                    history_df = pd.DataFrame([
-                        {
-                            "Line #": s["index"],
-                            "Type": s["type"],
-                            "Length (px)": s["length_px"],
-                            "Length (µm)": s["length_um"],
-                        }
-                        for s in measured_segments
-                    ])
-                    st.dataframe(history_df, use_container_width=True, hide_index=True)
+                history_df = pd.DataFrame([
+                    {
+                        "Line #": s["index"],
+                        "Type": s["type"],
+                        "Length (px)": round(float(s["length_px"]), 1),
+                        "Length (µm)": round(float(s["length_um"]), 2),
+                        "Suggested Min (µm)": round(float(s["length_um"]) * 0.8, 2),
+                        "Suggested Max (µm)": round(float(s["length_um"]) * 1.2, 2),
+                    }
+                    for s in measured_segments
+                ])
+                st.dataframe(history_df, use_container_width=True, hide_index=True)
             else:
-                st.caption("👈 Click and drag a line on the micrograph to measure a pore or particle.")
+                st.caption("Click and drag a line on the canvas above to measure a pore or particle.")
 
         with st.expander("📐 Precision Coordinate Caliper (Fallback / Exact Pixel Ruler)", expanded=False):
             st.markdown(

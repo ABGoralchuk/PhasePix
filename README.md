@@ -23,7 +23,7 @@ PhasePix is a high-performance Streamlit application designed for automated deep
 - **Dedicated Granulometry Export**: Interactive results table in the **Metrics** tab with an instant one-click download button (`📥 Download Results Table (CSV)`) for food science and colloidal dispersion publications.
 - **Interactive Table Editing & Manual Reclassification (`st.data_editor`)**: Researchers can check off artifact particles via the `Excluded` boolean checkbox column AND manually reclassify particles using the editable `phase_class` dropdown (`st.column_config.SelectboxColumn` with `['air_bubbles', 'fat_particles', 'Unclassified']`). Clicking `Apply Changes` synchronizes modifications to `st.session_state`, immediately recoloring the particle on the overlay, recalculating phase KPI counts, and updating granulometry metrics in real time (with a `Reset Modifications` option).
 - **Lime Green Unclassified Masks**: Unclassified particles (those not matching the Min/Max size boundaries) are highlighted on the segmentation overlay in distinct semi-transparent Lime Green (`RGB 50, 205, 50` / `#32cd32`), making them instantly recognizable for visual inspection and manual reclassification.
-- **Visual Ruler (Interactive SEM Caliper)**: Powered by `streamlit-drawable-canvas`, researchers can switch to the **📏 Visual Ruler** tab to draw measurement lines directly across pores, bubbles, or fat globules on the micrograph. The tool automatically computes Euclidean line length in pixels $\sqrt{\Delta x^2 + \Delta y^2}$, multiplies by the active spatial calibration scale, and displays the exact physical dimension in micrometers ($\mu\text{m}$) via a prominent metric card and history table, providing immediate guidance for configuring Min/Max boundary thresholds.
+- **Visual Ruler (Zero-Latency HTML5 Caliper)**: The **📏 Visual Ruler** tab renders the micrograph inside a self-contained HTML5 `<canvas>` component (`st.components.v1.html`), so a click-and-drag measurement is calculated **entirely in the browser** — no server rerun, no websocket round-trip, identical behaviour on Windows Docker, macOS and Linux. Euclidean line length $\sqrt{\Delta x^2 + \Delta y^2}$ is mapped from CSS pixels → embedded bitmap pixels → **native micrograph pixels** using the exact `native/bitmap` ratio, then multiplied by the active calibration to report micrometres ($\mu\text{m}$). A live floating badge and a four-card dashboard show **Measured Length (µm)**, **Measured Length (px)**, **Suggested Min Size (80 %)** and **Suggested Max Size (120 %)** while dragging, and every measurement is appended to a colour-coded history table with *Undo Last Line* / *Clear All Lines* controls. The legacy `streamlit-drawable-canvas` caliper and an exact pixel-coordinate caliper remain available in collapsible expanders as cross-checks.
 - **Manual Particle ID Exclusion**: Allows researchers to exclude specific particle IDs (e.g. `4, 12, 45`) via the sidebar text input.
 - **Flexible Phase Layering & Z-Order (Layering)**: Dedicated visualization controls to tune individual opacities (`Air Bubbles Opacity` and `Fat Particles Opacity`, default 0.3), toggle class visibility (`Show Air Bubbles` and `Show Fat Particles`), and control layering priority (`Fat over Air` vs. `Air over Fat`) so that overlying fat globule crusts do not obstruct air pore analysis on whipped emulsions.
 - **Sample Type Modes & Dynamic Sidebar UI**: Supports 3 distinct sample types via `st.radio('Sample Type', options=['Emulsion', 'Whipped Emulsion', 'Foam'])`:
@@ -57,6 +57,7 @@ PhasePix/
 ├── analyzer.py                       # Morphological, photometric & D[3,2]/D[4,3] feature extraction
 ├── app.py                            # Streamlit web application & UI dashboard
 ├── cellpose_model.py                 # Cellpose inference wrapper with MPS / CUDA / CPU handling
+├── patch_canvas.py                   # streamlit-drawable-canvas compatibility patch (build-time + runtime)
 ├── scale_detector.py                 # Automated SEM scale bar detection
 ├── visualizer.py                     # Size-based phase sorting, overlay rendering & KDE visualization
 ├── install_python.txt                # Native Windows setup commands and dependency guide
@@ -77,11 +78,14 @@ Docker provides an identical, isolated runtime on Windows, macOS, and Linux with
 2. Double-click **`run_windows_docker.bat`**.
 
 The batch script automatically:
-- Syncs the latest updates directly from GitHub (`git fetch --all && git reset --hard origin/main`).
-- Verifies that Docker Desktop is active.
+- Syncs the latest updates directly from GitHub (`git fetch --all && git reset --hard origin/main`) **inline in the same window** — the launcher is never re-spawned through `cmd /c`, so the terminal can no longer close on its own.
+- Verifies that Docker Desktop is active (clear message + `pause` instead of a silent exit).
 - Ensures required host directories (`images\sem`, `images\light`, `models_cache`) and preset JSON files exist.
-- Builds and starts the container in the background (`docker compose up --build -d`).
+- Builds and starts the container, trying NVIDIA GPU passthrough first (`docker-compose.yml`) and falling back automatically to `docker-compose.cpu.yml` when no GPU is available (`if errorlevel 1` + `goto`, never a parenthesised `if` block).
 - Launches the application in your default browser at `http://localhost:8501`.
+- Streams the live container log and then **always** hits `pause`, so the window stays open on every success and every error path.
+
+During `docker build`, `patch_canvas.py` rewrites `streamlit_drawable_canvas/__init__.py` inside `site-packages` so the canvas encodes its background image locally as `data:image/png;base64,...` and never calls Streamlit's removed private `image_to_url` API. `app.py` imports the same module again at runtime, giving two independent layers of protection.
 
 ### macOS / Linux (Docker Compose)
 

@@ -1,17 +1,40 @@
+# PhasePix runtime dependencies
+# ---------------------------------------------------------------------------
+# Streamlit dashboard
+#
+# NOTE: streamlit==1.65.0 is a real, published PyPI release - uploaded
+# 2026-10-02 (https://pypi.org/project/streamlit/1.65.0/). The Docker build must
+# NOT be downgraded to 1.39/1.42:
+#   * ``st.segmented_control`` (used for the PhasePix tab bar) requires >= 1.40
+#   * Streamlit < 1.54.0 ships CVE-2026-33682 - a Windows SSRF / NTLM leak that
+#     also affects local ``phasepix.bat`` usage.
 streamlit==1.65.0
+
+# Drawable canvas is only used for the optional Fabric.js fallback rulers.
+# Its ``image_to_url`` call is incompatible with Streamlit >= 1.30, so
+# ``patch_canvas.py`` patches it both at image-build time and at runtime.
 streamlit-drawable-canvas==0.9.3
+
+# ---------------------------------------------------------------------------
+# Scientific / imaging stack
+# ---------------------------------------------------------------------------
 numpy
 pandas
 scipy
 scikit-image
 opencv-python-headless
-matplotlib
-seaborn
 Pillow
 tifffile
 imagecodecs
+matplotlib
+seaborn
+pytesseract
+
+# ---------------------------------------------------------------------------
+# Deep learning segmentation (Cellpose + Segment Anything)
+# ---------------------------------------------------------------------------
 torch
 torchvision
 cellpose
 segment-anything
-pytesseract
+
