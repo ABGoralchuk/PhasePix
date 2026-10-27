@@ -20,8 +20,6 @@ models_cache/
 
 # Temporary & scratch files
 scratch/
-Phasepix_code.txt
-Phasepix.txt
 
 # OS specific
 .DS_Store
