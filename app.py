@@ -5033,19 +5033,28 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         canvas_drawing_mode = "rect" if assist_mode.startswith("📦 AI Smart Box") else "point"
 
         curr_ver = st.session_state.get("manual_canvas_ver", 0)
-        canvas_result = st_canvas(
-            fill_color=canvas_fill_color,
-            stroke_width=2,
-            stroke_color=canvas_stroke_color,
-            background_image=canvas_bg,
-            update_streamlit=True,
-            height=target_h,
-            width=target_w,
-            drawing_mode=canvas_drawing_mode,
-            point_display_radius=4,
-            display_toolbar=True,
-            key=f"manual_correction_canvas_{image_name}_{curr_ver}",
-        )
+        canvas_kwargs = {
+            "fill_color": canvas_fill_color,
+            "stroke_width": 2,
+            "stroke_color": canvas_stroke_color,
+            "background_image": canvas_bg,
+            "update_streamlit": True,
+            "height": target_h,
+            "width": target_w,
+            "drawing_mode": canvas_drawing_mode,
+            "point_display_radius": 4,
+            "key": f"manual_correction_canvas_{image_name}_{curr_ver}",
+            "display_toolbar": False,
+        }
+        try:
+            canvas_result = st_canvas(**canvas_kwargs)
+        except TypeError as e:
+            if "display_toolbar" in str(e):
+                # Fallback for older streamlit-drawable-canvas versions
+                canvas_kwargs.pop("display_toolbar", None)
+                canvas_result = st_canvas(**canvas_kwargs)
+            else:
+                raise
 
         if clear_canvas_btn:
             st.session_state["manual_canvas_ver"] = curr_ver + 1

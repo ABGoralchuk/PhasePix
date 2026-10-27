@@ -1,5 +1,5 @@
 streamlit
-streamlit-drawable-canvas
+streamlit-drawable-canvas>=0.9.3
 numpy
 pandas
 scipy
@@ -14,3 +14,4 @@ torch
 torchvision
 cellpose
 segment-anything
+pytesseract
