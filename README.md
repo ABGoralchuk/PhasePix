@@ -40,26 +40,71 @@ PhasePix is a high-performance Streamlit application designed for automated deep
 PhasePix/
 ├── .agents/
 │   ├── rules/
-│   │   └── rules.md             # Project architectural rules and constraints
+│   │   └── rules.md                  # Project architectural rules and constraints
 │   └── skills/
 │       └── developing-with-streamlit/
-├── images/                      # Put your SEM micrographs here (jpg, png, tif)
-├── analyzer.py                  # Morphological, photometric & D[3,2]/D[4,3] feature extraction
-├── app.py                       # Streamlit web application & UI dashboard
-├── cellpose_model.py            # Cellpose inference wrapper with MPS / CPU handling
-├── install_python.txt           # Windows setup commands and dependency guide
-├── phasepix.bat                 # Quick launch script for Windows
-├── phasepix_run.command         # Quick launch script for macOS Finder
-├── Phasepix_code.txt            # Complete single-file code snapshot of the PhasePix codebase
-├── requirements.txt             # Pinned project dependencies
-├── scale_detector.py            # Automated SEM scale bar detection
-├── visualizer.py                # Size-based phase sorting, overlay rendering & KDE visualization
-└── README.md                    # Project documentation & run guide
+├── .dockerignore                     # Docker build context exclusions (models_cache weights, datasets, git)
+├── Dockerfile                        # Multi-platform Linux container build based on python:3.11-slim
+├── docker-compose.yml                # Docker Compose orchestration with persistent host volumes
+├── run_windows_docker.bat            # 1-Click auto-updating Windows launcher with GitHub sync & Docker checks
+├── requirements.txt                  # Clean runtime dependencies for Linux container and local environments
+├── images/                           # SEM and light microscopy images (mounted as persistent volume)
+│   ├── sem/                          # SEM micrographs
+│   └── light/                        # Light microscopy images
+├── models_cache/                     # Downloaded neural network weights (SAM, Cellpose)
+├── light_calibration_presets.json    # Light microscopy objective calibration presets
+├── parameter_presets.json            # Segmentor recipe and parameter presets
+├── analyzer.py                       # Morphological, photometric & D[3,2]/D[4,3] feature extraction
+├── app.py                            # Streamlit web application & UI dashboard
+├── cellpose_model.py                 # Cellpose inference wrapper with MPS / CUDA / CPU handling
+├── scale_detector.py                 # Automated SEM scale bar detection
+├── visualizer.py                     # Size-based phase sorting, overlay rendering & KDE visualization
+├── install_python.txt                # Native Windows setup commands and dependency guide
+├── phasepix.bat                      # Native Windows virtual environment launch script
+├── phasepix_run.command              # Native macOS Finder launcher script
+└── README.md                         # Project documentation & run guide
 ```
 
 ---
 
-## Installation & Setup
+## Running with Docker (Recommended for Windows Production)
+
+Docker provides an identical, isolated runtime on Windows, macOS, and Linux without needing to manage local Python installations or system DLLs.
+
+### Windows (1-Click Auto-Updating Launcher)
+
+1. Ensure **Docker Desktop** is installed and running.
+2. Double-click **`run_windows_docker.bat`**.
+
+The batch script automatically:
+- Syncs the latest updates directly from GitHub (`git fetch --all && git reset --hard origin/main`).
+- Verifies that Docker Desktop is active.
+- Ensures required host directories (`images\sem`, `images\light`, `models_cache`) and preset JSON files exist.
+- Builds and starts the container in the background (`docker compose up --build -d`).
+- Launches the application in your default browser at `http://localhost:8501`.
+
+### macOS / Linux (Docker Compose)
+
+1. Make sure Docker is running.
+2. Start the container:
+   ```bash
+   docker compose up --build -d
+   ```
+3. Open `http://localhost:8501` in your browser.
+4. To stop the container:
+   ```bash
+   docker compose down
+   ```
+
+### Persistent Data Volumes
+All research assets are mounted directly from the host filesystem:
+- **`./images` $\rightarrow$ `/app/images`**: Micrographs added on the host are immediately accessible.
+- **`./models_cache` $\rightarrow$ `/app/models_cache`**: Downloaded Segment Anything (SAM) and Cellpose weights are saved on the host and never redownloaded.
+- **`./light_calibration_presets.json` & `./parameter_presets.json`**: Presets created or modified in the UI persist across container restarts.
+
+---
+
+## Native Installation & Setup (Alternative)
 
 ### Windows
 Follow the quick commands provided in [install_python.txt](install_python.txt):
@@ -77,6 +122,10 @@ Follow the quick commands provided in [install_python.txt](install_python.txt):
    pip install -r requirements.txt
    ```
    *(For NVIDIA GPU acceleration: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121` prior to requirements)*
+4. Run:
+   ```cmd
+   phasepix.bat
+   ```
 
 ### macOS / Linux
 1. **Clone or navigate to the project directory**:
@@ -90,9 +139,15 @@ Follow the quick commands provided in [install_python.txt](install_python.txt):
    source .venv/bin/activate
    ```
 
-3. **Install pinned dependencies**:
+3. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
+   ```
+
+4. **Launch**:
+   - Double-click `phasepix_run.command` in macOS Finder, or:
+   ```bash
+   streamlit run app.py
    ```
 
 ---

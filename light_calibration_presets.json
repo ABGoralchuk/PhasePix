@@ -1,0 +1,57 @@
+{
+  "10x Objective": {
+    "um_per_px": 0.72098,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 13.87
+  },
+  "10x + 1.6x Objective": {
+    "um_per_px": 0.45998,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 21.74
+  },
+  "20x Objective": {
+    "um_per_px": 0.35348,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 28.29
+  },
+  "20x + 1.6x Objective": {
+    "um_per_px": 0.22989,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 43.5
+  },
+  "40x Objective": {
+    "um_per_px": 0.17915,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 55.82
+  },
+  "40x + 1.6x Objective": {
+    "um_per_px": 0.11662,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 85.75
+  },
+  "63x Objective": {
+    "um_per_px": 0.11424,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 87.53501400560225
+  },
+  "63x + 1.6x Objective": {
+    "um_per_px": 0.0742,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 134.77
+  },
+  "100x Objective": {
+    "um_per_px": 0.07149,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 139.87
+  },
+  "100x + 1.6x Objective": {
+    "um_per_px": 0.04667,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 214.28
+  },
+  "Custom Calibration": {
+    "um_per_px": 0.2,
+    "scale_bar_um": 10.0,
+    "scale_bar_px": 50.0
+  }
+}

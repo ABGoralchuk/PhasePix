@@ -1,0 +1,79 @@
+{
+  "Light": {
+    "💧 Liquid Emulsion (Standard 40x)": {
+      "light_emulsion_profile_radio": "💧 Liquid Fat (Smooth Globules)",
+      "light_expected_droplet_um": 5.0,
+      "light_min_fat_size_input": 0.5,
+      "light_max_fat_size_input": 40.0,
+      "light_crystal_smooth_slider": 0,
+      "light_multiscale_checkbox": false,
+      "light_invert_bf_checkbox": true,
+      "light_solidity_slider": 0.75,
+      "shared_fat_circ_slider": 0.68,
+      "shared_flow_slider": 0.7,
+      "shared_cellprob_slider": -1.0,
+      "shared_clahe_checkbox": false
+    },
+    "❄️ Crystallized Fat Emulsion (Multi-Scale 40x/63x)": {
+      "light_emulsion_profile_radio": "❄️ Crystallized Fat (Textured / Internal Crystals)",
+      "light_expected_droplet_um": 9.0,
+      "light_min_fat_size_input": 0.5,
+      "light_max_fat_size_input": 60.0,
+      "light_crystal_smooth_slider": 3,
+      "light_multiscale_checkbox": true,
+      "light_invert_bf_checkbox": false,
+      "light_solidity_slider": 0.84,
+      "shared_fat_circ_slider": 0.6,
+      "shared_flow_slider": 0.7,
+      "shared_cellprob_slider": -1.0,
+      "shared_clahe_checkbox": false
+    }
+  },
+  "SEM": {
+    "🫧+🟠 Whipped Emulsion (Two-Pass + Deep-Scan)": {
+      "sem_sample_type_radio": "Whipped Emulsion",
+      "sem_detection_focus_radio": "🫧+🟠 Both Air Bubbles & Fat Particles (Two-Pass)",
+      "sem_min_air_um": 5.0,
+      "sem_max_air_um": 150.0,
+      "sem_min_fat_um": 0.2,
+      "sem_max_fat_um": 5.0,
+      "shared_flow_slider": 0.75,
+      "shared_cellprob_slider": -1.5,
+      "shared_fat_circ_slider": 0.6,
+      "sem_air_circ_slider": 0.5,
+      "sem_ads_circ_slider": 0.3,
+      "sem_deepscan_checkbox": true,
+      "shared_clahe_checkbox": true
+    },
+    "🫧 Whipped Emulsion (Fast Air Bubbles Preview)": {
+      "sem_sample_type_radio": "Whipped Emulsion",
+      "sem_detection_focus_radio": "🫧 Air Bubbles Only (Fast & Precise)",
+      "sem_min_air_um": 10.0,
+      "sem_max_air_um": 100.0,
+      "sem_min_fat_um": 0.2,
+      "sem_max_fat_um": 5.0,
+      "shared_flow_slider": 0.7,
+      "shared_cellprob_slider": -1.0,
+      "shared_fat_circ_slider": 0.6,
+      "sem_air_circ_slider": 0.5,
+      "sem_ads_circ_slider": 0.3,
+      "sem_deepscan_checkbox": false,
+      "shared_clahe_checkbox": true
+    },
+    "🟠 SEM Single-Phase Emulsion": {
+      "sem_sample_type_radio": "Emulsion",
+      "sem_detection_focus_radio": "🫧 Air Bubbles Only (Fast & Precise)",
+      "sem_min_air_um": 10.0,
+      "sem_max_air_um": 100.0,
+      "sem_min_fat_um": 0.2,
+      "sem_max_fat_um": 5.0,
+      "shared_flow_slider": 0.7,
+      "shared_cellprob_slider": -1.0,
+      "shared_fat_circ_slider": 0.6,
+      "sem_air_circ_slider": 0.5,
+      "sem_ads_circ_slider": 0.3,
+      "sem_deepscan_checkbox": false,
+      "shared_clahe_checkbox": true
+    }
+  }
+}

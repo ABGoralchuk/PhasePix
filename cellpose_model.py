@@ -8,6 +8,7 @@ import cv2
 import logging
 import math
 import os
+import shutil
 import ssl
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,39 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+
+# ---------------- SEGMENT ANYTHING (SAM) BACKBONE REGISTRY ----------------
+# All three official SAM architectures stay available so users with large
+# unified-memory Macs (e.g. 48 GB) can trade loading time for boundary accuracy.
+SAM_MODEL_CONFIGS = {
+    "vit_b": {
+        "filename": "sam_vit_b_01ec64.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+        "min_bytes": 300_000_000,
+    },
+    "vit_l": {
+        "filename": "sam_vit_l_0b3195.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+        "min_bytes": 1_100_000_000,
+    },
+    "vit_h": {
+        "filename": "sam_vit_h_4b8939.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+        "min_bytes": 2_400_000_000,
+    },
+}
+
+
+def _normalize_sam_model_type(sam_model_type: Optional[str]) -> str:
+    """Return a valid SAM backbone key, defaulting safely to ``vit_b``."""
+    if isinstance(sam_model_type, str) and sam_model_type in SAM_MODEL_CONFIGS:
+        return sam_model_type
+    if sam_model_type:
+        logger.warning(
+            "Unknown SAM backbone '%s'; defaulting to 'vit_b'.", sam_model_type
+        )
+    return "vit_b"
 
 
 def apply_clahe(
@@ -101,6 +135,60 @@ def get_device() -> Tuple[torch.device, bool]:
     return torch.device("cpu"), False
 
 
+def _instantiate_cellpose_model(
+    model_type: str,
+    custom_model_path: Optional[str],
+    device: torch.device,
+    use_gpu: bool,
+) -> models.CellposeModel:
+    """
+    Build a CellposeModel, degrading ``cyto3`` -> ``cyto2`` when unavailable.
+
+    ``cyto3`` is the super-generalist Cellpose model, but not every Cellpose build
+    bundles it. A missing/broken ``cyto3`` must never crash the app, so the request
+    falls back to the proven ``cyto2`` baseline.
+    """
+    if custom_model_path:
+        return models.CellposeModel(
+            pretrained_model=custom_model_path,
+            gpu=use_gpu,
+            device=device,
+        )
+
+    requested = model_type
+    bundled_models = getattr(models, "MODEL_NAMES", None)
+    if (
+        requested == "cyto3"
+        and isinstance(bundled_models, (list, tuple, set, frozenset))
+        and "cyto3" not in bundled_models
+    ):
+        logger.warning(
+            "This Cellpose build does not bundle 'cyto3' (available: %s); using 'cyto2'.",
+            ", ".join(str(name) for name in bundled_models) or "unknown",
+        )
+        requested = "cyto2"
+
+    try:
+        return models.CellposeModel(
+            pretrained_model=requested,
+            model_type=requested,
+            gpu=use_gpu,
+            device=device,
+        )
+    except Exception as exc:
+        if requested != "cyto3":
+            raise
+        logger.warning(
+            "Failed to initialize Cellpose 'cyto3' (%s); falling back to 'cyto2'.", exc
+        )
+        return models.CellposeModel(
+            pretrained_model="cyto2",
+            model_type="cyto2",
+            gpu=use_gpu,
+            device=device,
+        )
+
+
 @st.cache_resource(show_spinner="Loading Cellpose segmentation model...")
 def get_cellpose_model(
     model_type: str = "cyto2",
@@ -111,7 +199,7 @@ def get_cellpose_model(
     Uses @st.cache_resource to prevent re-initialization during Streamlit app re-runs.
 
     Args:
-        model_type: The Cellpose model identifier (e.g., 'cyto2', 'nuclei').
+        model_type: The Cellpose model identifier ('cyto3', 'cyto2', 'nuclei').
         custom_model_path: Optional filesystem path to user-supplied custom .pth weights.
 
     Returns:
@@ -119,37 +207,24 @@ def get_cellpose_model(
     """
     device, is_gpu = get_device()
     try:
-        if custom_model_path:
-            model = models.CellposeModel(
-                pretrained_model=custom_model_path,
-                gpu=is_gpu,
-                device=device,
-            )
-            logger.info("Custom CellposeModel initialized from '%s' on %s (gpu=%s).", custom_model_path, device, is_gpu)
-        else:
-            model = models.CellposeModel(
-                pretrained_model=model_type,
-                model_type=model_type,
-                gpu=is_gpu,
-                device=device,
-            )
-            logger.info("CellposeModel '%s' initialized on %s (gpu=%s).", model_type, device, is_gpu)
+        model = _instantiate_cellpose_model(model_type, custom_model_path, device, is_gpu)
+        logger.info(
+            "CellposeModel request '%s' ready on %s (gpu=%s).",
+            model_type,
+            device,
+            is_gpu,
+        )
         return model
     except Exception as exc:
-        logger.error("Failed to initialize Cellpose model on %s: %s. Falling back to CPU.", device, exc)
-        if custom_model_path:
-            return models.CellposeModel(
-                pretrained_model=custom_model_path,
-                gpu=False,
-                device=torch.device("cpu"),
-            )
-        else:
-            return models.CellposeModel(
-                pretrained_model=model_type,
-                model_type=model_type,
-                gpu=False,
-                device=torch.device("cpu"),
-            )
+        logger.error(
+            "Failed to initialize Cellpose model '%s' on %s: %s. Falling back to CPU.",
+            model_type,
+            device,
+            exc,
+        )
+        return _instantiate_cellpose_model(
+            model_type, custom_model_path, torch.device("cpu"), False
+        )
 
 
 @st.cache_data(show_spinner="Running Cellpose segmentation inference...")
@@ -722,18 +797,28 @@ class CellposeSegmenter:
 
 
 @st.cache_resource(show_spinner="Loading Interactive SAM Predictor...")
-def get_sam_predictor():
+def get_sam_predictor(sam_model_type: str = "vit_b"):
     """
-    Load and cache the Segment Anything Model (SAM) `SamPredictor` instance.
+    Load and cache a Segment Anything (SAM) ``SamPredictor`` for one backbone.
 
-    - Checks that `segment_anything` is installed.
-    - Looks for the checkpoint at ``models_cache/sam_vit_b_01ec64.pth``.
-    - Downloads the checkpoint automatically via ``urllib.request.urlretrieve`` if missing.
-    - Initializes SAM on CPU (safe default; avoids float64/MPS decoder issues on Apple Silicon).
+    - ``vit_b`` (375 MB) is fast and ideal for interactive use.
+    - ``vit_l`` (1.25 GB) and ``vit_h`` (2.56 GB) trade loading time/RAM for
+      noticeably better boundary precision on faint, blurry or crystallized edges.
+
+    The checkpoint is stored under ``models_cache/{filename}``; missing or truncated
+    files are downloaded in 8 MB chunks into a ``.part`` file and atomically moved
+    into place. SAM always runs on CPU (safe default; avoids float64/MPS decoder
+    issues on Apple Silicon).
+
+    Args:
+        sam_model_type: One of ``"vit_b"``, ``"vit_l"``, ``"vit_h"``.
 
     Returns:
         SamPredictor | None: A ready-to-use predictor, or None if SAM is unavailable.
     """
+    sam_type = _normalize_sam_model_type(sam_model_type)
+    config = SAM_MODEL_CONFIGS[sam_type]
+
     try:
         from segment_anything import sam_model_registry, SamPredictor  # type: ignore
     except Exception as exc:
@@ -743,12 +828,18 @@ def get_sam_predictor():
     try:
         models_dir = Path("models_cache")
         models_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = models_dir / "sam_vit_b_01ec64.pth"
-        # A truncated/partial checkpoint (~350 MB when complete) would break torch.load,
-        # so anything suspiciously small is treated as missing and re-downloaded.
-        if not ckpt_path.exists() or ckpt_path.stat().st_size < 100_000_000:
-            url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-            logger.info("SAM checkpoint not found. Downloading from %s ...", url)
+        ckpt_path = models_dir / config["filename"]
+        min_bytes = int(config["min_bytes"])
+
+        # A truncated/partial checkpoint would break torch.load, so anything
+        # suspiciously small is treated as missing and re-downloaded.
+        if not ckpt_path.exists() or ckpt_path.stat().st_size < min_bytes:
+            url = config["url"]
+            logger.info(
+                "SAM %s checkpoint missing or truncated. Downloading from %s ...",
+                sam_type,
+                url,
+            )
             tmp_path = ckpt_path.with_name(ckpt_path.name + ".part")
             try:
                 # macOS Python often lacks a proper CA bundle, which makes
@@ -758,9 +849,31 @@ def get_sam_predictor():
                 with urllib.request.urlopen(url, context=ssl_ctx) as response, open(
                     tmp_path, "wb"
                 ) as out_file:
-                    out_file.write(response.read())
+                    # Stream in 8 MB chunks: vit_h is ~2.56 GB, so never buffer it whole.
+                    shutil.copyfileobj(response, out_file, length=8 * 1024 * 1024)
+
+                downloaded_bytes = tmp_path.stat().st_size if tmp_path.exists() else 0
+                if downloaded_bytes < min_bytes:
+                    logger.warning(
+                        "SAM %s download incomplete (%d of at least %d bytes); aborting.",
+                        sam_type,
+                        downloaded_bytes,
+                        min_bytes,
+                    )
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    return None
+
                 os.replace(tmp_path, ckpt_path)
-                logger.info("SAM checkpoint downloaded to %s", ckpt_path)
+                logger.info(
+                    "SAM %s checkpoint downloaded to %s (%.1f MB).",
+                    sam_type,
+                    ckpt_path,
+                    downloaded_bytes / 1e6,
+                )
             except Exception as net_exc:
                 if tmp_path.exists():
                     try:
@@ -772,32 +885,36 @@ def get_sam_predictor():
 
         # On macOS Apple Silicon, the MPS decoder can hit float64 errors.
         # Running SAM on CPU is the safe, reliable choice.
-        sam = sam_model_registry["vit_b"](checkpoint=str(ckpt_path))
+        sam = sam_model_registry[sam_type](checkpoint=str(ckpt_path))
         sam.to(device="cpu")
         predictor = SamPredictor(sam)
-        logger.info("SAM SamPredictor (vit_b) initialized on CPU.")
+        logger.info("SAM SamPredictor (%s) initialized on CPU.", sam_type)
         return predictor
     except Exception as exc:
-        logger.warning("Failed to initialize SAM predictor: %s", exc)
+        logger.warning("Failed to initialize SAM predictor (%s): %s", sam_type, exc)
         return None
 
 
-def get_cached_sam_predictor_for_image(image_2d: np.ndarray):
+def get_cached_sam_predictor_for_image(
+    image_2d: np.ndarray,
+    sam_model_type: str = "vit_b",
+):
     """
     Return a SAM predictor whose image embeddings are computed for ``image_2d``.
 
     Image embeddings are expensive to compute, so they are cached on the predictor
-    instance via the ``_cached_img_hash`` attribute. If the image hash matches the
-    previously cached one, ``set_image`` is skipped and the predictor is returned
-    instantly with its existing embeddings.
+    instance via the ``_cached_img_hash`` attribute. Each backbone has its own cached
+    predictor instance, therefore switching ``vit_b`` <-> ``vit_h`` never reuses
+    embeddings computed by a different architecture.
 
     Args:
         image_2d: 2D grayscale image array.
+        sam_model_type: SAM backbone key (``"vit_b"``, ``"vit_l"``, ``"vit_h"``).
 
     Returns:
         SamPredictor | None: Predictor with embeddings set for the image, or None.
     """
-    predictor = get_sam_predictor()
+    predictor = get_sam_predictor(sam_model_type=sam_model_type)
     if predictor is None:
         return None
 
@@ -1064,6 +1181,7 @@ def predict_interactive_box_mask(
     target_phase: str = "air_bubbles",
     cellpose_model=None,
     invert_brightfield: bool = False,
+    sam_model_type: str = "vit_b",
 ) -> np.ndarray:
     """
     Instant interactive segmentation of an object drawn with a bounding box.
@@ -1098,6 +1216,8 @@ def predict_interactive_box_mask(
         invert_brightfield: When True (brightfield light microscopy), the fallback only
                         tests the inverted ROI polarity — the correct one for dark-rim
                         droplets — instead of running Cellpose twice.
+        sam_model_type: SAM backbone used by Step A (``"vit_b"`` fast, ``"vit_l"``
+                        balanced, ``"vit_h"`` maximum boundary precision).
 
     Returns:
         np.ndarray: 2D uint8 binary mask (0/1) with shape ``image_2d.shape[:2]``.
@@ -1139,7 +1259,9 @@ def predict_interactive_box_mask(
     hint_layer = np.zeros((h, w), dtype=np.uint8)
 
     # ── Step A: SAM — box + 1 positive centre point + 4 negative corner points ──
-    predictor = get_cached_sam_predictor_for_image(image_2d)
+    predictor = get_cached_sam_predictor_for_image(
+        image_2d, sam_model_type=sam_model_type
+    )
     if predictor is not None:
         try:
             pt_coords = np.vstack(

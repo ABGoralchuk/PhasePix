@@ -22,7 +22,7 @@ import seaborn as sns
 from scipy.ndimage import find_objects
 
 # Internal application modules
-from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale
+from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, smooth_internal_crystals
 from analyzer import (
     extract_metrics,
     calculate_granulometry_metrics,
@@ -147,6 +147,1560 @@ def save_light_presets(presets: dict) -> None:
     """
     with open(LIGHT_PRESETS_PATH, "w", encoding="utf-8") as fh:
         json.dump(presets, fh, indent=2, ensure_ascii=False)
+
+
+# ---------------- AI PARAMETER ADVISOR + CUSTOM PARAMETER PRESETS ----------------
+PARAMETER_PRESETS_FILE = "parameter_presets.json"
+# Resolve relative to the application root so student recipes survive any cwd.
+PARAMETER_PRESETS_PATH = Path(__file__).resolve().parent / PARAMETER_PRESETS_FILE
+
+SEM_FOCUS_AIR = "🫧 Air Bubbles Only (Fast & Precise)"
+SEM_FOCUS_TWO_PASS = "🫧+🟠 Both Air Bubbles & Fat Particles (Two-Pass)"
+LIGHT_PROFILE_LIQUID = "💧 Liquid Fat (Smooth Globules)"
+LIGHT_PROFILE_CRYSTALLIZED = "❄️ Crystallized Fat (Textured / Internal Crystals)"
+
+# Stable widget-key defaults for every Section 4 / Section 5 control.
+# They are used (a) as fallbacks when a control is hidden by the active
+# profile/sample-type branch and (b) to snapshot "current settings" when the
+# student saves a custom preset.
+PARAMETER_WIDGET_DEFAULTS: dict = {
+    "SEM": {
+        "sem_sample_type_radio": "Whipped Emulsion",
+        "sem_detection_focus_radio": SEM_FOCUS_AIR,
+        "sem_min_air_um": 10.0,
+        "sem_max_air_um": 100.0,
+        "sem_min_fat_um": 0.20,
+        "sem_max_fat_um": 5.0,
+        "shared_flow_slider": 0.70,
+        "shared_cellprob_slider": -1.0,
+        "shared_fat_circ_slider": 0.60,
+        "sem_air_circ_slider": 0.50,
+        "sem_ads_circ_slider": 0.30,
+        "sem_deepscan_checkbox": False,
+        "shared_clahe_checkbox": True,
+        "shared_model_type_select": "cyto2",
+    },
+    "Light": {
+        "light_min_fat_size_input": 0.50,
+        "light_max_fat_size_input": 50.0,
+        "light_emulsion_profile_radio": LIGHT_PROFILE_CRYSTALLIZED,
+        "light_expected_droplet_um": 9.0,
+        "light_crystal_smooth_slider": 3,
+        "light_multiscale_checkbox": True,
+        "light_invert_bf_checkbox": False,
+        "light_solidity_slider": 0.84,
+        "shared_fat_circ_slider": 0.60,
+        "shared_flow_slider": 0.70,
+        "shared_cellprob_slider": -1.0,
+        "shared_clahe_checkbox": False,
+        "shared_model_type_select": "cyto2",
+    },
+}
+
+
+def default_parameter_presets() -> dict:
+    """
+    Built-in laboratory recipes offered by the Parameter Preset Manager.
+
+    Returns:
+        dict: ``{"SEM": {preset_name: {widget_key: value}}, "Light": {...}}``.
+    """
+    return {
+        "Light": {
+            "💧 Liquid Emulsion (Standard 40x)": {
+                "light_emulsion_profile_radio": LIGHT_PROFILE_LIQUID,
+                "light_expected_droplet_um": 5.0,
+                "light_min_fat_size_input": 0.50,
+                "light_max_fat_size_input": 40.0,
+                "light_crystal_smooth_slider": 0,
+                "light_multiscale_checkbox": False,
+                "light_invert_bf_checkbox": True,
+                "light_solidity_slider": 0.75,
+                "shared_fat_circ_slider": 0.68,
+                "shared_flow_slider": 0.70,
+                "shared_cellprob_slider": -1.0,
+                "shared_clahe_checkbox": False,
+            },
+            "❄️ Crystallized Fat Emulsion (Multi-Scale 40x/63x)": {
+                "light_emulsion_profile_radio": LIGHT_PROFILE_CRYSTALLIZED,
+                "light_expected_droplet_um": 9.0,
+                "light_min_fat_size_input": 0.50,
+                "light_max_fat_size_input": 60.0,
+                "light_crystal_smooth_slider": 3,
+                "light_multiscale_checkbox": True,
+                "light_invert_bf_checkbox": False,
+                "light_solidity_slider": 0.84,
+                "shared_fat_circ_slider": 0.60,
+                "shared_flow_slider": 0.70,
+                "shared_cellprob_slider": -1.0,
+                "shared_clahe_checkbox": False,
+            },
+        },
+        "SEM": {
+            "🫧+🟠 Whipped Emulsion (Two-Pass + Deep-Scan)": {
+                "sem_sample_type_radio": "Whipped Emulsion",
+                "sem_detection_focus_radio": SEM_FOCUS_TWO_PASS,
+                "sem_min_air_um": 5.0,
+                "sem_max_air_um": 150.0,
+                "sem_min_fat_um": 0.20,
+                "sem_max_fat_um": 5.0,
+                "shared_flow_slider": 0.75,
+                "shared_cellprob_slider": -1.5,
+                "shared_fat_circ_slider": 0.60,
+                "sem_air_circ_slider": 0.50,
+                "sem_ads_circ_slider": 0.30,
+                "sem_deepscan_checkbox": True,
+                "shared_clahe_checkbox": True,
+            },
+            "🫧 Whipped Emulsion (Fast Air Bubbles Preview)": {
+                "sem_sample_type_radio": "Whipped Emulsion",
+                "sem_detection_focus_radio": SEM_FOCUS_AIR,
+                "sem_min_air_um": 10.0,
+                "sem_max_air_um": 100.0,
+                "sem_min_fat_um": 0.20,
+                "sem_max_fat_um": 5.0,
+                "shared_flow_slider": 0.70,
+                "shared_cellprob_slider": -1.0,
+                "shared_fat_circ_slider": 0.60,
+                "sem_air_circ_slider": 0.50,
+                "sem_ads_circ_slider": 0.30,
+                "sem_deepscan_checkbox": False,
+                "shared_clahe_checkbox": True,
+            },
+            "🟠 SEM Single-Phase Emulsion": {
+                "sem_sample_type_radio": "Emulsion",
+                "sem_detection_focus_radio": SEM_FOCUS_AIR,
+                "sem_min_air_um": 10.0,
+                "sem_max_air_um": 100.0,
+                "sem_min_fat_um": 0.20,
+                "sem_max_fat_um": 5.0,
+                "shared_flow_slider": 0.70,
+                "shared_cellprob_slider": -1.0,
+                "shared_fat_circ_slider": 0.60,
+                "sem_air_circ_slider": 0.50,
+                "sem_ads_circ_slider": 0.30,
+                "sem_deepscan_checkbox": False,
+                "shared_clahe_checkbox": True,
+            },
+        },
+    }
+
+
+def load_parameter_presets() -> dict:
+    """
+    Load Section 4 / Section 5 widget recipes from ``parameter_presets.json``.
+
+    Built-in laboratory presets are always available; user-saved entries override
+    their same-named built-in counterparts. Corrupted files fall back silently to
+    the built-ins so the sidebar never breaks during a lab session.
+
+    Returns:
+        dict: ``{"SEM": {name: {widget_key: value}}, "Light": {...}}``.
+    """
+    presets = {
+        modality: {name: dict(values) for name, values in recipes.items()}
+        for modality, recipes in default_parameter_presets().items()
+    }
+    try:
+        if PARAMETER_PRESETS_PATH.exists():
+            with open(PARAMETER_PRESETS_PATH, "r", encoding="utf-8") as fh:
+                stored = json.load(fh)
+            if isinstance(stored, dict):
+                for modality in ("SEM", "Light"):
+                    recipes = stored.get(modality, {})
+                    if not isinstance(recipes, dict):
+                        continue
+                    for name, values in recipes.items():
+                        if isinstance(values, dict):
+                            presets[modality][str(name)] = dict(values)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return presets
+
+
+def save_parameter_presets(presets: dict) -> None:
+    """
+    Persist Section 4 / Section 5 widget recipes to ``parameter_presets.json``.
+
+    Args:
+        presets: Mapping ``modality -> {preset_name: {widget_key: value}}``.
+
+    Raises:
+        OSError: If the JSON file cannot be written (surfaced by the caller).
+    """
+    with open(PARAMETER_PRESETS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(presets, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def _json_safe_parameter(value):
+    """Coerce numpy scalars into plain JSON-serialisable Python values."""
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    return value
+
+
+def collect_parameter_snapshot(modality: str, live_values: Optional[dict] = None) -> dict:
+    """
+    Build a complete ``widget_key -> value`` recipe for the active modality.
+
+    Hidden controls (e.g. crystal smoothing while the liquid profile is active)
+    fall back to their canonical defaults so a saved preset can always be
+    re-applied deterministically.
+
+    Args:
+        modality: ``"SEM"`` or ``"Light"``.
+        live_values: Values read from the currently rendered sidebar controls.
+
+    Returns:
+        dict: Filtered, JSON-safe widget state for the modality.
+    """
+    snapshot = dict(PARAMETER_WIDGET_DEFAULTS.get(modality, {}))
+    for key in list(st.session_state.keys()):
+        if key in snapshot and st.session_state[key] is not None:
+            snapshot[key] = st.session_state[key]
+    for key, value in (live_values or {}).items():
+        if key in snapshot and value is not None:
+            snapshot[key] = value
+    return {key: _json_safe_parameter(value) for key, value in snapshot.items()}
+
+
+def build_default_parameter_state(
+    is_light_mode: bool,
+    light_profile: Optional[str] = None,
+) -> dict:
+    """
+    Return the clean Section 4/5 defaults for the active modality and optical profile.
+
+    Light mode follows the selected droplet profile (crystallized vs liquid), while
+    SEM mode uses the canonical whipped-emulsion recipe. Used by the sidebar
+    "🔄 Reset to Defaults" action so a student can always return to the validated
+    starting point (e.g. 9.0 µm target, cyto2, 0.50-50.0 µm, smoothing 3,
+    solidity 0.84 for crystallized fat).
+
+    Args:
+        is_light_mode: Whether Light Microscopy is active.
+        light_profile: Current light-mode profile string (ignored in SEM mode).
+
+    Returns:
+        dict: JSON-safe ``widget_key -> default_value`` mapping.
+    """
+    modality = "Light" if is_light_mode else "SEM"
+    defaults = dict(PARAMETER_WIDGET_DEFAULTS.get(modality, {}))
+
+    if is_light_mode:
+        crystallized = str(light_profile or LIGHT_PROFILE_CRYSTALLIZED).startswith("❄️")
+        defaults.update(
+            {
+                "light_emulsion_profile_radio": (
+                    LIGHT_PROFILE_CRYSTALLIZED if crystallized else LIGHT_PROFILE_LIQUID
+                ),
+                "light_expected_droplet_um": 9.0 if crystallized else 5.0,
+                "light_crystal_smooth_slider": 3 if crystallized else 0,
+                "light_multiscale_checkbox": bool(crystallized),
+                "light_invert_bf_checkbox": not crystallized,
+                "light_solidity_slider": 0.84 if crystallized else 0.72,
+                "shared_fat_circ_slider": 0.60,
+            }
+        )
+
+    return {key: _json_safe_parameter(value) for key, value in defaults.items()}
+
+
+# ---------------- DUAL-MODALITY DIAGNOSTIC & RECOMMENDATION ENGINE ----------------
+def _ellipse(size: int) -> np.ndarray:
+    """Return an elliptical structuring element of the requested odd size."""
+    size = max(1, int(size))
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def _prepare_analysis_gray(image: np.ndarray) -> Tuple[np.ndarray, float]:
+    """
+    Normalise an analysis image to 8-bit grayscale and limit its working size.
+
+    Args:
+        image: Raw analysis image (footer already excluded).
+
+    Returns:
+        Tuple[np.ndarray, float]: working grayscale image and the resize factor
+        (``working_px / original_px``) needed to convert calibrated µm/px.
+    """
+    arr = np.asarray(image)
+    if arr.size == 0:
+        raise ValueError("Empty analysis image - load a micrograph first.")
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.dtype != np.uint8:
+        arr = cv2.normalize(arr.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    max_dim = int(max(arr.shape[:2]))
+    if max_dim > 900:
+        factor = 900.0 / float(max_dim)
+        new_size = (
+            max(1, int(round(arr.shape[1] * factor))),
+            max(1, int(round(arr.shape[0] * factor))),
+        )
+        return cv2.resize(arr, new_size, interpolation=cv2.INTER_AREA), factor
+    return arr, 1.0
+
+
+def _component_areas(mask_u8: np.ndarray, min_area: int) -> list:
+    """Return component areas that are plausibly objects (not the background)."""
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8.astype(np.uint8), 8)
+    limit = 0.45 * float(mask_u8.size)
+    areas = []
+    for idx in range(1, n_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if min_area <= area <= limit:
+            areas.append(area)
+    return areas
+
+
+def _fill_holes(mask_u8: np.ndarray) -> np.ndarray:
+    """Fill enclosed holes so dark refractive rims become solid droplet footprints."""
+    padded = cv2.copyMakeBorder(mask_u8, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    flood = padded.copy()
+    ff_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    filled = cv2.bitwise_or(padded, holes)
+    return filled[1:-1, 1:-1]
+
+
+def _remove_border_background(mask_u8: np.ndarray, min_fraction: float = 0.05) -> np.ndarray:
+    """Drop large connected regions touching the frame edge (background phase)."""
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8.astype(np.uint8), 8)
+    height, width = mask_u8.shape[:2]
+    out = mask_u8.copy()
+    for idx in range(1, n_labels):
+        x, y, w, h, area = stats[idx]
+        touches_border = x <= 1 or y <= 1 or (x + w) >= width - 1 or (y + h) >= height - 1
+        if touches_border and area > min_fraction * float(mask_u8.size):
+            out[labels == idx] = 0
+    return out
+
+
+def _distance_transform_diameters(mask_u8: np.ndarray, um_per_px: float) -> list:
+    """Estimate object diameters (µm) from distance-transform local maxima."""
+    dist = cv2.distanceTransform(mask_u8.astype(np.uint8), cv2.DIST_L2, 5)
+    if float(dist.max()) <= 0:
+        return []
+    peaks = ((dist >= cv2.dilate(dist, _ellipse(5)) - 1e-3) & (dist > 1.0)).astype(np.uint8)
+    n_peaks, labels = cv2.connectedComponents(peaks, 8)
+    diameters = []
+    for idx in range(1, n_peaks):
+        radii = dist[labels == idx]
+        if radii.size == 0:
+            continue
+        diameter_um = 2.0 * float(radii.max()) * float(um_per_px)
+        if 0.15 <= diameter_um <= 2000.0:
+            diameters.append(diameter_um)
+    return diameters
+
+
+def _watershed_droplet_diameters(
+    mask_u8: np.ndarray,
+    um_per_px: float,
+    min_peak_separation_px: int = 6,
+) -> Tuple[list, list]:
+    """
+    Split touching droplets and return (region diameters, peak diameters) in µm.
+
+    Distance-transform maxima are used as watershed seeds (one seed per droplet
+    lobe), which prevents a merged doublet from being reported as one giant
+    droplet. Peak radii are converted with ``2 * r_px * um_per_px`` and kept as a
+    fallback; the primary distribution uses each watershed region's area-equivalent
+    diameter so D[2,1] is not inflated by merged lobes.
+
+    Args:
+        mask_u8: Binary (0/1 or 0/255) droplet mask.
+        um_per_px: Physical size of one pixel (µm).
+        min_peak_separation_px: Minimum spacing between accepted maxima.
+
+    Returns:
+        Tuple[list, list]: (watershed region diameters, local-maximum diameters),
+        both filtered to 0.8-200 µm.
+    """
+    mask = (mask_u8 > 0).astype(np.uint8)
+    if not np.any(mask):
+        return [], []
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if float(dist.max()) <= 0:
+        return [], []
+
+    separation = max(3, int(min_peak_separation_px))
+    local_max = cv2.dilate(dist, _ellipse(separation))
+    peaks = ((dist >= local_max - 1e-3) & (dist > 1.0)).astype(np.uint8)
+    n_peaks, peak_labels = cv2.connectedComponents(peaks, 8)
+    if n_peaks <= 1:
+        return [], []
+
+    # Literal peak-radius diameter (2 * r_px * µm/px), filtered below 0.8 µm.
+    peak_diameters = []
+    for label in range(1, n_peaks):
+        radii = dist[peak_labels == label]
+        if radii.size == 0:
+            continue
+        diameter_um = 2.0 * float(radii.max()) * float(um_per_px)
+        if 0.8 <= diameter_um <= 200.0:
+            peak_diameters.append(diameter_um)
+
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    markers[mask == 0] = 1  # background seed
+    markers[peaks > 0] = peak_labels[peaks > 0] + 1  # one seed per droplet lobe
+    vis = cv2.cvtColor((mask * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    cv2.watershed(vis, markers)
+
+    diameters = []
+    for region_id in range(2, n_peaks + 1):
+        region = (markers == region_id) & (mask > 0)
+        area = int(np.count_nonzero(region))
+        if area < 4:
+            continue
+        diameter_um = 2.0 * math.sqrt(area / math.pi) * float(um_per_px)
+        if 0.8 <= diameter_um <= 200.0:
+            diameters.append(diameter_um)
+    return diameters, peak_diameters
+
+
+def _contour_diameters(mask_u8: np.ndarray, um_per_px: float) -> list:
+    """Fallback equivalent-circle diameters (µm) from external contours."""
+    contours, _ = cv2.findContours(mask_u8.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    diameters = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area <= 4.0:
+            continue
+        diameter_um = 2.0 * math.sqrt(area / math.pi) * float(um_per_px)
+        if 0.15 <= diameter_um <= 2000.0:
+            diameters.append(diameter_um)
+    return diameters
+
+
+def _clean_micron(value: float) -> float:
+    """Round a physical size to clean, human-readable laboratory values."""
+    val = max(0.0, float(value))
+    if val >= 50.0:
+        return float(round(val / 10.0) * 10.0)
+    if val >= 10.0:
+        return float(round(val / 5.0) * 5.0)
+    if val >= 2.0:
+        return float(round(val / 0.5) * 0.5)
+    if val >= 0.5:
+        return float(round(round(val / 0.1) * 0.1, 2))
+    return float(round(val, 2))
+
+
+def _fmt_um(value) -> str:
+    """Format a physical size for the comparison table."""
+    if value is None:
+        return "-"
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if val >= 100.0:
+        return f"{val:.0f} µm"
+    if val >= 10.0:
+        return f"{val:.1f} µm"
+    return f"{val:.2f} µm"
+
+
+def _current_value(current_params: dict, key: str):
+    """Read a current widget value, falling back to its canonical default."""
+    if isinstance(current_params, dict) and current_params.get(key) is not None:
+        return current_params[key]
+    for defaults in PARAMETER_WIDGET_DEFAULTS.values():
+        if key in defaults:
+            return defaults[key]
+    return None
+
+
+def _format_param_value(key: str, value) -> str:
+    """Render a widget value for the educational comparison table."""
+    if value is None:
+        return "-"
+    if key in (
+        "sem_min_air_um",
+        "sem_max_air_um",
+        "sem_min_fat_um",
+        "sem_max_fat_um",
+        "light_min_fat_size_input",
+        "light_max_fat_size_input",
+        "light_expected_droplet_um",
+    ):
+        return _fmt_um(value)
+    if isinstance(value, (bool, np.bool_)):
+        return "On" if bool(value) else "Off"
+    if key in (
+        "shared_flow_slider",
+        "shared_cellprob_slider",
+        "shared_fat_circ_slider",
+        "sem_air_circ_slider",
+        "sem_ads_circ_slider",
+        "light_solidity_slider",
+    ):
+        return f"{float(value):.2f}"
+    if key == "light_crystal_smooth_slider":
+        return f"{int(value)} / 4" if int(value) > 0 else "Off"
+    return str(value)
+
+
+def _comparison_row(key: str, label: str, recommended, current_params: dict, why: str) -> dict:
+    """Build one fully formatted row of the educational comparison table."""
+    return {
+        "Parameter": label,
+        "Current": _format_param_value(key, _current_value(current_params, key)),
+        "Recommended": _format_param_value(key, recommended),
+        "Why (Educational Rationale)": why,
+    }
+
+
+def _diagnose_light_microscopy(gray: np.ndarray, um_per_px: float, current_params: dict) -> dict:
+    """
+    Brightfield diagnostics: internal crystal striations, packing, polarity and scale.
+
+    Internal crystal needles are dark lines *inside* bright fat globules, so plain
+    Otsu thresholding labels them as "background" and shreds each globule into tiny
+    bright patches. The fix is to separate two views of the same image:
+
+    * a crystal-smoothed copy used to build macro-droplet masks and size estimates;
+    * the raw (unsmoothed) image used to measure crystal striation physics strictly
+      inside the eroded macro-droplet interiors (rims excluded).
+    """
+    work, resize_factor = _prepare_analysis_gray(gray)
+    try:
+        ratio_value = float(um_per_px)
+    except (TypeError, ValueError):
+        ratio_value = 0.0
+    px_um = ratio_value if math.isfinite(ratio_value) and ratio_value > 0 else 0.18
+    px_um = px_um / resize_factor if resize_factor > 0 else px_um
+
+    # ── 1. Crystal-smoothed copy: erase internal needles, keep outer rims ─────
+    try:
+        smoothed = smooth_internal_crystals(work, strength=3)
+    except Exception:
+        smoothed = work.copy()
+    blur_s = cv2.GaussianBlur(smoothed, (5, 5), 0)
+
+    p5, _, p95 = (float(np.percentile(blur_s, q)) for q in (5.0, 50.0, 95.0))
+    contrast = p95 - p5
+
+    # Polarity is decided on the smoothed image so striations cannot masquerade
+    # as the "dark object" class (the root cause of the old 0.77x misclassification).
+    otsu_thr, _ = cv2.threshold(blur_s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright_mask = (blur_s >= otsu_thr).astype(np.uint8)
+    dark_mask = (1 - bright_mask).astype(np.uint8)
+    min_area = max(12, int(round(0.00004 * float(work.size))))
+
+    # ── 2. Macro-droplet interior mask (bridges thin internal crystal lines) ──
+    # Dark inter-droplet ridges are detected first: the closing bridges internal
+    # crystal needles, but restoring those outer ridges prevents neighbouring
+    # globules from merging into one giant sheet.
+    ridge_k = max(5, int(round(1.2 / max(px_um, 1e-4))) | 1)
+    outer_ridges = (
+        cv2.morphologyEx(blur_s, cv2.MORPH_BLACKHAT, _ellipse(ridge_k)) > 14.0
+    ).astype(np.uint8)
+
+    close_k = max(9, int(round(2.5 / max(px_um, 1e-4))) | 1)
+    macro_seed = cv2.morphologyEx(blur_s, cv2.MORPH_CLOSE, _ellipse(close_k))
+    macro_seed[outer_ridges > 0] = 0
+    macro_blur = cv2.GaussianBlur(macro_seed, (5, 5), 0)
+    macro_thr, _ = cv2.threshold(macro_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    macro_bright = (macro_blur >= macro_thr).astype(np.uint8)
+    macro_dark = (1 - macro_bright).astype(np.uint8)
+
+    def _macro_candidate(binary_mask: np.ndarray):
+        """Return (mask, coverage, n_components, plausible) for one polarity."""
+        candidate = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, _ellipse(3))
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, _ellipse(5))
+        candidate = _fill_holes(candidate)
+        foreground = int(np.count_nonzero(candidate))
+        coverage_value = foreground / float(candidate.size)
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
+        valid_areas = [
+            int(stats[i, cv2.CC_STAT_AREA])
+            for i in range(1, n_labels)
+            if min_area <= stats[i, cv2.CC_STAT_AREA] <= 0.45 * candidate.size
+        ]
+        all_areas = [
+            int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n_labels)
+        ]
+        largest_fraction = (
+            max(all_areas) / float(foreground) if all_areas and foreground > 0 else 0.0
+        )
+        # A bright background sheet enclosing dilute droplets looks like "objects"
+        # by component count, but its near-total coverage and dominant single region
+        # reveal that it is the background phase.
+        is_plausible = (
+            0.02 <= coverage_value <= 0.97
+            and len(valid_areas) >= 3
+            and (coverage_value <= 0.90 or largest_fraction <= 0.85)
+        )
+        return candidate, coverage_value, len(valid_areas), is_plausible
+
+    bright_candidate = _macro_candidate(macro_bright)
+    dark_candidate = _macro_candidate(macro_dark)
+    if bright_candidate[3] and dark_candidate[3]:
+        bright_objects = bright_candidate[2] >= dark_candidate[2]
+    elif bright_candidate[3]:
+        bright_objects = True
+    elif dark_candidate[3]:
+        bright_objects = False
+    else:
+        # Fallback for ambiguous fields: the polarity with more compact components wins.
+        bright_objects = bright_candidate[2] >= dark_candidate[2]
+
+    macro_mask, packing, _, _ = bright_candidate if bright_objects else dark_candidate
+    macro_bool = macro_mask > 0
+
+    # ── 3. Internal crystal striations measured on the UNSMOOTHED image ───────
+    blackhat = cv2.morphologyEx(work, cv2.MORPH_BLACKHAT, _ellipse(7))
+    lap = np.abs(cv2.Laplacian(work.astype(np.float32), cv2.CV_32F, ksize=3))
+    # Erode each macro-droplet proportionally to its own radius (>= 3 px) so the
+    # dark outer rim / refraction halo never leaks into the texture sample.
+    macro_dist = cv2.distanceTransform(macro_mask, cv2.DIST_L2, 5)
+    n_macro, macro_labels, macro_stats, _ = cv2.connectedComponentsWithStats(
+        macro_mask, 8
+    )
+    interior = np.zeros_like(macro_mask)
+    for idx in range(1, n_macro):
+        area = int(macro_stats[idx, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        x, y, w_box, h_box, _ = (int(v) for v in macro_stats[idx])
+        if w_box < 2 or h_box < 2:
+            continue
+        crop_labels = macro_labels[y : y + h_box, x : x + w_box]
+        crop_dist = macro_dist[y : y + h_box, x : x + w_box]
+        component = crop_labels == idx
+        if not np.any(component):
+            continue
+        max_radius = float(crop_dist[component].max())
+        max_radius = min(max_radius, 0.5 * float(min(macro_mask.shape)))
+        if max_radius < 5.0:
+            continue
+        erode_px = max(3, int(round(0.45 * max_radius)))
+        kernel_size = 2 * erode_px + 1
+        if kernel_size >= min(w_box, h_box) or kernel_size >= 2 * max_radius:
+            continue
+        core = cv2.erode(component.astype(np.uint8), _ellipse(kernel_size))
+        interior[y : y + h_box, x : x + w_box] |= core
+    if np.count_nonzero(interior) < 80:
+        interior = cv2.erode(macro_mask, _ellipse(7))
+    interior_bool = interior.astype(bool)
+    if not np.any(interior_bool):
+        interior_bool = macro_bool.copy()
+
+    striation_mask = (blackhat > 12) & interior_bool
+    striation_density = float(np.count_nonzero(striation_mask)) / float(
+        np.count_nonzero(interior_bool)
+    )
+    striation_intensity = float(blackhat[interior_bool].mean())
+    interior_values = work[interior_bool]
+    if interior_values.size > 20:
+        low_pct, high_pct = np.percentile(interior_values, [10.0, 90.0])
+        trimmed_values = interior_values[
+            (interior_values >= low_pct) & (interior_values <= high_pct)
+        ]
+        internal_std = (
+            float(trimmed_values.std()) if trimmed_values.size else float(interior_values.std())
+        )
+    else:
+        internal_std = float(interior_values.std())
+    lap_energy = float(lap[interior_bool].mean())
+    outer_bool = ~macro_bool
+    lap_outside = float(lap[outer_bool].mean()) if np.any(outer_bool) else lap_energy
+    lap_ratio = lap_energy / max(lap_outside, 1e-6)
+
+    crystallized = bool(
+        striation_density >= 0.035
+        or internal_std > 18.0
+        or (packing > 0.55 and (lap_energy >= 6.0 or lap_ratio >= 1.15))
+    )
+    crystal_score = float(
+        np.clip(
+            0.55 * (striation_density / 0.12)
+            + 0.30 * (internal_std / 30.0)
+            + 0.15 * (packing / 0.75),
+            0.0,
+            1.0,
+        )
+    )
+
+    # ── 4. Droplet size on the crystal-smoothed mask ──────────────────────────
+    # Dark inter-droplet borders are removed via a black-hat ridge map, and the
+    # distance-transform peaks seed a marker-controlled watershed so merged
+    # doublets are split into their true lobes.
+    if bright_objects:
+        # Bright bodies: subtract dark contact ridges, then fill to get footprints.
+        size_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, _ellipse(3))
+        size_mask = (size_mask.astype(bool) & ~outer_ridges.astype(bool)).astype(np.uint8)
+        size_mask = cv2.morphologyEx(size_mask, cv2.MORPH_OPEN, _ellipse(3))
+        size_mask = _fill_holes(size_mask)
+        size_mask = cv2.erode(size_mask, _ellipse(3))
+    else:
+        # Dark-rim droplets: the rim IS the droplet boundary. Subtract nothing and
+        # fill the enclosed bright interior so each ring becomes a solid footprint.
+        size_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, _ellipse(3))
+        size_mask = _fill_holes(size_mask)
+
+    min_peak_sep_px = max(6, int(round(1.5 / max(px_um, 1e-4))))
+    diameters, peak_diameters = _watershed_droplet_diameters(
+        size_mask, px_um, min_peak_separation_px=min_peak_sep_px
+    )
+    if len(diameters) < 3:
+        diameters = peak_diameters
+    if len(diameters) < 3:
+        diameters = _distance_transform_diameters(size_mask, px_um)
+    if len(diameters) < 3:
+        diameters = _contour_diameters(size_mask, px_um)
+    if not diameters:
+        diameters = [3.0, 6.0, 9.0]
+    diam_arr = np.asarray(diameters, dtype=float)
+    d5, d50, d70, d75, d90, d95, d98 = (
+        float(np.percentile(diam_arr, q))
+        for q in (5.0, 50.0, 70.0, 75.0, 90.0, 95.0, 98.0)
+    )
+    polydispersity = d90 / max(d50, 1e-6)
+
+    # Liquid emulsions: area-weighted D[2,1] + P75 avoids being dragged down by
+    # tiny interstitial droplets. Crystallized/polydisperse packed emulsions use a
+    # robust Sauter D[3,2] + P82 instead, because the 1.0x fine pass must not cut
+    # inside 15-24 µm globules.
+    d_area_weighted = float(
+        np.sum(diam_arr ** 2) / max(np.sum(diam_arr), 1e-6)
+    )
+    # Sauter D[3,2] is extremely tail-sensitive: a handful of coalesced/merged
+    # lobes can double it. Winsorizing at P85 keeps the volume-weighted scale
+    # anchored to the bulk globule population instead of a few outliers.
+    sauter_cap = float(np.percentile(diam_arr, 85.0))
+    sauter_arr = np.minimum(diam_arr, sauter_cap)
+    d_sauter = float(
+        np.sum(sauter_arr ** 3) / max(np.sum(sauter_arr ** 2), 1e-6)
+    )
+    p82 = float(np.percentile(diam_arr, 82.0))
+    use_crystal_scale = bool(crystallized or polydispersity > 1.6)
+    if use_crystal_scale:
+        crystal_target = 0.5 * d_sauter + 0.5 * p82
+        # Large central macro-globules: never let the base pass fall below 8 µm.
+        if d95 >= 11.0:
+            crystal_target = max(crystal_target, 8.0)
+    else:
+        crystal_target = 0.5 * d_area_weighted + 0.5 * d75
+    expected_droplet = float(
+        np.clip(round(crystal_target * 2.0) / 2.0, 3.0, 22.0)
+    )
+    # Never truncate the large central globules of a crystallized emulsion:
+    # 18-25 µm macro-globules must stay classified as fat, not "Unclassified".
+    min_fat = float(round(max(0.40, min(1.0, d5 * 0.65)), 2))
+    max_fat = float(round(max(25.0, d98 * 1.6, expected_droplet * 3.2), 1))
+    multiscale = bool(crystallized or polydispersity > 1.6)
+
+    # Brightfield polarity: packed bright bodies (dark contact borders) vs. dilute
+    # dark-rimmed droplets on a bright background.
+    if bright_objects and (crystallized or packing >= 0.28):
+        invert_bf = False
+        invert_why = (
+            "Tightly packed bright-body globules separated by thin dark contact "
+            f"borders (packing {packing:.0%}): the native polarity already gives "
+            "Cellpose filled bodies, whereas inversion would turn every globule into "
+            "a hole."
+        )
+    elif (not bright_objects) and packing <= 0.70:
+        invert_bf = True
+        invert_why = (
+            "Dilute droplets present dark refractive rims/halos on a bright background; "
+            "inverting converts those rims into solid bright bodies so Cellpose can close "
+            "the true outer droplet boundary."
+        )
+    else:
+        invert_bf = not crystallized
+        invert_why = (
+            "Mixed/ambiguous polarity: inversion follows the optical profile "
+            "(crystallized-packed keeps OFF, liquid/dispersed keeps ON)."
+        )
+
+    cellprob = -1.5 if contrast < 65.0 else -1.0
+    profile = LIGHT_PROFILE_CRYSTALLIZED if crystallized else LIGHT_PROFILE_LIQUID
+    solidity = 0.84 if crystallized else 0.75
+    fat_circularity = 0.60 if crystallized else 0.68
+    smoothing_strength = 3 if crystallized else 0
+
+    crystal_pipeline_active = bool(
+        crystallized and smoothing_strength >= 3 and multiscale
+    )
+    current_model_choice = str(
+        _current_value(current_params, "shared_model_type_select") or "cyto2"
+    )
+    if current_model_choice == "cyto3":
+        # The student explicitly opted into maximum sensitivity; keep their choice.
+        model_recommendation = "cyto3"
+    elif crystal_pipeline_active:
+        # Smoothing 3 + multi-scale already suppress internal crystal lines; cyto2
+        # is faster and equally clean unless the optics are genuinely faint.
+        model_recommendation = "cyto3" if contrast < 75.0 else "cyto2"
+    else:
+        model_recommendation = "cyto3" if contrast < 65.0 else "cyto2"
+
+    recommended_state = {
+        "light_emulsion_profile_radio": profile,
+        "light_crystal_smooth_slider": smoothing_strength,
+        "light_solidity_slider": solidity,
+        "shared_fat_circ_slider": fat_circularity,
+        "light_expected_droplet_um": expected_droplet,
+        "light_min_fat_size_input": min_fat,
+        "light_max_fat_size_input": max_fat,
+        "light_multiscale_checkbox": multiscale,
+        "light_invert_bf_checkbox": bool(invert_bf),
+        "shared_clahe_checkbox": False,
+        "shared_flow_slider": 0.70,
+        "shared_cellprob_slider": float(cellprob),
+        "shared_model_type_select": model_recommendation,
+    }
+    return {
+        "profile": profile,
+        "crystallized": crystallized,
+        "contrast": contrast,
+        "d5": d5,
+        "d50": d50,
+        "d70": d70,
+        "d75": d75,
+        "d90": d90,
+        "d95": d95,
+        "d98": d98,
+        "d_area_weighted": d_area_weighted,
+        "d_sauter": d_sauter,
+        "sauter_cap": sauter_cap,
+        "p82": p82,
+        "use_crystal_scale": use_crystal_scale,
+        "crystal_target": crystal_target,
+        "expected_droplet": expected_droplet,
+        "smoothing_strength": smoothing_strength,
+        "crystal_pipeline_active": crystal_pipeline_active,
+        "model_recommendation": model_recommendation,
+        "current_model_choice": current_model_choice,
+        "min_peak_sep_px": min_peak_sep_px,
+        "striation_density": striation_density,
+        "striation_intensity": striation_intensity,
+        "internal_std": internal_std,
+        "lap_energy": lap_energy,
+        "lap_ratio": lap_ratio,
+        "packing": packing,
+        "coverage": packing,
+        "crystal_score": crystal_score,
+        "texture_ratio": lap_ratio,
+        "polydispersity": polydispersity,
+        "recommended": recommended_state,
+        "invert_why": invert_why,
+        "cellprob": cellprob,
+    }
+
+
+def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params: dict) -> dict:
+    """SEM diagnostics: dark craters/pores, fine matrix globules, shadow depth."""
+    work, resize_factor = _prepare_analysis_gray(gray)
+    try:
+        ratio_value = float(um_per_px)
+    except (TypeError, ValueError):
+        ratio_value = 0.0
+    px_um = ratio_value if math.isfinite(ratio_value) and ratio_value > 0 else 0.2
+    px_um = px_um / resize_factor if resize_factor > 0 else px_um
+
+    blur = cv2.GaussianBlur(work, (5, 5), 0)
+    p5, p95 = (float(np.percentile(blur, q)) for q in (5.0, 95.0))
+    contrast = p95 - p5
+    bg_level = float(np.percentile(blur, 85.0))
+
+    # 1. Dark crater / pore detection at the 22nd intensity percentile.
+    # When dark pores occupy < 22% of the field, that percentile still sits on the
+    # matrix; fall back to an Otsu cut so genuinely dark craters are isolated.
+    p22 = float(np.percentile(blur, 22.0))
+    bg_median = float(np.median(blur))
+    dark_threshold = p22
+    if p22 > bg_median - 10.0:
+        otsu_threshold, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        dark_threshold = float(min(otsu_threshold, p22))
+    dark = (blur <= dark_threshold).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, _ellipse(3))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, _ellipse(5))
+
+    min_pore_px = max(
+        9,
+        min(
+            int(round(math.pi * (0.35 / max(px_um, 1e-6)) ** 2)),
+            max(9, int(0.01 * float(blur.size))),
+        ),
+    )
+    pores = []
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    for idx in range(1, n_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < min_pore_px or area > 0.35 * float(blur.size):
+            continue
+        comp = (labels == idx).astype(np.uint8)
+        contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour_area = float(cv2.contourArea(contours[0]))
+        perimeter = float(cv2.arcLength(contours[0], True))
+        if contour_area <= 0 or perimeter <= 0:
+            continue
+        circularity = float(4.0 * math.pi * contour_area / (perimeter ** 2))
+        if circularity < 0.35:
+            continue
+        diameter_um = 2.0 * math.sqrt(contour_area / math.pi) * px_um
+        if not 0.4 <= diameter_um <= 5000.0:
+            continue
+        values = blur[labels == idx]
+        shadow = float(bg_level - float(values.mean()))
+        # The 22nd-percentile cut can also grab the matrix when pores are sparse;
+        # genuine craters must be measurably darker than the surrounding matrix.
+        if shadow < 6.0:
+            continue
+        pores.append(
+            {
+                "d_um": diameter_um,
+                "circ": circularity,
+                "shadow": shadow,
+                "inner_std": float(values.std()),
+            }
+        )
+
+    # 2. Fine bright matrix globules via white top-hat (isolates objects up to ~3 µm).
+    max_kernel = max(3, min(work.shape[:2]) - 1)
+    tophat_len = int(np.clip(round(3.0 / max(px_um, 1e-6)), 5, min(41, max_kernel)))
+    tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, _ellipse(tophat_len))
+    fat_threshold = max(6.0, float(np.percentile(tophat, 99.0)))
+    fat_mask = (tophat >= fat_threshold).astype(np.uint8)
+    fat_mask = cv2.morphologyEx(fat_mask, cv2.MORPH_OPEN, _ellipse(3))
+    n_fat, _, fat_stats, _ = cv2.connectedComponentsWithStats(fat_mask, 8)
+    fat_diams = []
+    for idx in range(1, n_fat):
+        area = int(fat_stats[idx, cv2.CC_STAT_AREA])
+        if area < 3:
+            continue
+        diameter_um = 2.0 * math.sqrt(area / math.pi) * px_um
+        if 0.1 <= diameter_um <= 40.0:
+            fat_diams.append(diameter_um)
+
+    air_vals = np.asarray([p["d_um"] for p in pores], dtype=float)
+    fat_vals = np.asarray(fat_diams, dtype=float)
+    has_pores = bool(air_vals.size >= 3 and float(np.median(air_vals)) >= 1.5)
+    has_fine = bool(fat_vals.size >= 15)
+    if air_vals.size:
+        air_p10, air_p50, air_p95 = (float(np.percentile(air_vals, q)) for q in (10.0, 50.0, 95.0))
+    else:
+        air_p10 = air_p50 = air_p95 = 0.0
+    if fat_vals.size:
+        fat_p10, fat_p50, fat_p95 = (float(np.percentile(fat_vals, q)) for q in (10.0, 50.0, 95.0))
+    else:
+        fat_p10 = fat_p50 = fat_p95 = 0.0
+
+    # 3. Shadow depth + internal crater variance (adsorbed-fat evidence).
+    shadow_depth = float(np.median([p["shadow"] for p in pores])) if pores else 0.0
+    speck_density = 0.0
+    if np.any(dark):
+        speck_density = float((tophat[dark.astype(bool)] >= max(8.0, fat_threshold * 0.5)).mean())
+    inner_stds = [p["inner_std"] for p in pores if p["d_um"] >= 2.0]
+    internal_speck = bool(
+        (inner_stds and float(np.median(inner_stds)) >= 14.0) or speck_density >= 0.02
+    )
+    # 4. Sample type / detection target (user's choice kept unless both phases are clear).
+    current_type = str(_current_value(current_params, "sem_sample_type_radio") or "Whipped Emulsion")
+    current_focus = str(_current_value(current_params, "sem_detection_focus_radio") or SEM_FOCUS_AIR)
+    both_present = bool(has_pores and has_fine and fat_p95 < max(air_p50 * 0.75, 1.0))
+    if both_present:
+        rec_type, rec_focus = "Whipped Emulsion", SEM_FOCUS_TWO_PASS
+    else:
+        rec_type, rec_focus = current_type, current_focus
+    if rec_focus not in (SEM_FOCUS_AIR, SEM_FOCUS_TWO_PASS):
+        rec_focus = SEM_FOCUS_AIR
+
+    cur_min_air = float(_current_value(current_params, "sem_min_air_um"))
+    cur_max_air = float(_current_value(current_params, "sem_max_air_um"))
+    if has_pores:
+        rec_min_air = _clean_micron(max(0.5, air_p10 * 0.70))
+        rec_max_air = _clean_micron(max(rec_min_air + 1.0, air_p95 * 1.30))
+    else:
+        rec_min_air, rec_max_air = cur_min_air, cur_max_air
+
+    cur_min_fat = float(_current_value(current_params, "sem_min_fat_um"))
+    cur_max_fat = float(_current_value(current_params, "sem_max_fat_um"))
+    if has_fine:
+        rec_min_fat = _clean_micron(max(0.1, fat_p10 * 0.60))
+        rec_max_fat = _clean_micron(max(rec_min_fat + 0.2, fat_p95 * 1.40))
+    else:
+        rec_min_fat, rec_max_fat = cur_min_fat, cur_max_fat
+
+    low_contrast = bool(contrast < 65.0 or shadow_depth > 55.0)
+    if contrast < 45.0 or shadow_depth > 75.0:
+        flow = 0.80
+    elif low_contrast:
+        flow = 0.75
+    else:
+        flow = 0.70
+    cellprob = -1.5 if low_contrast else -1.0
+    deepscan = bool(internal_speck) or bool(
+        _current_value(current_params, "sem_deepscan_checkbox")
+    )
+    dust_score = float(
+        np.clip(0.5 * (shadow_depth / 80.0) + 0.5 * (1.0 if internal_speck else 0.0), 0.0, 1.0)
+    )
+
+    recommended_state = {
+        "sem_sample_type_radio": rec_type,
+        "sem_detection_focus_radio": rec_focus,
+        "sem_min_air_um": float(rec_min_air),
+        "sem_max_air_um": float(rec_max_air),
+        "sem_min_fat_um": float(rec_min_fat),
+        "sem_max_fat_um": float(rec_max_fat),
+        "shared_flow_slider": float(flow),
+        "shared_cellprob_slider": float(cellprob),
+        "shared_fat_circ_slider": 0.60,
+        "sem_air_circ_slider": 0.50,
+        "sem_ads_circ_slider": 0.30,
+        "sem_deepscan_checkbox": bool(deepscan),
+        "shared_clahe_checkbox": True,
+        # Low-contrast craters or internal shadow speckle benefit from cyto3's
+        # much broader training distribution.
+        "shared_model_type_select": (
+            "cyto3" if (low_contrast or internal_speck) else "cyto2"
+        ),
+    }
+    return {
+        "n_pores": int(air_vals.size),
+        "n_globules": int(fat_vals.size),
+        "air_p10": air_p10,
+        "air_p50": air_p50,
+        "air_p95": air_p95,
+        "fat_p10": fat_p10,
+        "fat_p50": fat_p50,
+        "fat_p95": fat_p95,
+        "has_pores": has_pores,
+        "has_fine": has_fine,
+        "both_present": both_present,
+        "contrast": contrast,
+        "shadow_depth": shadow_depth,
+        "speck_density": speck_density,
+        "internal_speck": internal_speck,
+        "dust_score": dust_score,
+        "low_contrast": low_contrast,
+        "flow": flow,
+        "cellprob": cellprob,
+        "recommended": recommended_state,
+    }
+
+
+
+def _light_summary_metrics(diag: dict) -> dict:
+    """Measured facts shown as diagnostic badges."""
+    return {
+        "Droplet Ø (P5-P95)": f"{diag['d5']:.1f}-{diag['d95']:.1f} µm",
+        "AI Target Ø": f"{diag['expected_droplet']:.1f} µm",
+        "Crystal Striation / Packing": (
+            f"{diag['striation_density'] * 100:.0f}% · {diag['packing']:.2f}"
+        ),
+        "Optical Contrast (P95-P5)": f"{diag['contrast']:.0f} GL",
+        "Recommended Profile": (
+            "❄️ Crystallized Fat" if diag["crystallized"] else "💧 Liquid Fat"
+        ),
+    }
+
+
+def _light_comparison_rows(diag: dict, current_params: dict) -> list:
+    """Educational Current vs. Recommended table for brightfield light microscopy."""
+    rec = diag["recommended"]
+    crystallized = bool(diag["crystallized"])
+    if crystallized:
+        profile_why = (
+            f"Black-hat striation density inside eroded globule interiors is "
+            f"{diag['striation_density']:.1%} (internal std {diag['internal_std']:.1f} GL, "
+            f"packing {diag['packing']:.0%}, Laplacian energy {diag['lap_energy']:.1f}). "
+            "These dark refraction lines are the optical signature of internal fat "
+            "crystals; edge-preserving smoothing plus strict convexity keeps each "
+            "globule intact instead of splitting it along crystal needles."
+        )
+    else:
+        profile_why = (
+            f"Globule interiors are optically smooth (striation density "
+            f"{diag['striation_density']:.1%}, internal std {diag['internal_std']:.1f} GL, "
+            f"packing {diag['packing']:.0%}); smoothing and the extra convexity "
+            "constraint would only erode genuine diffuse droplet boundaries."
+        )
+
+    if rec["shared_model_type_select"] == "cyto3":
+        if diag["crystal_pipeline_active"] and diag["contrast"] < 75.0:
+            model_why = (
+                f"Contrast is {diag['contrast']:.0f} GL (< 75), so even with smoothing "
+                f"{diag['smoothing_strength']} + multi-scale the faint crystal boundaries "
+                "benefit from cyto3's broader multi-modality training. Measured striation "
+                f"density {diag['striation_density']:.1%}, internal std "
+                f"{diag['internal_std']:.1f} GL."
+            )
+        elif diag["current_model_choice"] == "cyto3":
+            model_why = (
+                "cyto3 was already selected, so it is retained for maximum boundary "
+                f"sensitivity. Contrast is {diag['contrast']:.0f} GL with striation "
+                f"density {diag['striation_density']:.1%}."
+            )
+        else:
+            model_why = (
+                f"Low optical contrast ({diag['contrast']:.0f} GL < 65) makes faint "
+                "droplet boundaries ambiguous; cyto3's super-generalist training recovers "
+                f"them better than cyto2. Striation density "
+                f"{diag['striation_density']:.1%}, internal std {diag['internal_std']:.1f} GL."
+            )
+    elif diag["crystal_pipeline_active"]:
+        model_why = (
+            f"Smoothing {diag['smoothing_strength']} + multi-scale already erase internal "
+            f"crystal refraction lines cleanly, and contrast is {diag['contrast']:.0f} GL "
+            "(≥ 75), so cyto2 reaches the same boundaries much faster than cyto3."
+        )
+    else:
+        model_why = (
+            f"Globule interiors are smooth (striation density "
+            f"{diag['striation_density']:.1%}, internal std {diag['internal_std']:.1f} GL) "
+            f"and contrast is adequate ({diag['contrast']:.0f} GL); cyto2 reaches the "
+            "same boundaries much faster."
+        )
+
+    rows = [
+        _comparison_row(
+            "light_emulsion_profile_radio",
+            "Emulsion Droplet Profile",
+            rec["light_emulsion_profile_radio"],
+            current_params,
+            profile_why,
+        ),
+        _comparison_row(
+            "light_expected_droplet_um",
+            "Typical Droplet Diameter for AI (µm)",
+            rec["light_expected_droplet_um"],
+            current_params,
+            (
+                (
+                    "A marker-controlled watershed seeded by distance-transform maxima "
+                    f"(min peak separation {diag['min_peak_sep_px']} px) separates touching "
+                    "globules. For crystallized multi-scale segmentation the robust Sauter "
+                    f"D[3,2] = {diag['d_sauter']:.2f} µm (winsorized at P85 = "
+                    f"{diag['sauter_cap']:.2f} µm) is blended 50/50 with P82 = "
+                    f"{diag['p82']:.2f} µm, giving {diag['expected_droplet']:.1f} µm. "
+                    "That keeps the 1.0× pass from cutting inside 15-24 µm globules, "
+                    "where a number-median scale of ~6.5 µm split them into two lobes."
+                )
+                if diag["use_crystal_scale"]
+                else (
+                    "A marker-controlled watershed seeded by distance-transform maxima "
+                    f"(min peak separation {diag['min_peak_sep_px']} px) separates touching "
+                    f"globules. Area-weighted D[2,1] = {diag['d_area_weighted']:.2f} µm and "
+                    f"P75 = {diag['d75']:.2f} µm blend to {diag['expected_droplet']:.1f} µm, "
+                    "so tiny interstitial droplets cannot drag the AI scale down."
+                )
+            ),
+        ),
+        _comparison_row(
+            "light_min_fat_size_input",
+            "Min Fat Particle Size (µm)",
+            rec["light_min_fat_size_input"],
+            current_params,
+            (
+                f"The P5 droplet diameter is {diag['d5']:.2f} µm; 65% of it, capped at "
+                f"1.0 µm, gives {rec['light_min_fat_size_input']:.2f} µm - enough to "
+                "suppress sub-resolution noise while keeping the genuine small-droplet "
+                "tail."
+            ),
+        ),
+        _comparison_row(
+            "light_max_fat_size_input",
+            "Max Fat Particle Size (µm)",
+            rec["light_max_fat_size_input"],
+            current_params,
+            (
+                f"P98 = {diag['d98']:.1f} µm; 1.6× P98 and 3.2× the AI target give "
+                f"{rec['light_max_fat_size_input']:.1f} µm (always ≥ 25 µm), so "
+                "18-25 µm central macro-globules are classified as fat instead of "
+                "falling into Unclassified."
+            ),
+        ),
+    ]
+    rows.extend(
+        [
+            _comparison_row(
+                "light_multiscale_checkbox",
+                "Multi-Scale Globule Detection",
+                rec["light_multiscale_checkbox"],
+                current_params,
+                (
+                    f"Size spread P90/P50 = {diag['polydispersity']:.2f} "
+                    f"({'broad' if diag['polydispersity'] > 1.6 else 'narrow'}) with "
+                    f"{'crystallized' if crystallized else 'liquid'} droplets. Multi-scale "
+                    "runs a coarse pass for large globules (avoiding internal splitting) "
+                    "plus a fine pass for the small droplet population."
+                ),
+            ),
+            _comparison_row(
+                "light_crystal_smooth_slider",
+                "Internal Crystal Smoothing Strength",
+                rec["light_crystal_smooth_slider"],
+                current_params,
+                (
+                    f"Measured internal black-hat striation density is "
+                    f"{diag['striation_density']:.1%}; strength 3 edge-preserving "
+                    "smoothing erases those crystal needles before inference, so "
+                    "Cellpose sees one continuous droplet instead of several shards."
+                    if crystallized
+                    else f"Striation density is only {diag['striation_density']:.1%}, so "
+                    "smoothing is switched off to preserve the faint refractive rim of "
+                    "liquid droplets."
+                ),
+            ),
+            _comparison_row(
+                "light_invert_bf_checkbox",
+                "Invert Brightfield (Dark-Rim Droplets)",
+                rec["light_invert_bf_checkbox"],
+                current_params,
+                diag["invert_why"],
+            ),
+            _comparison_row(
+                "light_solidity_slider",
+                "Matrix Fat Min Solidity",
+                rec["light_solidity_slider"],
+                current_params,
+                (
+                    "Crystallized globules are solid convex bodies: Solidity ≥ 0.84 "
+                    "rejects crescent shards and inter-droplet background fragments that "
+                    "survive circularity filtering."
+                    if crystallized
+                    else "Liquid droplets are deformable; 0.75 tolerates slight elongation "
+                    "while still rejecting concave fragments and shards."
+                ),
+            ),
+        ]
+    )
+    rows.extend(
+        [
+            _comparison_row(
+                "shared_fat_circ_slider",
+                "Matrix Fat Min Circularity",
+                rec["shared_fat_circ_slider"],
+                current_params,
+                (
+                    "0.60 accommodates faceted crystal outlines and touching boundaries "
+                    "between packed globules."
+                    if crystallized
+                    else "0.68 rejects rim fragments and elongated debris while keeping "
+                    "near-spherical liquid droplets."
+                ),
+            ),
+            _comparison_row(
+                "shared_flow_slider",
+                "flow_threshold",
+                rec["shared_flow_slider"],
+                current_params,
+                (
+                    "Brightfield droplet boundaries are optically crisp, so 0.70 keeps the "
+                    "learned flow field stable while tolerating slightly irregular "
+                    "crystallized outlines."
+                ),
+            ),
+            _comparison_row(
+                "shared_cellprob_slider",
+                "cellprob_threshold",
+                rec["shared_cellprob_slider"],
+                current_params,
+                (
+                    f"Measured P95-P5 optical contrast is {diag['contrast']:.0f} GL "
+                    f"({'< 65, so -1.5 recovers faint droplets' if diag['contrast'] < 65 else 'adequate, so -1.0 avoids background false positives'})."
+                ),
+            ),
+            _comparison_row(
+                "shared_clahe_checkbox",
+                "Enable CLAHE Preprocessing",
+                False,
+                current_params,
+                "CLAHE is disabled in brightfield: it amplifies the dark refractive halos "
+                "and uneven illumination gradients that already dominate the gradient "
+                "field, producing spurious boundaries.",
+            ),
+            _comparison_row(
+                "shared_model_type_select",
+                "Cellpose Foundation Model",
+                rec["shared_model_type_select"],
+                current_params,
+                model_why,
+            ),
+        ]
+    )
+    return rows
+
+
+def _sem_summary_metrics(diag: dict) -> dict:
+    """Three-to-four measured facts shown as diagnostic badges."""
+
+    def _range_text(p10: float, p95: float) -> str:
+        if p10 <= 0.0 or p95 <= 0.0:
+            return "not detected"
+        return f"{p10:.1f}-{p95:.1f} µm"
+
+    return {
+        "Pore Ø (P10-P95)": _range_text(diag["air_p10"], diag["air_p95"]),
+        "Matrix Globule Ø (P10-P95)": _range_text(diag["fat_p10"], diag["fat_p95"]),
+        "Optical Contrast (P95-P5)": f"{diag['contrast']:.0f} GL",
+        "Crater Shadow / Speck Score": (
+            f"−{diag['shadow_depth']:.0f} GL · {diag['dust_score']:.2f}"
+        ),
+    }
+
+
+def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
+    """Educational Current vs. Recommended table for SEM micrographs."""
+    rec = diag["recommended"]
+    pore_text = (
+        f"{diag['n_pores']} near-circular dark craters spanning "
+        f"{diag['air_p10']:.1f}-{diag['air_p95']:.1f} µm (P10-P95)"
+        if diag["has_pores"]
+        else "no dominant population of large dark craters was segmented"
+    )
+    globule_text = (
+        f"{diag['n_globules']} fine bright matrix globules with P95 = "
+        f"{diag['fat_p95']:.2f} µm"
+        if diag["has_fine"]
+        else "no dense fine-globule population was isolated by the top-hat filter"
+    )
+    sample_why = (
+        f"{pore_text} coexist with {globule_text}. Two physically distinct phases "
+        "require a two-pass workflow so large air pores and fine fat globules are "
+        "measured with separate detection scales."
+        if diag["both_present"]
+        else f"{pore_text}; {globule_text}. Only one phase is statistically dominant, "
+        "so your current sample type is retained instead of silently switching the "
+        "classification logic."
+    )
+    focus_why = (
+        "Two-pass is recommended because the pore and globule size distributions barely "
+        "overlap: the air pass captures dark craters at the air-bubble scale, then the "
+        "fat pass captures the fine matrix emulsion."
+        if diag["both_present"]
+        else "The retained detection target matches the single dominant phase measured "
+        "in this field of view; a second pass would only add runtime and false positives."
+    )
+    rows = [
+        _comparison_row(
+            "sem_sample_type_radio",
+            "Sample Type",
+            rec["sem_sample_type_radio"],
+            current_params,
+            sample_why,
+        ),
+        _comparison_row(
+            "sem_detection_focus_radio",
+            "AI Detection Target",
+            rec["sem_detection_focus_radio"],
+            current_params,
+            focus_why,
+        ),
+        _comparison_row(
+            "sem_min_air_um",
+            "Min Air Bubble Size (µm)",
+            rec["sem_min_air_um"],
+            current_params,
+            (
+                f"0.70 × the measured pore P10 ({diag['air_p10']:.1f} µm) keeps the "
+                "smallest real bubbles while excluding speckle and crater-wall fragments."
+                if diag["has_pores"]
+                else "No reliable pore population was measured, so the existing minimum "
+                "air-bubble boundary is preserved."
+            ),
+        ),
+        _comparison_row(
+            "sem_max_air_um",
+            "Max Air Bubble Size (µm)",
+            rec["sem_max_air_um"],
+            current_params,
+            (
+                f"1.30 × the measured pore P95 ({diag['air_p95']:.1f} µm) leaves headroom "
+                "for large whipped-air bubbles without admitting merged clusters."
+                if diag["has_pores"]
+                else "No reliable pore population was measured, so the existing maximum "
+                "air-bubble boundary is preserved."
+            ),
+        ),
+    ]
+    rows.extend(
+        [
+            _comparison_row(
+                "sem_min_fat_um",
+                "Min Fat Particle Size (µm)",
+                rec["sem_min_fat_um"],
+                current_params,
+                (
+                    f"0.60 × the top-hat globule P10 ({diag['fat_p10']:.2f} µm) removes "
+                    "sub-resolution texture while retaining genuine small matrix droplets."
+                    if diag["has_fine"]
+                    else "The fine-globule population was too sparse to re-bound; the "
+                    "current minimum fat size is retained."
+                ),
+            ),
+            _comparison_row(
+                "sem_max_fat_um",
+                "Max Fat Particle Size (µm)",
+                rec["sem_max_fat_um"],
+                current_params,
+                (
+                    f"1.40 × the globule P95 ({diag['fat_p95']:.2f} µm) captures the coarse "
+                    "tail of the matrix emulsion without swallowing air-crater rims."
+                    if diag["has_fine"]
+                    else "The fine-globule population was too sparse to re-bound; the "
+                    "current maximum fat size is retained."
+                ),
+            ),
+            _comparison_row(
+                "shared_flow_slider",
+                "flow_threshold",
+                rec["shared_flow_slider"],
+                current_params,
+                (
+                    f"Global contrast is {diag['contrast']:.0f} GL with a median pore "
+                    f"shadow of {diag['shadow_depth']:.0f} GL; a stricter flow bound "
+                    "keeps the learned flow field from leaking across blurred crater walls."
+                ),
+            ),
+            _comparison_row(
+                "shared_cellprob_slider",
+                "cellprob_threshold",
+                rec["shared_cellprob_slider"],
+                current_params,
+                (
+                    f"Low contrast ({diag['contrast']:.0f} GL < 65) or deep crater shadow "
+                    f"({diag['shadow_depth']:.0f} GL) means faint pores fall below the "
+                    "default probability: -1.5 recovers them."
+                    if diag["low_contrast"]
+                    else f"Contrast ({diag['contrast']:.0f} GL) and crater shadow "
+                    f"({diag['shadow_depth']:.0f} GL) are adequate, so -1.0 suppresses "
+                    "background false positives."
+                ),
+            ),
+            _comparison_row(
+                "sem_air_circ_slider",
+                "Air Bubbles Min Circularity",
+                0.50,
+                current_params,
+                "Air bubbles are near-spherical; 0.50 removes irregular inter-particle "
+                "gaps while tolerating partially occluded bubble rims.",
+            ),
+            _comparison_row(
+                "shared_fat_circ_slider",
+                "Matrix Fat Min Circularity",
+                0.60,
+                current_params,
+                "Matrix fat globules are spherical but often touching; 0.60 keeps merged "
+                "round pairs and rejects angular mineral debris.",
+            ),
+            _comparison_row(
+                "sem_ads_circ_slider",
+                "Adsorbed Fat Min Circularity",
+                0.30,
+                current_params,
+                "Adsorbed fat sits as caps/patches on curved bubble walls, so a low bound "
+                "(0.30) is required to retain these non-spherical interfacial objects.",
+            ),
+            _comparison_row(
+                "sem_deepscan_checkbox",
+                "Deep-Scan Adsorbed Fat inside Bubbles",
+                rec["sem_deepscan_checkbox"],
+                current_params,
+                (
+                    f"Crater interiors show internal variance (speck density "
+                    f"{diag['speck_density']:.3f}), consistent with adsorbed fat globules "
+                    "hiding in the dark shadow - a localized deep-scan recovers them."
+                    if diag["internal_speck"]
+                    else "Crater interiors are homogeneous, so deep-scan would only add "
+                    "runtime; your current setting is retained."
+                ),
+            ),
+            _comparison_row(
+                "shared_clahe_checkbox",
+                "Enable CLAHE Preprocessing",
+                True,
+                current_params,
+                "SEM craters and shadowed pore walls are locally low-contrast; CLAHE "
+                "(clipLimit=2.0) normalises those dark regions before the network sees "
+                "the image.",
+            ),
+            _comparison_row(
+                "shared_model_type_select",
+                "Cellpose Foundation Model",
+                rec["shared_model_type_select"],
+                current_params,
+                (
+                    f"Low contrast ({diag['contrast']:.0f} GL), deep crater shadow "
+                    f"({diag['shadow_depth']:.0f} GL) or internal speckle (density "
+                    f"{diag['speck_density']:.3f}) requires cyto3's broader multi-modality "
+                    "training to separate faint pore walls from matrix texture."
+                    if rec["shared_model_type_select"] == "cyto3"
+                    else f"Contrast ({diag['contrast']:.0f} GL) and crater definition "
+                    f"({diag['shadow_depth']:.0f} GL shadow) are sufficient for the faster "
+                    "cyto2 baseline."
+                ),
+            ),
+        ]
+    )
+    return rows
+
+
+def diagnose_and_recommend_parameters(
+    analysis_img: np.ndarray,
+    pixel_to_um_ratio: float,
+    is_light_mode: bool,
+    current_params: dict,
+) -> dict:
+    """
+    Measure the current micrograph and translate the optics into Cellpose settings.
+
+    The advisor never mutates widget state: it returns a structured proposal that
+    the UI shows in an interactive review card. Physical sizes are derived from the
+    active calibration (``pixel_to_um_ratio`` µm/px) so both SEM and light
+    microscopy modes produce values in µm.
+
+    Args:
+        analysis_img: Cropped grayscale micrograph (SEM footer already excluded).
+        pixel_to_um_ratio: Active calibration in µm per pixel.
+        is_light_mode: ``True`` for brightfield light microscopy, ``False`` for SEM.
+        current_params: Mapping of Section 4 / 5 widget keys to their current values.
+
+    Returns:
+        dict: ``modality``, ``summary_metrics``, ``recommended_widget_state`` and
+        ``comparison_rows`` (Parameter / Current / Recommended / Rationale).
+
+    Raises:
+        ValueError: If the analysis image is empty.
+    """
+    gray = np.asarray(analysis_img)
+    if gray.size == 0:
+        raise ValueError("Empty analysis image - load a micrograph before running the advisor.")
+
+    if is_light_mode:
+        diag = _diagnose_light_microscopy(gray, pixel_to_um_ratio, current_params)
+        return {
+            "modality": "💡 Light Microscopy",
+            "summary_metrics": _light_summary_metrics(diag),
+            "recommended_widget_state": dict(diag["recommended"]),
+            "comparison_rows": _light_comparison_rows(diag, current_params),
+        }
+
+    diag = _diagnose_sem_micrograph(gray, pixel_to_um_ratio, current_params)
+    return {
+        "modality": "🔬 SEM Micrograph",
+        "summary_metrics": _sem_summary_metrics(diag),
+        "recommended_widget_state": dict(diag["recommended"]),
+        "comparison_rows": _sem_comparison_rows(diag, current_params),
+    }
 
 
 def calculate_canvas_line_length(line_obj: dict) -> float:
@@ -476,6 +2030,37 @@ def _remove_nested_matryoshka_masks(
 
 # ---------------- SIDEBAR CONFIGURATION ----------------
 with st.sidebar:
+    # ── Pre-widget session-state synchronisation ─────────────────────────────
+    # The AI Parameter Advisor "Apply" action and the preset loader stage their
+    # widget values here; writing them BEFORE any widget is instantiated avoids
+    # StreamlitAPIException ("cannot be modified after widget is instantiated").
+    _pending_parameter_updates = st.session_state.pop("_pending_parameter_updates", None)
+    if _pending_parameter_updates:
+        for _param_key, _param_value in _pending_parameter_updates.items():
+            st.session_state[_param_key] = _param_value
+        # Drop sticky particle-editor table state so the new recipe reclassifies
+        # immediately on this very run.
+        for _stale_editor_key in [
+            k for k in list(st.session_state.keys())
+            if str(k).startswith("particle_data_editor")
+        ]:
+            del st.session_state[_stale_editor_key]
+        st.session_state["manual_phase_overrides"] = {}
+        st.session_state["force_class_refresh"] = True
+        # Keep the profile tracker aligned with the applied profile so the
+        # profile-driven defaults below cannot overwrite the applied recipe.
+        if "light_emulsion_profile_radio" in _pending_parameter_updates:
+            st.session_state["light_profile_tracker"] = _pending_parameter_updates[
+                "light_emulsion_profile_radio"
+            ]
+
+    _preset_saved_flash = st.session_state.pop("_preset_saved_flash", None)
+    if _preset_saved_flash:
+        st.toast(f"💾 Saved preset: {_preset_saved_flash}", icon="💾")
+    _preset_loaded_flash = st.session_state.pop("_preset_loaded_flash", None)
+    if _preset_loaded_flash:
+        st.toast(f"📂 Loaded preset: {_preset_loaded_flash}", icon="📂")
+
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
 
@@ -504,6 +2089,20 @@ with st.sidebar:
         ),
     )
     is_light_mode = (imaging_mode == "💡 Light Microscopy")
+
+    # Shared preprocessing toggles keep different physical defaults per modality
+    # (CLAHE helps recover shadowed SEM craters but amplifies brightfield halos).
+    # Reset them only when the modality actually changes and no pending recipe
+    # from the advisor / preset loader explicitly supplied a value.
+    if st.session_state.get("_last_imaging_modality") != imaging_mode:
+        st.session_state["_last_imaging_modality"] = imaging_mode
+        # A snapshot from the other modality cannot be applied here.
+        st.session_state.pop("_previous_parameter_snapshot", None)
+        if not (
+            _pending_parameter_updates
+            and "shared_clahe_checkbox" in _pending_parameter_updates
+        ):
+            st.session_state["shared_clahe_checkbox"] = not is_light_mode
 
     st.divider()
 
@@ -827,6 +2426,7 @@ with st.sidebar:
             options=["Emulsion", "Whipped Emulsion", "Foam"],
             index=1,
             help="Select 'Emulsion' for single-phase fat droplets, 'Whipped Emulsion' for multi-phase air and fat sorting, or 'Foam' for single-phase air bubbles.",
+            key="sem_sample_type_radio",
         )
 
     if is_light_mode:
@@ -882,6 +2482,7 @@ with st.sidebar:
                 value=0.20,
                 step=0.1,
                 help="Minimum equivalent diameter in micrometers for fat particles.",
+                key="sem_min_fat_um",
             ))
         with col_fat2:
             max_fat_size = float(st.number_input(
@@ -891,6 +2492,7 @@ with st.sidebar:
                 value=5.0,
                 step=0.5,
                 help="Maximum equivalent diameter in micrometers for fat particles.",
+                key="sem_max_fat_um",
             ))
         # Internal defaults for hidden air bubble settings
         min_air_size = 10.0
@@ -915,6 +2517,7 @@ with st.sidebar:
                 value=10.0,
                 step=1.0,
                 help="Minimum equivalent diameter in micrometers for air bubbles.",
+                key="sem_min_air_um",
             ))
         with col_air2:
             max_air_size = float(st.number_input(
@@ -924,6 +2527,7 @@ with st.sidebar:
                 value=100.0,
                 step=5.0,
                 help="Maximum equivalent diameter in micrometers for air bubbles.",
+                key="sem_max_air_um",
             ))
         # Internal defaults for hidden fat particle settings
         min_fat_size = 0.20
@@ -947,7 +2551,7 @@ with st.sidebar:
                 "**Two-Pass** — dedicated pass for large air bubbles + second pass for fine "
                 "fat globules; both layers shown simultaneously on the overlay."
             ),
-            key="detection_focus_radio",
+            key="sem_detection_focus_radio",
         )
 
         st.markdown("**Air Bubble Size Range (µm):**")
@@ -960,6 +2564,7 @@ with st.sidebar:
                 value=10.0,
                 step=1.0,
                 help="Minimum equivalent diameter in micrometers for air bubbles.",
+                key="sem_min_air_um",
             ))
         with col_air2:
             max_air_size = float(st.number_input(
@@ -969,6 +2574,7 @@ with st.sidebar:
                 value=100.0,
                 step=5.0,
                 help="Maximum equivalent diameter in micrometers for air bubbles.",
+                key="sem_max_air_um",
             ))
 
         st.markdown("**Fat Particle Size Range (µm):**")
@@ -981,6 +2587,7 @@ with st.sidebar:
                 value=0.20,
                 step=0.1,
                 help="Minimum equivalent diameter in micrometers for fat particles.",
+                key="sem_min_fat_um",
             ))
         with col_fat2:
             max_fat_size = float(st.number_input(
@@ -990,6 +2597,7 @@ with st.sidebar:
                 value=5.0,
                 step=0.5,
                 help="Maximum equivalent diameter in micrometers for fat particles.",
+                key="sem_max_fat_um",
             ))
 
         overlap_priority = "Air Bubbles"
@@ -1036,9 +2644,15 @@ with st.sidebar:
 
     model_type = st.selectbox(
         "Pretrained Model",
-        options=["cyto2", "nuclei", "Custom Model File..."],
-        index=0,
-        help="Architecture model family for particle detection or user-trained custom weights.",
+        options=["cyto3", "cyto2", "nuclei", "Custom Model File..."],
+        index=1,
+        key="shared_model_type_select",
+        help=(
+            "**cyto3:** Super-generalist model trained on a massive multi-modality "
+            "dataset (best for complex/textured micrographs).  \n"
+            "**cyto2:** Classic high-speed baseline for standard SEM & emulsions.  \n"
+            "**nuclei:** Optimized for round, high-contrast spherical droplets."
+        ),
     )
 
     custom_model_path: Optional[str] = None
@@ -1090,6 +2704,7 @@ with st.sidebar:
                         "Automatically converted to pixels using your active objective calibration. "
                         "Set higher (e.g., 8–14 µm) for large crystallized globules so AI captures them whole instead of splitting internal crystal lines."
                     ),
+                    key="light_expected_droplet_um",
                 )
             )
             eff_diameter = float(np.clip(expected_droplet_um / max(pixel_to_um_ratio, 1e-6), 12.0, 220.0))
@@ -1140,6 +2755,7 @@ with st.sidebar:
         value=0.7,
         step=0.05,
         help="Maximum allowed flow error. Higher values detect more irregular or faint boundaries (default: 0.7).",
+        key="shared_flow_slider",
     )
 
     cellprob_threshold = st.slider(
@@ -1149,6 +2765,7 @@ with st.sidebar:
         value=-1.0,
         step=0.5,
         help="Cell probability detection threshold. Negative values (e.g. -1.0 to -2.0) drastically increase detection of low-contrast pores and bubbles (default: -1.0).",
+        key="shared_cellprob_slider",
     )
 
     fat_min_solidity = 0.0
@@ -1162,7 +2779,8 @@ with st.sidebar:
         ads_min_circularity = 0.30
         enable_deepscan = False
         fat_min_circularity = st.slider(
-            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.05
+            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.01,
+            key="shared_fat_circ_slider",
         )
         default_solidity = 0.84 if is_crystallized_mode else 0.72
         fat_min_solidity = float(
@@ -1171,8 +2789,9 @@ with st.sidebar:
                 min_value=0.50,
                 max_value=0.98,
                 value=default_solidity,
-                step=0.02,
+                step=0.01,
                 help="Ratio of droplet area to its convex hull area. True spherical/oval droplets have Solidity > 0.84; crescent shards and inter-droplet background fragments have low solidity and are rejected.",
+                key="light_solidity_slider",
             )
         )
         if is_crystallized_mode:
@@ -1183,26 +2802,34 @@ with st.sidebar:
                     max_value=4,
                     value=3,
                     help="0 = off. 2–3 smooths out internal crystal needles before AI segmentation so whole globules are detected intact.",
+                    key="light_crystal_smooth_slider",
                 )
             )
             enable_multiscale_crystal = st.checkbox(
                 "🔍 Multi-Scale Globule Detection (Large + Small Globules)",
                 value=True,
                 help="Runs a coarse AI pass for large crystallized globules (preventing internal splitting) and a fine pass for small globules, merging intact droplets.",
+                key="light_multiscale_checkbox",
             )
         st.caption("ℹ️ Light Microscopy: only fat-droplet circularity/convexity filtering is applied.")
     else:
         air_min_circularity = st.slider(
-            "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05
+            "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05,
+            key="sem_air_circ_slider",
         )
         fat_min_circularity = st.slider(
-            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.05
+            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.01,
+            key="shared_fat_circ_slider",
         )
-        ads_min_circularity = st.slider("🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05)
+        ads_min_circularity = st.slider(
+            "🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05,
+            key="sem_ads_circ_slider",
+        )
         enable_deepscan = st.checkbox(
             "🔬 Deep-Scan Adsorbed Fat inside Bubbles",
             value=False,
             help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
+            key="sem_deepscan_checkbox",
         )
         st.caption("ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat.")
 
@@ -1211,6 +2838,11 @@ with st.sidebar:
     # Optical preprocessing for transmitted-light (brightfield) micrographs
     invert_brightfield = False
     if is_light_mode:
+        # Keep the widget's polarity default in sync with the selected optical
+        # profile, unless the user (or the AI advisor) explicitly overrode it.
+        if st.session_state.get("light_profile_tracker") != emulsion_profile:
+            st.session_state["light_profile_tracker"] = emulsion_profile
+            st.session_state["light_invert_bf_checkbox"] = not is_crystallized_mode
         invert_brightfield = st.checkbox(
             "💡 Invert Brightfield (Dark-Rim Droplets)",
             value=not is_crystallized_mode,
@@ -1221,13 +2853,198 @@ with st.sidebar:
                 "Crystallized profiles default to OFF because packed globules have bright "
                 "bodies separated by dark borders."
             ),
+            key="light_invert_bf_checkbox",
         )
 
     enable_clahe = st.checkbox(
         "Enable CLAHE Preprocessing",
         value=not is_light_mode,
         help="Applies Contrast Limited Adaptive Histogram Equalization with OpenCV (clipLimit=2.0, tileGridSize=(8,8)) to boost contrast for faint pores before segmentation.",
+        key="shared_clahe_checkbox",
     )
+
+    # ── 🪄 AI Parameter Advisor (controlled apply) ────────────────────────────
+    st.divider()
+    st.markdown("**🪄 AI Parameter Advisor**")
+    st.caption(
+        "Measures the current micrograph in physical µm and *proposes* Section 4/5 "
+        "settings. Nothing changes until you review the diagnostics and apply."
+    )
+
+    # Single source of truth for "current" values (also used by preset saving).
+    _live_parameter_values = {
+        "sem_sample_type_radio": sample_type,
+        "sem_detection_focus_radio": detection_focus,
+        "sem_min_air_um": float(min_air_size),
+        "sem_max_air_um": float(max_air_size),
+        "sem_min_fat_um": float(min_fat_size),
+        "sem_max_fat_um": float(max_fat_size),
+        "light_min_fat_size_input": float(min_fat_size),
+        "light_max_fat_size_input": float(max_fat_size),
+        "light_emulsion_profile_radio": emulsion_profile if is_light_mode else None,
+        "light_expected_droplet_um": expected_droplet_um,
+        "light_crystal_smooth_slider": int(crystal_smooth_strength),
+        "light_multiscale_checkbox": bool(enable_multiscale_crystal),
+        "light_invert_bf_checkbox": bool(invert_brightfield) if is_light_mode else None,
+        "light_solidity_slider": float(fat_min_solidity) if is_light_mode else None,
+        "shared_fat_circ_slider": float(fat_min_circularity),
+        "shared_flow_slider": float(flow_threshold),
+        "shared_cellprob_slider": float(cellprob_threshold),
+        "shared_clahe_checkbox": bool(enable_clahe),
+        "shared_model_type_select": model_type,
+        "sem_air_circ_slider": float(air_min_circularity) if not is_light_mode else None,
+        "sem_ads_circ_slider": float(ads_min_circularity) if not is_light_mode else None,
+        "sem_deepscan_checkbox": bool(enable_deepscan) if not is_light_mode else None,
+    }
+
+    if st.button(
+        "🪄 Analyze Image & Recommend Parameters",
+        type="primary",
+        use_container_width=True,
+        key="autotune_analyze_btn",
+        help=(
+            "Runs optical and morphological diagnostics on the current image and opens a "
+            "review card with measured µm ranges, a parameter comparison table and the "
+            "scientific rationale for every suggestion."
+        ),
+    ):
+        if image_bytes is None:
+            st.warning("Load a micrograph before running the AI Parameter Advisor.")
+        else:
+            try:
+                _advisor_raw = decode_image_bytes(image_bytes)
+                _advisor_footer = max(0, min(int(footer_height), _advisor_raw.shape[0] - 1))
+                _advisor_img = (
+                    _advisor_raw[:-_advisor_footer, :]
+                    if _advisor_footer > 0
+                    else _advisor_raw
+                )
+                _advisor_proposal = diagnose_and_recommend_parameters(
+                    _advisor_img,
+                    float(pixel_to_um_ratio),
+                    bool(is_light_mode),
+                    dict(_live_parameter_values),
+                )
+                _advisor_proposal["image_name"] = image_name
+                _advisor_proposal["is_light_mode"] = bool(is_light_mode)
+                _advisor_proposal["calibration_um_per_px"] = float(pixel_to_um_ratio)
+                st.session_state["autotune_proposal"] = _advisor_proposal
+            except Exception as exc:
+                st.error(f"AI Parameter Advisor could not analyse this image: {exc}")
+
+    # ── ↩️ Undo Last Apply / 🔄 Reset to Defaults (one-click recovery) ─────────
+    _undo_col, _reset_col = st.columns(2)
+    with _undo_col:
+        if st.button(
+            "↩️ Undo Last Apply",
+            use_container_width=True,
+            key="autotune_undo_btn",
+            disabled=not bool(st.session_state.get("_previous_parameter_snapshot")),
+            help=(
+                "Restore the parameter values that were active before the last "
+                "Apply, preset load, or reset."
+            ),
+        ):
+            _undo_snapshot = st.session_state.pop("_previous_parameter_snapshot", None)
+            if _undo_snapshot:
+                st.session_state["_pending_parameter_updates"] = dict(_undo_snapshot)
+                st.session_state.pop("autotune_proposal", None)
+                st.toast("↩️ Reverted to previous parameters!")
+                st.rerun()
+
+    with _reset_col:
+        if st.button(
+            "🔄 Reset to Defaults",
+            use_container_width=True,
+            key="autotune_reset_btn",
+            help=(
+                "Restore the clean defaults for the active modality and optical profile "
+                "(9.0 µm target, cyto2, 0.50-50.0 µm, smoothing 3, solidity 0.84 for "
+                "crystallized fat)."
+            ),
+        ):
+            st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
+                "Light" if is_light_mode else "SEM", _live_parameter_values
+            )
+            st.session_state["_pending_parameter_updates"] = build_default_parameter_state(
+                is_light_mode,
+                emulsion_profile if is_light_mode else None,
+            )
+            # Clear manual classification/exclusion state so the reset recipe is
+            # evaluated against a clean object set.
+            st.session_state["manual_phase_overrides"] = {}
+            st.session_state["interactive_excluded_ids"] = set()
+            st.session_state.pop("autotune_proposal", None)
+            st.toast("🔄 Parameters reset to defaults!")
+            st.rerun()
+
+    # ── 📂 Custom Parameter Preset Manager ────────────────────────────────────
+    with st.expander("📂 Parameter Presets (Save / Load Recipes)", expanded=False):
+        _preset_modality = "Light" if is_light_mode else "SEM"
+        _parameter_presets = load_parameter_presets()
+        _modality_presets = _parameter_presets.get(_preset_modality, {})
+        st.caption(
+            f"Recipes for **{_preset_modality}** mode are stored in "
+            f"`{PARAMETER_PRESETS_FILE}` in the project root."
+        )
+
+        if _modality_presets:
+            _preset_names = list(_modality_presets.keys())
+            _selected_preset_name = st.selectbox(
+                "Saved Recipe",
+                options=_preset_names,
+                key=f"parameter_preset_select_{_preset_modality.lower()}",
+                help="Built-in laboratory recipes plus every preset you saved yourself.",
+            )
+            if st.button(
+                "📂 Load Preset",
+                use_container_width=True,
+                key=f"load_parameter_preset_{_preset_modality.lower()}",
+            ):
+                st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
+                    _preset_modality, _live_parameter_values
+                )
+                st.session_state["_pending_parameter_updates"] = dict(
+                    _modality_presets[_selected_preset_name]
+                )
+                st.session_state.pop("autotune_proposal", None)
+                st.session_state["_preset_loaded_flash"] = _selected_preset_name
+                st.rerun()
+        else:
+            st.info("No presets stored for this modality yet.")
+
+        _new_preset_name = st.text_input(
+            "New preset name",
+            placeholder="Student Lab - Coconut Bar Emulsion 40x",
+            key=f"parameter_preset_name_{_preset_modality.lower()}",
+            help="Saves every Section 4 & Section 5 control for the active modality.",
+        )
+        if st.button(
+            "💾 Save Current Settings as Preset",
+            use_container_width=True,
+            key=f"save_parameter_preset_{_preset_modality.lower()}",
+        ):
+            _clean_preset_name = str(_new_preset_name or "").strip()
+            if not _clean_preset_name:
+                st.warning("Type a preset name before saving.")
+            else:
+                _preset_snapshot = collect_parameter_snapshot(
+                    _preset_modality, _live_parameter_values
+                )
+                _parameter_presets.setdefault(_preset_modality, {})[
+                    _clean_preset_name
+                ] = _preset_snapshot
+                try:
+                    save_parameter_presets(_parameter_presets)
+                    st.session_state["_preset_saved_flash"] = _clean_preset_name
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"Could not write `{PARAMETER_PRESETS_FILE}`: {exc}")
+
+        st.caption(
+            "ℹ️ Presets capture the full Section 4 & 5 recipe so a lab protocol can be "
+            "reproduced exactly on another image or microscope."
+        )
 
     st.divider()
 
@@ -2387,6 +4204,85 @@ else:
         cols[c_idx].metric("Mean Diameter", f"{avg_diam:.2f} µm")
         c_idx += 1
 
+    # ---------------- 🪄 AI PARAMETER ADVISOR REVIEW CARD ----------------
+    _autotune_proposal = st.session_state.get("autotune_proposal")
+    if _autotune_proposal is not None:
+        _proposal_matches_image = (
+            _autotune_proposal.get("image_name") == image_name
+            and bool(_autotune_proposal.get("is_light_mode")) == bool(is_light_mode)
+        )
+        if not _proposal_matches_image:
+            # Stale proposal from another image/modality: silently discard it.
+            st.session_state.pop("autotune_proposal", None)
+        else:
+            with st.container(border=True):
+                st.markdown(
+                    "### 🪄 AI Microstructure Diagnostics & Recommended Parameters "
+                    f"({_autotune_proposal.get('modality', 'Micrograph')})"
+                )
+                st.caption(
+                    f"Measured on `{image_name}` at **"
+                    f"{float(_autotune_proposal.get('calibration_um_per_px', pixel_to_um_ratio)):.4f} µm/px**. "
+                    "Review the physical evidence below before applying — no sidebar "
+                    "parameter has been changed yet."
+                )
+
+                _proposal_metrics = _autotune_proposal.get("summary_metrics", {})
+                if _proposal_metrics:
+                    _badge_cols = st.columns(len(_proposal_metrics))
+                    for _badge_col, (_metric_label, _metric_value) in zip(
+                        _badge_cols, _proposal_metrics.items()
+                    ):
+                        _badge_col.metric(_metric_label, _metric_value)
+
+                st.markdown("**📊 Parameter Comparison & Scientific Rationale**")
+                _proposal_rows = _autotune_proposal.get("comparison_rows", [])
+                if _proposal_rows:
+                    st.dataframe(
+                        pd.DataFrame(_proposal_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Parameter": st.column_config.TextColumn(
+                                "Parameter", width="medium"
+                            ),
+                            "Current": st.column_config.TextColumn("Current", width="small"),
+                            "Recommended": st.column_config.TextColumn(
+                                "Recommended", width="small"
+                            ),
+                            "Why (Educational Rationale)": st.column_config.TextColumn(
+                                "Why (Educational Rationale)", width="large"
+                            ),
+                        },
+                    )
+                else:
+                    st.info("No parameter changes are required for this micrograph.")
+
+                _apply_col, _dismiss_col = st.columns(2)
+                if _apply_col.button(
+                    "✅ Apply Recommended Parameters",
+                    type="primary",
+                    use_container_width=True,
+                    key="autotune_apply_btn",
+                ):
+                    st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
+                        "Light" if is_light_mode else "SEM",
+                        _live_parameter_values,
+                    )
+                    st.session_state["_pending_parameter_updates"] = dict(
+                        _autotune_proposal.get("recommended_widget_state", {})
+                    )
+                    st.session_state.pop("autotune_proposal", None)
+                    st.toast("✅ Optimal parameters applied!")
+                    st.rerun()
+                if _dismiss_col.button(
+                    "✖️ Dismiss (Keep Current Settings)",
+                    use_container_width=True,
+                    key="autotune_dismiss_btn",
+                ):
+                    st.session_state.pop("autotune_proposal", None)
+                    st.rerun()
+
     # Navigation View Bar
     tab_options = [
         "📊 Interactive Dashboard",
@@ -2408,6 +4304,12 @@ else:
     )
     if active_tab is None:
         active_tab = "📊 Interactive Dashboard"
+
+    # Active Smart Box SAM backbone (persisted across tabs for the session manifest).
+    _sam_backbone_state = str(st.session_state.get("sam_backbone_select", "vit_b"))
+    active_sam_type = _sam_backbone_state.split(" ")[0].strip() or "vit_b"
+    if active_sam_type not in ("vit_b", "vit_l", "vit_h"):
+        active_sam_type = "vit_b"
 
     # ---------------- TAB 1: DASHBOARD (COLUMNS) ----------------
     if active_tab == "📊 Interactive Dashboard":
@@ -2940,6 +4842,27 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 ),
             )
 
+            # Row 1b: SAM backbone selector (Smart Box only). Heavier backbones trade
+            # loading time / unified memory for maximum boundary precision.
+            active_sam_type = "vit_b"
+            if assist_mode.startswith("📦 AI Smart Box"):
+                sam_model_choice = st.selectbox(
+                    "🧠 SAM Backbone (Smart Box AI)",
+                    options=[
+                        "vit_b — Base (375 MB, Instant)",
+                        "vit_l — Large (1.25 GB, Balanced)",
+                        "vit_h — Huge (2.56 GB, Max Precision for Complex Edges)",
+                    ],
+                    index=0,
+                    key="sam_backbone_select",
+                    help=(
+                        "Select 'vit_h' (2.56 GB) to leverage your 48 GB RAM for maximum "
+                        "boundary accuracy on faint, blurry, or crystallized droplets/pores. "
+                        "vit_l is the balanced option; vit_b loads instantly."
+                    ),
+                )
+                active_sam_type = sam_model_choice.split(" ")[0].strip()
+
             # Row 2: Target Phase Assignment (Col 1) and Action Buttons (Col 2)
             t_row2_col1, t_row2_col2 = st.columns([1.6, 1.2])
             with t_row2_col1:
@@ -3192,6 +5115,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     invert_brightfield=(
                         invert_brightfield if 'invert_brightfield' in locals() else False
                     ),
+                    sam_model_type=active_sam_type,
                 )
 
                 if parsed_metrics:
@@ -4229,6 +6153,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Fat Particles Opacity": float(fat_opacity),
             "Z-Order (Layering)": str(z_order),
             "Cellpose Model": model_type,
+            "SAM Backbone (Manual Smart Box)": active_sam_type,
             "Particle Diameter Setting (px)": eff_diameter if eff_diameter else "Auto",
             "Flow Threshold": float(flow_threshold),
             "Cell Probability Threshold": float(cellprob_threshold),

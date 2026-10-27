@@ -1309,6 +1309,7 @@ def segment_box_to_smooth_contour(
     cellpose_model: Optional[Any] = None,
     num_points: int = 160,
     invert_brightfield: bool = False,
+    sam_model_type: str = "vit_b",
 ) -> Optional[np.ndarray]:
     """
     Convert a user-drawn bounding box ("Smart Box") into a smooth closed contour.
@@ -1329,6 +1330,8 @@ def segment_box_to_smooth_contour(
         num_points: Number of output contour vertices (default: 160).
         invert_brightfield: Forwarded to ``predict_interactive_box_mask``; when True the
             fallback tests only the inverted ROI polarity (brightfield dark-rim droplets).
+        sam_model_type: SAM backbone forwarded to ``predict_interactive_box_mask``
+            (``"vit_b"`` / ``"vit_l"`` / ``"vit_h"``).
 
     Returns:
         Optional[np.ndarray]: (num_points, 2) float32 closed contour, or None when the
@@ -1378,6 +1381,7 @@ def segment_box_to_smooth_contour(
             target_phase=str(target_phase or "air_bubbles"),
             cellpose_model=cellpose_model,
             invert_brightfield=bool(invert_brightfield),
+            sam_model_type=sam_model_type,
         )
     except Exception:
         mask = None
@@ -1437,6 +1441,7 @@ def parse_canvas_manual_objects(
     max_air_size_um: Optional[float] = None,
     auto_snap_mode: Optional[Union[str, bool]] = None,
     invert_brightfield: bool = False,
+    sam_model_type: str = "vit_b",
     **kwargs,
 ) -> Tuple[list[dict], list[dict]]:
     """
@@ -1472,6 +1477,8 @@ def parse_canvas_manual_objects(
         invert_brightfield: True for brightfield light microscopy; forwarded down the AI
             chain so only the inverted ROI polarity is evaluated (faster + more accurate
             for dark-rim droplets).
+        sam_model_type: SAM backbone forwarded to ``segment_box_to_smooth_contour`` for
+            Smart Box rectangles (``"vit_b"`` / ``"vit_l"`` / ``"vit_h"``).
 
     Returns:
         Tuple[list[dict], list[dict]]: (metrics_list, polygons_list)
@@ -1742,6 +1749,7 @@ def parse_canvas_manual_objects(
                         cellpose_model=cellpose_model,
                         num_points=160,
                         invert_brightfield=bool(invert_brightfield),
+                        sam_model_type=sam_model_type,
                     )
                     if box_contour is not None and len(box_contour) >= 3:
                         _commit_contour(box_contour, "smart_box")
