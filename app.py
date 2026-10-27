@@ -47,24 +47,75 @@ from visualizer import (
 )
 from scale_detector import detect_scale_bar_pixels, detect_scale_bar
 
-# Compatibility shim: adapt image_to_url for streamlit_drawable_canvas in modern Streamlit
+# Compatibility shim: adapt image_to_url for streamlit_drawable_canvas across all Streamlit versions
+import inspect
 from types import SimpleNamespace
-import streamlit.elements.image as _sei
-import streamlit.elements.lib.image_utils as _image_utils
 
-if not getattr(_image_utils, "_phasepix_patched", False):
-    _original_image_to_url = _image_utils.image_to_url
+try:
+    import streamlit.elements.image as _sei
+except Exception:
+    _sei = None
 
-    def _compat_image_to_url(image, layout_config, *args, **kwargs):
-        if isinstance(layout_config, int) or layout_config is None:
-            layout_config = SimpleNamespace(width=layout_config if layout_config is not None else -1)
-        return _original_image_to_url(image, layout_config, *args, **kwargs)
+try:
+    import streamlit.elements.lib.image_utils as _image_utils
+except Exception:
+    _image_utils = None
 
-    _image_utils.image_to_url = _compat_image_to_url
-    _sei.image_to_url = _compat_image_to_url
-    _image_utils._phasepix_patched = True
+if _sei is not None:
+    _orig_func = getattr(_sei, "image_to_url", None)
+    if _orig_func is None and _image_utils is not None:
+        _orig_func = getattr(_image_utils, "image_to_url", None)
+
+    def _compat_image_to_url(image, layout_config=None, *args, **kwargs):
+        if isinstance(layout_config, (int, float)) or layout_config is None:
+            w = int(layout_config) if layout_config is not None else -1
+            layout_config = SimpleNamespace(width=w)
+        if _orig_func is not None:
+            try:
+                return _orig_func(image, layout_config, *args, **kwargs)
+            except Exception:
+                pass
+        try:
+            import io
+            import base64
+            buf = io.BytesIO()
+            if hasattr(image, "save"):
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
+        except Exception:
+            pass
+        return ""
+
+    if not hasattr(_sei, "image_to_url") or not getattr(_sei, "_phasepix_patched", False):
+        _sei.image_to_url = _compat_image_to_url
+        _sei._phasepix_patched = True
+    if _image_utils is not None and (not hasattr(_image_utils, "image_to_url") or not getattr(_image_utils, "_phasepix_patched", False)):
+        _image_utils.image_to_url = _compat_image_to_url
+        _image_utils._phasepix_patched = True
 
 from streamlit_drawable_canvas import st_canvas
+
+
+def safe_st_canvas(**kwargs):
+    """Universal wrapper for st_canvas resilient to missing or altered keyword arguments across versions."""
+    try:
+        sig = inspect.signature(st_canvas)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if not has_var_kw:
+            kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    except Exception:
+        pass
+    try:
+        return st_canvas(**kwargs)
+    except TypeError as exc:
+        if "display_toolbar" in str(exc) and "display_toolbar" in kwargs:
+            kwargs.pop("display_toolbar", None)
+            return st_canvas(**kwargs)
+        raise
 
 
 # ---------------- LIGHT MICROSCOPY CALIBRATION PRESETS ----------------
@@ -1705,15 +1756,111 @@ def diagnose_and_recommend_parameters(
 
 def calculate_canvas_line_length(line_obj: dict) -> float:
     """Calculate Euclidean length of a line object from Fabric.js canvas JSON."""
+    if not isinstance(line_obj, dict):
+        return 0.0
     scale_x = float(line_obj.get("scaleX", 1.0))
     scale_y = float(line_obj.get("scaleY", 1.0))
     if "x1" in line_obj and "x2" in line_obj and "y1" in line_obj and "y2" in line_obj:
         dx = (float(line_obj["x2"]) - float(line_obj["x1"])) * scale_x
         dy = (float(line_obj["y2"]) - float(line_obj["y1"])) * scale_y
-        return float(np.sqrt(dx ** 2 + dy ** 2))
+        dist = float(np.hypot(dx, dy))
+        if dist >= 1e-3:
+            return dist
     w = float(line_obj.get("width", 0.0)) * scale_x
     h = float(line_obj.get("height", 0.0)) * scale_y
-    return float(np.sqrt(w ** 2 + h ** 2))
+    return float(np.hypot(w, h))
+
+
+def _extract_ruler_segments_px(
+    json_data: Optional[dict],
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> list[dict]:
+    """Extract physical pixel lengths from Fabric.js objects in canvas json_data.
+
+    Parameters:
+        json_data: Canvas JSON export dictionary containing 'objects'.
+        scale_x: Multiplier to scale canvas X coordinates back to original micrograph pixels.
+        scale_y: Multiplier to scale canvas Y coordinates back to original micrograph pixels.
+
+    Returns:
+        List of segment dicts with keys: 'index', 'type', 'length_px', 'canvas_length_px'.
+    """
+    if not json_data or not isinstance(json_data, dict):
+        return []
+
+    objects = json_data.get("objects", [])
+    if not isinstance(objects, list):
+        return []
+
+    segments = []
+    for idx, obj in enumerate(objects):
+        if not isinstance(obj, dict):
+            continue
+
+        obj_type = str(obj.get("type", "")).lower()
+        obj_scale_x = float(obj.get("scaleX", 1.0))
+        obj_scale_y = float(obj.get("scaleY", 1.0))
+
+        raw_len_px = 0.0
+
+        if obj_type == "line":
+            has_pts = all(k in obj for k in ("x1", "x2", "y1", "y2"))
+            if has_pts:
+                dx = (float(obj["x2"]) - float(obj["x1"])) * obj_scale_x
+                dy = (float(obj["y2"]) - float(obj["y1"])) * obj_scale_y
+                raw_len_px = float(np.hypot(dx, dy))
+
+            # If x1..y2 are degenerate (0 length), fallback to width and height
+            if raw_len_px < 1e-3:
+                w = float(obj.get("width", 0.0)) * obj_scale_x
+                h = float(obj.get("height", 0.0)) * obj_scale_y
+                raw_len_px = float(np.hypot(w, h))
+
+        elif obj_type == "path":
+            path_pts = obj.get("path", [])
+            coords = []
+            if isinstance(path_pts, list):
+                for p in path_pts:
+                    if isinstance(p, (list, tuple)) and len(p) >= 3:
+                        try:
+                            coords.append((float(p[1]), float(p[2])))
+                        except (ValueError, TypeError):
+                            pass
+            if len(coords) >= 2:
+                p_start = coords[0]
+                p_end = coords[-1]
+                dx = (p_end[0] - p_start[0]) * obj_scale_x
+                dy = (p_end[1] - p_start[1]) * obj_scale_y
+                raw_len_px = float(np.hypot(dx, dy))
+            elif len(coords) == 1:
+                w = float(obj.get("width", 0.0)) * obj_scale_x
+                h = float(obj.get("height", 0.0)) * obj_scale_y
+                raw_len_px = float(np.hypot(w, h))
+
+        elif obj_type == "rect":
+            w = float(obj.get("width", 0.0)) * obj_scale_x
+            h = float(obj.get("height", 0.0)) * obj_scale_y
+            raw_len_px = float(np.hypot(w, h))
+
+        else:
+            w = float(obj.get("width", 0.0)) * obj_scale_x
+            h = float(obj.get("height", 0.0)) * obj_scale_y
+            raw_len_px = float(np.hypot(w, h))
+
+        # Scale canvas coordinates back to original micrograph pixels
+        eff_scale = (scale_x + scale_y) / 2.0
+        orig_img_px = raw_len_px * eff_scale
+
+        if orig_img_px > 0.5:
+            segments.append({
+                "index": len(segments) + 1,
+                "type": obj_type or "object",
+                "canvas_length_px": round(raw_len_px, 2),
+                "length_px": round(orig_img_px, 2),
+            })
+
+    return segments
 
 
 # Configure page layout and aesthetics
@@ -5033,28 +5180,19 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         canvas_drawing_mode = "rect" if assist_mode.startswith("📦 AI Smart Box") else "point"
 
         curr_ver = st.session_state.get("manual_canvas_ver", 0)
-        canvas_kwargs = {
-            "fill_color": canvas_fill_color,
-            "stroke_width": 2,
-            "stroke_color": canvas_stroke_color,
-            "background_image": canvas_bg,
-            "update_streamlit": True,
-            "height": target_h,
-            "width": target_w,
-            "drawing_mode": canvas_drawing_mode,
-            "point_display_radius": 4,
-            "key": f"manual_correction_canvas_{image_name}_{curr_ver}",
-            "display_toolbar": False,
-        }
-        try:
-            canvas_result = st_canvas(**canvas_kwargs)
-        except TypeError as e:
-            if "display_toolbar" in str(e):
-                # Fallback for older streamlit-drawable-canvas versions
-                canvas_kwargs.pop("display_toolbar", None)
-                canvas_result = st_canvas(**canvas_kwargs)
-            else:
-                raise
+        canvas_result = safe_st_canvas(
+            fill_color=canvas_fill_color,
+            stroke_width=2,
+            stroke_color=canvas_stroke_color,
+            background_image=canvas_bg,
+            update_streamlit=True,
+            height=target_h,
+            width=target_w,
+            drawing_mode=canvas_drawing_mode,
+            point_display_radius=4,
+            display_toolbar=False,
+            key=f"manual_correction_canvas_{image_name}_{curr_ver}",
+        )
 
         if clear_canvas_btn:
             st.session_state["manual_canvas_ver"] = curr_ver + 1
@@ -5407,7 +5545,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             with col_tools2:
                 line_width = st.slider("Line Width", min_value=1, max_value=8, value=3)
 
-            canvas_result = st_canvas(
+            canvas_result = safe_st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=line_width,
                 stroke_color=line_color,
@@ -5416,6 +5554,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 height=target_h,
                 width=target_w,
                 drawing_mode="line",
+                display_toolbar=True,
                 key=f"visual_ruler_{image_name}",
             )
 
@@ -5426,37 +5565,92 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 scale_label += f" | 💡 Preset: **{selected_objective}**"
             st.info(scale_label)
 
-            measured_lines = []
-            if canvas_result is not None and canvas_result.json_data is not None:
-                canvas_objects = canvas_result.json_data.get("objects", [])
-                for obj in canvas_objects:
-                    if obj.get("type") == "line":
-                        adj_factor = 1.0 / scale_ratio
-                        raw_px = calculate_canvas_line_length(obj) * adj_factor
-                        real_um = raw_px * pixel_to_um_ratio
-                        measured_lines.append((raw_px, real_um))
+            scale_x = float(ruler_w) / float(target_w) if target_w > 0 else 1.0
+            scale_y = float(ruler_h) / float(target_h) if target_h > 0 else 1.0
 
-            if measured_lines:
-                latest_px, latest_um = measured_lines[-1]
+            measured_segments = []
+            if canvas_result is not None and getattr(canvas_result, "json_data", None) is not None:
+                measured_segments = _extract_ruler_segments_px(
+                    canvas_result.json_data,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+
+            if measured_segments:
+                for seg in measured_segments:
+                    seg["length_um"] = round(seg["length_px"] * pixel_to_um_ratio, 2)
+
+                latest_seg = measured_segments[-1]
+                latest_px = latest_seg["length_px"]
+                latest_um = latest_seg["length_um"]
+
                 st.metric(
-                    label="Measured Length (µm)",
+                    label="📏 Measured Size (µm)",
                     value=f"{latest_um:.2f} µm",
                     delta=f"{latest_px:.1f} px",
                 )
+
+                min_suggest = max(0.1, round(latest_um * 0.8, 1))
+                max_suggest = round(latest_um * 1.2, 1)
+
                 st.success(
-                    f"💡 Size guidance: Enter **{latest_um:.1f} µm** in the sidebar's "
-                    "Min/Max size input for optimal classification."
+                    f"💡 **Suggested Sidebar Boundary Range:**\n\n"
+                    f"- **Min Size:** `{min_suggest:.1f} µm` (80%)\n"
+                    f"- **Max Size:** `{max_suggest:.1f} µm` (120%)"
                 )
 
-                if len(measured_lines) > 1:
+                if len(measured_segments) > 1:
                     st.markdown("#### Measurement History")
                     history_df = pd.DataFrame([
-                        {"Line #": i + 1, "Length (px)": round(p, 1), "Length (µm)": round(u, 2)}
-                        for i, (p, u) in enumerate(measured_lines)
+                        {
+                            "Line #": s["index"],
+                            "Type": s["type"],
+                            "Length (px)": s["length_px"],
+                            "Length (µm)": s["length_um"],
+                        }
+                        for s in measured_segments
                     ])
                     st.dataframe(history_df, use_container_width=True, hide_index=True)
             else:
                 st.caption("👈 Click and drag a line on the micrograph to measure a pore or particle.")
+
+        with st.expander("📐 Precision Coordinate Caliper (Fallback / Exact Pixel Ruler)", expanded=False):
+            st.markdown(
+                "Use this precision coordinate tool if browser extensions block interactive canvas dragging, "
+                "or when exact pixel-coordinate measurements are required."
+            )
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            with fc1:
+                cal_x1 = st.number_input("Start X (px)", min_value=0, max_value=ruler_w, value=int(ruler_w * 0.25), step=1, key=f"cal_x1_{image_name}")
+            with fc2:
+                cal_y1 = st.number_input("Start Y (px)", min_value=0, max_value=ruler_h, value=int(ruler_h * 0.5), step=1, key=f"cal_y1_{image_name}")
+            with fc3:
+                cal_x2 = st.number_input("End X (px)", min_value=0, max_value=ruler_w, value=int(ruler_w * 0.75), step=1, key=f"cal_x2_{image_name}")
+            with fc4:
+                cal_y2 = st.number_input("End Y (px)", min_value=0, max_value=ruler_h, value=int(ruler_h * 0.5), step=1, key=f"cal_y2_{image_name}")
+
+            cal_dx = float(cal_x2 - cal_x1)
+            cal_dy = float(cal_y2 - cal_y1)
+            cal_dist_px = float(np.hypot(cal_dx, cal_dy))
+            cal_dist_um = cal_dist_px * pixel_to_um_ratio
+
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                st.metric("Caliper Distance (µm)", f"{cal_dist_um:.2f} µm")
+            with mc2:
+                st.metric("Pixel Span", f"{cal_dist_px:.1f} px")
+            with mc3:
+                st.info(f"Recommended Range: **{cal_dist_um * 0.8:.1f} - {cal_dist_um * 1.2:.1f} µm**")
+
+            # Draw preview on image copy
+            preview_arr = np.array(ruler_pil).copy()
+            cv2.line(preview_arr, (int(cal_x1), int(cal_y1)), (int(cal_x2), int(cal_y2)), (0, 255, 100), 3, cv2.LINE_AA)
+            cv2.circle(preview_arr, (int(cal_x1), int(cal_y1)), 5, (255, 50, 50), -1)
+            cv2.circle(preview_arr, (int(cal_x2), int(cal_y2)), 5, (255, 50, 50), -1)
+            mid_x, mid_y = int((cal_x1 + cal_x2) / 2), int((cal_y1 + cal_y2) / 2)
+            cv2.putText(preview_arr, f"{cal_dist_um:.1f} um ({cal_dist_px:.0f} px)", (mid_x - 40, max(25, mid_y - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(preview_arr, f"{cal_dist_um:.1f} um ({cal_dist_px:.0f} px)", (mid_x - 40, max(25, mid_y - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+            st.image(preview_arr, caption=f"Precision Caliper Line ({cal_dist_um:.2f} µm)", use_container_width=True)
 
     # ---------------- TAB 3: DETAILED METRICS & TABLES ----------------
     elif active_tab == "🔬 Metrics":
