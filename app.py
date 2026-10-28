@@ -620,18 +620,73 @@ def _contour_diameters(mask_u8: np.ndarray, um_per_px: float) -> list:
     return diameters
 
 
-def _clean_micron(value: float) -> float:
-    """Round a physical size to clean, human-readable laboratory values."""
+def _floor_to_step(value: float, step: float) -> float:
+    """Round ``value`` DOWN to the nearest multiple of ``step`` (artifact-free)."""
+    if step <= 0:
+        return float(value)
+    return float(round(math.floor(round(float(value) / step, 6)) * step, 6))
+
+
+def _ceil_to_step(value: float, step: float) -> float:
+    """Round ``value`` UP to the nearest multiple of ``step`` (artifact-free)."""
+    if step <= 0:
+        return float(value)
+    return float(round(math.ceil(round(float(value) / step, 6)) * step, 6))
+
+
+def _clean_micron_min(value: float) -> float:
+    """
+    Round a *lower* size bound DOWNWARD to clean, human-readable laboratory values.
+
+    Directional flooring is essential for minimums: symmetric rounding can push a
+    minimum above the smallest object that was actually measured and silently clip
+    it (0.62 µm -> 0.6 µm is safe, 0.64 µm -> 0.7 µm is not). A lower bound must
+    always err towards smaller values.
+
+    Args:
+        value: Raw lower bound in µm.
+
+    Returns:
+        float: Floored bound on the same 10 / 5 / 0.5 / 0.1 / 0.01 µm ladder that
+        the Section 4 number inputs use.
+    """
     val = max(0.0, float(value))
     if val >= 50.0:
-        return float(round(val / 10.0) * 10.0)
+        return _floor_to_step(val, 10.0)
     if val >= 10.0:
-        return float(round(val / 5.0) * 5.0)
+        return _floor_to_step(val, 5.0)
     if val >= 2.0:
-        return float(round(val / 0.5) * 0.5)
+        return _floor_to_step(val, 0.5)
     if val >= 0.5:
-        return float(round(round(val / 0.1) * 0.1, 2))
-    return float(round(val, 2))
+        return _floor_to_step(val, 0.1)
+    return _floor_to_step(val, 0.01)
+
+
+def _clean_micron_max(value: float) -> float:
+    """
+    Round an *upper* size bound UPWARD to clean, human-readable laboratory values.
+
+    An upper bound must never be rounded down: a 54 µm recommendation rounded
+    symmetrically to 50 µm would clip every detected bubble larger than 50 µm.
+    Ceiling rounding preserves the full measured range plus its safety headroom.
+
+    Args:
+        value: Raw upper bound in µm.
+
+    Returns:
+        float: Ceiled bound on the same 10 / 5 / 0.5 / 0.1 / 0.01 µm ladder that
+        the Section 4 number inputs use.
+    """
+    val = max(0.0, float(value))
+    if val >= 50.0:
+        return _ceil_to_step(val, 10.0)
+    if val >= 10.0:
+        return _ceil_to_step(val, 5.0)
+    if val >= 2.0:
+        return _ceil_to_step(val, 0.5)
+    if val >= 0.5:
+        return _ceil_to_step(val, 0.1)
+    return _ceil_to_step(val, 0.01)
 
 
 def _fmt_um(value) -> str:
@@ -973,13 +1028,14 @@ def _diagnose_light_microscopy(gray: np.ndarray, um_per_px: float, current_param
     crystal_pipeline_active = bool(
         crystallized and smoothing_strength >= 3 and multiscale
     )
+    # Foundation-model choice is derived ONLY from the measured optics: contrast,
+    # crystal striation density and packing. current_model_choice is reported for
+    # the "Current" column but never feeds the recommendation, so a cyto3 selected
+    # for a previous image can no longer be echoed back as a "measured" finding.
     current_model_choice = str(
         _current_value(current_params, "shared_model_type_select") or "cyto2"
     )
-    if current_model_choice == "cyto3":
-        # The student explicitly opted into maximum sensitivity; keep their choice.
-        model_recommendation = "cyto3"
-    elif crystal_pipeline_active:
+    if crystallized:
         # Smoothing 3 + multi-scale already suppress internal crystal lines; cyto2
         # is faster and equally clean unless the optics are genuinely faint.
         model_recommendation = "cyto3" if contrast < 75.0 else "cyto2"
@@ -1041,7 +1097,24 @@ def _diagnose_light_microscopy(gray: np.ndarray, um_per_px: float, current_param
 
 
 def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params: dict) -> dict:
-    """SEM diagnostics: dark craters/pores, fine matrix globules, shadow depth."""
+    """
+    SEM diagnostics: dark craters/pores, fine matrix globules, shadow depth.
+
+    The recommended widget state is a *pure function* of the pixels and the
+    calibration. ``current_params`` is accepted only so the caller can render the
+    "Current" column of the comparison table next to the proposal - it must never
+    influence a recommended value, otherwise a range tuned on a previous
+    micrograph would be echoed back as if it had been measured on this one.
+
+    Args:
+        gray: Cropped SEM micrograph (footer already excluded).
+        um_per_px: Active calibration in µm per pixel.
+        current_params: Sidebar values, used by the comparison table only.
+
+    Returns:
+        dict: Measured statistics plus the ``recommended`` widget-state mapping.
+    """
+
     work, resize_factor = _prepare_analysis_gray(gray)
     try:
         ratio_value = float(um_per_px)
@@ -1055,9 +1128,8 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
     contrast = p95 - p5
     bg_level = float(np.percentile(blur, 85.0))
 
-    # 1. Dark crater / pore detection at the 22nd intensity percentile.
-    # When dark pores occupy < 22% of the field, that percentile still sits on the
-    # matrix; fall back to an Otsu cut so genuinely dark craters are isolated.
+    # 1a. Reference dark mask (22nd percentile, Otsu fallback). It doubles as the
+    #     base mask for the adsorbed-fat speckle statistic computed further below.
     p22 = float(np.percentile(blur, 22.0))
     bg_median = float(np.median(blur))
     dark_threshold = p22
@@ -1068,6 +1140,54 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
     dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, _ellipse(3))
     dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, _ellipse(5))
 
+    # Matrix anchor for the "is this really part of the dark phase?" test below.
+    # Percentile anchors collapse when dark craters cover most of the frame (dense
+    # foam), so the test is skipped there and the local ring test alone decides.
+    dark_fraction = float(np.count_nonzero(dark)) / float(dark.size)
+    dark_reference = (
+        bg_median - max(8.0, 0.25 * (bg_median - p5))
+        if dark_fraction <= 0.45
+        else None
+    )
+
+    # 1b. Pore candidates: multi-threshold + morphological contour pass.
+    #     A single 22nd-percentile cut silently misses valid bubbles whenever a
+    #     field holds only 1-2 large craters (the percentile then lands on the
+    #     matrix, not on the pores) or when a crater interior is coated with bright
+    #     adsorbed fat. We therefore probe several independent dark cuts - raw
+    #     percentiles p18/p25/p35 plus Otsu on a CLAHE-enhanced copy and on its
+    #     inverse (the two views segment_air_bubbles_auto also uses in Step B) -
+    #     flood-fill internal holes so bright adsorbed fat cannot break the pore
+    #     mask, and keep only the largest valid contour per spatial region.
+    #     The cuts are probed on a mildly denoised view (~0.5 µm of physical
+    #     smoothing): pixel noise would otherwise make every percentile cut split
+    #     into hundreds of pseudo-craters, while 20-100 µm bubbles are unaffected.
+    def _clahe_view(img: np.ndarray) -> np.ndarray:
+        """Return the CLAHE-enhanced analysis view (identity if CLAHE fails)."""
+        try:
+            return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(img)
+        except cv2.error:
+            return img.copy()
+
+    pore_sigma = float(np.clip(0.5 / max(px_um, 1e-6), 1.5, 9.0))
+    pore_view = cv2.GaussianBlur(
+        work, (0, 0), sigmaX=pore_sigma, sigmaY=pore_sigma
+    )
+    clahe_img = _clahe_view(pore_view)
+    inv_clahe = np.clip(255 - clahe_img, 0, 255).astype(np.uint8)
+
+    candidate_masks = [
+        (pore_view <= float(np.percentile(pore_view, pct))).astype(np.uint8)
+        for pct in (18.0, 22.0, 25.0, 35.0)
+    ]
+    # Otsu on the CLAHE view isolates locally boosted (shadowed) pore walls.
+    clahe_otsu, _ = cv2.threshold(clahe_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    candidate_masks.append((clahe_img <= clahe_otsu).astype(np.uint8))
+    # Otsu on the inverted view: craters become bright islands there, so the bright
+    # class of the inverted histogram is the dark-object class of the original.
+    inv_otsu, _ = cv2.threshold(inv_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    candidate_masks.append((inv_clahe >= inv_otsu).astype(np.uint8))
+
     min_pore_px = max(
         9,
         min(
@@ -1075,40 +1195,115 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
             max(9, int(0.01 * float(blur.size))),
         ),
     )
+    max_pore_px = 0.35 * float(blur.size)
+    # (filled area, circularity, bbox, local mask, pore record) kept together so
+    # overlapping candidates can be deduplicated by size before the masks are freed.
+    pore_candidates = []
+    for candidate_mask in candidate_masks:
+        cleaned = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, _ellipse(3))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, _ellipse(5))
+        # Bright adsorbed fat / internal shadow speckle inside a crater must not
+        # split or puncture the pore footprint.
+        cleaned = _fill_holes(cleaned)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, _ellipse(3))
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            contour_area = float(cv2.contourArea(contour))
+            if contour_area < float(min_pore_px) or contour_area > max_pore_px:
+                continue
+            perimeter = float(cv2.arcLength(contour, True))
+            if contour_area <= 0.0 or perimeter <= 0.0:
+                continue
+            circularity = float(4.0 * math.pi * contour_area / (perimeter ** 2))
+            if circularity < 0.30:
+                continue
+            diameter_um = 2.0 * math.sqrt(contour_area / math.pi) * px_um
+            if not 1.5 <= diameter_um <= 5000.0:
+                continue
+            box_x, box_y, box_w, box_h = cv2.boundingRect(contour)
+            if box_w < 2 or box_h < 2:
+                continue
+            local = np.zeros((box_h, box_w), np.uint8)
+            shifted = contour.copy()
+            shifted[:, :, 0] -= box_x
+            shifted[:, :, 1] -= box_y
+            cv2.drawContours(local, [shifted], -1, 1, thickness=cv2.FILLED)
+            local_bool = local.astype(bool)
+            filled_px = float(np.count_nonzero(local_bool))
+            if filled_px <= 0.0:
+                continue
+            values = blur[box_y : box_y + box_h, box_x : box_x + box_w][local_bool]
+            shadow = float(bg_level - float(values.mean()))
+            # Every cut can still grab flat matrix patches; genuine craters must be
+            # measurably darker than the surrounding material.
+            if shadow < 4.0:
+                continue
+            # Absolute darkness: a crater interior belongs to the dark phase, i.e. it
+            # sits clearly below the matrix mode. A percentile cut applied to a
+            # featureless field produces thin bands whose interior median equals the
+            # matrix mode, and those must never be reported as air bubbles.
+            if dark_reference is not None and float(np.median(values)) > dark_reference:
+                continue
+            # Local contrast-to-noise: a real crater stands out of the material that
+            # directly surrounds it. Flat matrix texture - which any percentile cut
+            # inevitably splits - has inside ≈ ring and is discarded here, while a
+            # medium-gray bubble interior sitting in a bright matrix still passes.
+            # Medians / IQR keep neighbouring craters inside the ring from faking a
+            # shadow or inflating the local noise estimate.
+            ring_pad = max(2, int(round(math.sqrt(filled_px / math.pi) * 0.35)))
+            crop_y0 = max(0, box_y - ring_pad)
+            crop_y1 = min(blur.shape[0], box_y + box_h + ring_pad)
+            crop_x0 = max(0, box_x - ring_pad)
+            crop_x1 = min(blur.shape[1], box_x + box_w + ring_pad)
+            crop = blur[crop_y0:crop_y1, crop_x0:crop_x1]
+            padded_local = np.zeros(crop.shape, np.uint8)
+            padded_local[
+                box_y - crop_y0 : box_y - crop_y0 + box_h,
+                box_x - crop_x0 : box_x - crop_x0 + box_w,
+            ] = local
+            ring = (cv2.dilate(padded_local, _ellipse(2 * ring_pad + 1)) > 0) & (
+                padded_local == 0
+            )
+            if np.any(ring):
+                ring_values = crop[ring].astype(np.float32)
+                ring_level = float(np.median(ring_values))
+                ring_q25, ring_q75 = np.percentile(ring_values, [25.0, 75.0])
+                ring_sigma = float((ring_q75 - ring_q25) / 1.349)
+                inside_level = float(np.median(crop[padded_local > 0]))
+                prominence_gate = max(
+                    6.0, min(1.5 * ring_sigma, 0.5 * max(float(contrast), 1.0))
+                )
+                if (ring_level - inside_level) < prominence_gate:
+                    continue
+            pore_candidates.append(
+                (
+                    filled_px,
+                    circularity,
+                    (box_x, box_y, box_w, box_h),
+                    local_bool,
+                    {
+                        "d_um": diameter_um,
+                        "circ": circularity,
+                        "shadow": shadow,
+                        "inner_std": float(values.std()),
+                    },
+                )
+            )
+
+    # Deduplicate overlapping candidates: the largest valid contour wins its
+    # spatial region, so a wide percentile cut cannot re-add a bubble that the
+    # darkest (or a tighter) cut already explained.
+    pore_candidates.sort(key=lambda item: (-item[0], -item[1]))
     pores = []
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
-    for idx in range(1, n_labels):
-        area = int(stats[idx, cv2.CC_STAT_AREA])
-        if area < min_pore_px or area > 0.35 * float(blur.size):
+    occupied = np.zeros(blur.shape[:2], dtype=bool)
+    for filled_px, _circularity, bbox, local_bool, pore in pore_candidates:
+        box_x, box_y, box_w, box_h = bbox
+        seen = occupied[box_y : box_y + box_h, box_x : box_x + box_w]
+        overlap_fraction = float(np.count_nonzero(seen & local_bool)) / filled_px
+        if overlap_fraction >= 0.50:
             continue
-        comp = (labels == idx).astype(np.uint8)
-        contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        contour_area = float(cv2.contourArea(contours[0]))
-        perimeter = float(cv2.arcLength(contours[0], True))
-        if contour_area <= 0 or perimeter <= 0:
-            continue
-        circularity = float(4.0 * math.pi * contour_area / (perimeter ** 2))
-        if circularity < 0.35:
-            continue
-        diameter_um = 2.0 * math.sqrt(contour_area / math.pi) * px_um
-        if not 0.4 <= diameter_um <= 5000.0:
-            continue
-        values = blur[labels == idx]
-        shadow = float(bg_level - float(values.mean()))
-        # The 22nd-percentile cut can also grab the matrix when pores are sparse;
-        # genuine craters must be measurably darker than the surrounding matrix.
-        if shadow < 6.0:
-            continue
-        pores.append(
-            {
-                "d_um": diameter_um,
-                "circ": circularity,
-                "shadow": shadow,
-                "inner_std": float(values.std()),
-            }
-        )
+        seen |= local_bool
+        pores.append(pore)
 
     # 2. Fine bright matrix globules via white top-hat (isolates objects up to ~3 µm).
     max_kernel = max(3, min(work.shape[:2]) - 1)
@@ -1127,18 +1322,33 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
         if 0.1 <= diameter_um <= 40.0:
             fat_diams.append(diameter_um)
 
+    # A pore population must be genuinely darker than the matrix noise floor.
+    # (Kept as a final safety net: a handful of residual blobs must never be
+    # promoted to an air phase.)
+    if pores:
+        noise_floor = max(6.0, 0.35 * float(contrast))
+        if float(np.max([p["shadow"] for p in pores])) < noise_floor:
+            pores = []
+
     air_vals = np.asarray([p["d_um"] for p in pores], dtype=float)
     fat_vals = np.asarray(fat_diams, dtype=float)
-    has_pores = bool(air_vals.size >= 3 and float(np.median(air_vals)) >= 1.5)
+    # Even a single prominent air bubble is real evidence: requiring >= 3 pores used
+    # to discard micrographs that contain only 1-2 large craters.
+    has_pores = bool(air_vals.size >= 1 and float(np.max(air_vals)) >= 2.0)
     has_fine = bool(fat_vals.size >= 15)
     if air_vals.size:
         air_p10, air_p50, air_p95 = (float(np.percentile(air_vals, q)) for q in (10.0, 50.0, 95.0))
+        air_d_min = float(np.min(air_vals))
+        air_d_max = float(np.max(air_vals))
     else:
         air_p10 = air_p50 = air_p95 = 0.0
+        air_d_min = air_d_max = 0.0
     if fat_vals.size:
-        fat_p10, fat_p50, fat_p95 = (float(np.percentile(fat_vals, q)) for q in (10.0, 50.0, 95.0))
+        fat_p5, fat_p10, fat_p50, fat_p95, fat_p98 = (
+            float(np.percentile(fat_vals, q)) for q in (5.0, 10.0, 50.0, 95.0, 98.0)
+        )
     else:
-        fat_p10 = fat_p50 = fat_p95 = 0.0
+        fat_p5 = fat_p10 = fat_p50 = fat_p95 = fat_p98 = 0.0
 
     # 3. Shadow depth + internal crater variance (adsorbed-fat evidence).
     shadow_depth = float(np.median([p["shadow"] for p in pores])) if pores else 0.0
@@ -1149,32 +1359,56 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
     internal_speck = bool(
         (inner_stds and float(np.median(inner_stds)) >= 14.0) or speck_density >= 0.02
     )
-    # 4. Sample type / detection target (user's choice kept unless both phases are clear).
-    current_type = str(_current_value(current_params, "sem_sample_type_radio") or "Whipped Emulsion")
-    current_focus = str(_current_value(current_params, "sem_detection_focus_radio") or SEM_FOCUS_AIR)
+    # 4. Sample type / detection target - derived from the measured phases ONLY.
+    #    current_params is deliberately not read here: the recommendation must be
+    #    identical for identical pixels, regardless of what the sidebar currently
+    #    holds (the "Current" column of the comparison table shows those values).
     both_present = bool(has_pores and has_fine and fat_p95 < max(air_p50 * 0.75, 1.0))
     if both_present:
         rec_type, rec_focus = "Whipped Emulsion", SEM_FOCUS_TWO_PASS
     else:
-        rec_type, rec_focus = current_type, current_focus
+        # Canonical modality defaults keep the air pass enabled, so a weakly
+        # detected (or genuinely absent) crater population can never silently
+        # disable bubble search for this image.
+        rec_type = str(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_sample_type_radio"])
+        rec_focus = str(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_detection_focus_radio"])
     if rec_focus not in (SEM_FOCUS_AIR, SEM_FOCUS_TWO_PASS):
         rec_focus = SEM_FOCUS_AIR
 
-    cur_min_air = float(_current_value(current_params, "sem_min_air_um"))
-    cur_max_air = float(_current_value(current_params, "sem_max_air_um"))
-    if has_pores:
-        rec_min_air = _clean_micron(max(0.5, air_p10 * 0.70))
-        rec_max_air = _clean_micron(max(rec_min_air + 1.0, air_p95 * 1.30))
-    else:
-        rec_min_air, rec_max_air = cur_min_air, cur_max_air
+    # 5. Directional size bounds: minima are floored, maxima are ceiled. Every
+    #    bound is derived from the measured pixels alone, so the recommendation is
+    #    a pure function of (image, calibration).
+    default_min_air = float(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_min_air_um"])
+    default_max_air = float(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_max_air_um"])
+    default_min_fat = float(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_min_fat_um"])
+    default_max_fat = float(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_max_fat_um"])
 
-    cur_min_fat = float(_current_value(current_params, "sem_min_fat_um"))
-    cur_max_fat = float(_current_value(current_params, "sem_max_fat_um"))
-    if has_fine:
-        rec_min_fat = _clean_micron(max(0.1, fat_p10 * 0.60))
-        rec_max_fat = _clean_micron(max(rec_min_fat + 0.2, fat_p95 * 1.40))
+    if has_pores:
+        # min(10.0, 0.65 * smallest bubble): never above the validated 10 µm
+        # default, so a field of 25-80 µm bubbles still admits 10-20 µm ones.
+        rec_min_air = _clean_micron_min(
+            max(0.5, min(default_min_air, air_d_min * 0.65))
+        )
+        # max(100.0, 1.35 * largest bubble): never below the validated 100 µm
+        # default, unless the whole frame is narrower than 80 µm (high magnification)
+        # where a 100 µm object cannot physically exist.
+        frame_width_um = float(work.shape[1]) * px_um
+        air_max_floor = (
+            default_max_air
+            if frame_width_um >= 80.0
+            else max(default_max_air * 0.1, frame_width_um)
+        )
+        rec_max_air = _clean_micron_max(max(air_max_floor, air_d_max * 1.35))
     else:
-        rec_min_fat, rec_max_fat = cur_min_fat, cur_max_fat
+        # No pore population measured: fall back to the canonical SEM defaults,
+        # never to whatever range the previous image left behind.
+        rec_min_air, rec_max_air = default_min_air, default_max_air
+
+    if has_fine:
+        rec_min_fat = _clean_micron_min(max(0.1, fat_p5 * 0.60))
+        rec_max_fat = _clean_micron_max(max(default_max_fat, fat_p98 * 1.40))
+    else:
+        rec_min_fat, rec_max_fat = default_min_fat, default_max_fat
 
     low_contrast = bool(contrast < 65.0 or shadow_depth > 55.0)
     if contrast < 45.0 or shadow_depth > 75.0:
@@ -1184,9 +1418,9 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
     else:
         flow = 0.70
     cellprob = -1.5 if low_contrast else -1.0
-    deepscan = bool(internal_speck) or bool(
-        _current_value(current_params, "sem_deepscan_checkbox")
-    )
+    # Deep-scan is an image property (adsorbed-fat speckle inside craters) and is
+    # never inherited from the currently checked checkbox.
+    deepscan = bool(internal_speck)
     dust_score = float(
         np.clip(0.5 * (shadow_depth / 80.0) + 0.5 * (1.0 if internal_speck else 0.0), 0.0, 1.0)
     )
@@ -1217,9 +1451,13 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
         "air_p10": air_p10,
         "air_p50": air_p50,
         "air_p95": air_p95,
+        "air_d_min": air_d_min,
+        "air_d_max": air_d_max,
+        "fat_p5": fat_p5,
         "fat_p10": fat_p10,
         "fat_p50": fat_p50,
         "fat_p95": fat_p95,
+        "fat_p98": fat_p98,
         "has_pores": has_pores,
         "has_fine": has_fine,
         "both_present": both_present,
@@ -1280,12 +1518,6 @@ def _light_comparison_rows(diag: dict, current_params: dict) -> list:
                 "benefit from cyto3's broader multi-modality training. Measured striation "
                 f"density {diag['striation_density']:.1%}, internal std "
                 f"{diag['internal_std']:.1f} GL."
-            )
-        elif diag["current_model_choice"] == "cyto3":
-            model_why = (
-                "cyto3 was already selected, so it is retained for maximum boundary "
-                f"sensitivity. Contrast is {diag['contrast']:.0f} GL with striation "
-                f"density {diag['striation_density']:.1%}."
             )
         else:
             model_why = (
@@ -1501,9 +1733,9 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
     rec = diag["recommended"]
     pore_text = (
         f"{diag['n_pores']} near-circular dark craters spanning "
-        f"{diag['air_p10']:.1f}-{diag['air_p95']:.1f} µm (P10-P95)"
+        f"{diag['air_d_min']:.1f}-{diag['air_d_max']:.1f} µm (min-max)"
         if diag["has_pores"]
-        else "no dominant population of large dark craters was segmented"
+        else "no large dark craters were segmented"
     )
     globule_text = (
         f"{diag['n_globules']} fine bright matrix globules with P95 = "
@@ -1517,16 +1749,17 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
         "measured with separate detection scales."
         if diag["both_present"]
         else f"{pore_text}; {globule_text}. Only one phase is statistically dominant, "
-        "so your current sample type is retained instead of silently switching the "
-        "classification logic."
+        "so the validated Whipped Emulsion recipe (air pass enabled) is used instead "
+        "of switching the classification logic on weak evidence."
     )
     focus_why = (
         "Two-pass is recommended because the pore and globule size distributions barely "
         "overlap: the air pass captures dark craters at the air-bubble scale, then the "
         "fat pass captures the fine matrix emulsion."
         if diag["both_present"]
-        else "The retained detection target matches the single dominant phase measured "
-        "in this field of view; a second pass would only add runtime and false positives."
+        else "Air-bubbles-only keeps the dedicated dark-crater detector on the single "
+        "dominant phase measured in this field of view; a second pass would only add "
+        "runtime and false positives."
     )
     rows = [
         _comparison_row(
@@ -1549,11 +1782,14 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
             rec["sem_min_air_um"],
             current_params,
             (
-                f"0.70 × the measured pore P10 ({diag['air_p10']:.1f} µm) keeps the "
-                "smallest real bubbles while excluding speckle and crater-wall fragments."
+                f"min(10.0 µm, 0.65 × the smallest measured bubble "
+                f"{diag['air_d_min']:.1f} µm) = {rec['sem_min_air_um']:.1f} µm after "
+                "rounding DOWN to a clean laboratory step. The cap keeps the bound at "
+                "or below the validated default, so 10-20 µm bubbles are never excluded "
+                "even when every detected crater is large."
                 if diag["has_pores"]
-                else "No reliable pore population was measured, so the existing minimum "
-                "air-bubble boundary is preserved."
+                else "No pore population was measured, so the canonical SEM default of "
+                "10.0 µm is used (never the range left over from the previous image)."
             ),
         ),
         _comparison_row(
@@ -1562,11 +1798,15 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
             rec["sem_max_air_um"],
             current_params,
             (
-                f"1.30 × the measured pore P95 ({diag['air_p95']:.1f} µm) leaves headroom "
-                "for large whipped-air bubbles without admitting merged clusters."
+                f"max(100.0 µm, 1.35 × the largest measured bubble "
+                f"{diag['air_d_max']:.1f} µm) = {rec['sem_max_air_um']:.1f} µm after "
+                "rounding UP to a clean laboratory step. Ceiling rounding plus the 35% "
+                "headroom guarantees that no detected bubble can ever be clipped, and "
+                "the bound only drops below 100 µm when the whole frame is narrower "
+                "than 80 µm."
                 if diag["has_pores"]
-                else "No reliable pore population was measured, so the existing maximum "
-                "air-bubble boundary is preserved."
+                else "No pore population was measured, so the canonical SEM default of "
+                "100.0 µm is used (never the range left over from the previous image)."
             ),
         ),
     ]
@@ -1578,11 +1818,13 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
                 rec["sem_min_fat_um"],
                 current_params,
                 (
-                    f"0.60 × the top-hat globule P10 ({diag['fat_p10']:.2f} µm) removes "
-                    "sub-resolution texture while retaining genuine small matrix droplets."
+                    f"0.60 × the top-hat globule P5 ({diag['fat_p5']:.2f} µm) = "
+                    f"{rec['sem_min_fat_um']:.2f} µm after rounding DOWN to a clean step: "
+                    "sub-resolution texture is removed while the genuine small-droplet "
+                    "tail is preserved."
                     if diag["has_fine"]
-                    else "The fine-globule population was too sparse to re-bound; the "
-                    "current minimum fat size is retained."
+                    else "The fine-globule population was too sparse to re-bound, so the "
+                    "canonical SEM default of 0.20 µm is used."
                 ),
             ),
             _comparison_row(
@@ -1591,11 +1833,13 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
                 rec["sem_max_fat_um"],
                 current_params,
                 (
-                    f"1.40 × the globule P95 ({diag['fat_p95']:.2f} µm) captures the coarse "
-                    "tail of the matrix emulsion without swallowing air-crater rims."
+                    f"max(5.0 µm, 1.40 × the globule P98 ({diag['fat_p98']:.2f} µm)) = "
+                    f"{rec['sem_max_fat_um']:.1f} µm after rounding UP to a clean step: "
+                    "the coarse tail of the matrix emulsion is captured without "
+                    "swallowing air-crater rims."
                     if diag["has_fine"]
-                    else "The fine-globule population was too sparse to re-bound; the "
-                    "current maximum fat size is retained."
+                    else "The fine-globule population was too sparse to re-bound, so the "
+                    "canonical SEM default of 5.0 µm is used."
                 ),
             ),
             _comparison_row(
@@ -1658,8 +1902,8 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
                     f"{diag['speck_density']:.3f}), consistent with adsorbed fat globules "
                     "hiding in the dark shadow - a localized deep-scan recovers them."
                     if diag["internal_speck"]
-                    else "Crater interiors are homogeneous, so deep-scan would only add "
-                    "runtime; your current setting is retained."
+                    else "Crater interiors are homogeneous, so a localized deep-scan would "
+                    "only add runtime; deep-scan stays off for this image."
                 ),
             ),
             _comparison_row(
@@ -2784,6 +3028,67 @@ with st.sidebar:
         elif st.button("Load Demo SEM Image", use_container_width=True):
             image_bytes = create_sample_sem_image()
             image_name = "Synthetic_SEM_Micrograph.png"
+
+    # ── 🔒 Parameter isolation between micrographs ────────────────────────────
+    # Section 4 & 5 controls are keyed in st.session_state, so a recipe tuned for
+    # Image #1 would otherwise leak into Image #2. That leak is not cosmetic: in
+    # SEM Air-Bubble / Two-Pass mode min_air_size & max_air_size drive both the
+    # Cellpose target diameter (sqrt(min * max)) and the geometric fallback gates
+    # (0.85 * min .. 1.15 * max) inside cached_segment_air_bubbles_auto, so a stale
+    # range silently biases the very first segmentation of the newly loaded image.
+    keep_params_on_switch = st.checkbox(
+        "🔒 Keep current parameters when switching images",
+        value=False,
+        key="keep_params_on_image_switch",
+        help=(
+            "When unchecked (default), loading a new micrograph automatically "
+            "resets Section 4 & 5 segmentation parameters to clean defaults so "
+            "previous image adjustments never bias the new image. Check this box "
+            "only when batch-analyzing a uniform series with identical settings."
+        ),
+    )
+
+    _previous_image_for_params = st.session_state.get("_last_loaded_image_for_params")
+    if _previous_image_for_params != image_name:
+        st.session_state["_last_loaded_image_for_params"] = image_name
+        if _previous_image_for_params is not None:
+            # Per-image analysis artefacts must never survive an image switch:
+            # a proposal / undo snapshot / manual correction measured on Image #1
+            # is meaningless for Image #2 and would be silently applied to it.
+            st.session_state.pop("autotune_proposal", None)
+            st.session_state.pop("_previous_parameter_snapshot", None)
+            st.session_state["manual_phase_overrides"] = {}
+            st.session_state["interactive_excluded_ids"] = set()
+            for _stale_editor_key in [
+                _k
+                for _k in list(st.session_state.keys())
+                if str(_k).startswith("particle_data_editor")
+            ]:
+                del st.session_state[_stale_editor_key]
+
+            if not keep_params_on_switch:
+                # Written BEFORE any Section 4 / 5 widget is instantiated in this
+                # run, so the controls below render with the clean defaults on this
+                # very run - an image switch therefore behaves exactly like opening
+                # that micrograph as the first image of a fresh session.
+                _active_light_profile = st.session_state.get(
+                    "light_emulsion_profile_radio"
+                )
+                for _default_key, _default_value in build_default_parameter_state(
+                    is_light_mode, _active_light_profile
+                ).items():
+                    st.session_state[_default_key] = _default_value
+                if is_light_mode:
+                    # Keep the profile tracker aligned with the freshly rendered
+                    # profile radio so the polarity default is not re-applied twice.
+                    st.session_state["light_profile_tracker"] = st.session_state.get(
+                        "light_emulsion_profile_radio", LIGHT_PROFILE_CRYSTALLIZED
+                    )
+                st.session_state["force_class_refresh"] = True
+                st.toast(
+                    "♻️ New micrograph loaded — parameters reset to clean defaults.",
+                    icon="♻️",
+                )
 
     st.divider()
 
