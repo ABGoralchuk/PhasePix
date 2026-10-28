@@ -4,7 +4,7 @@ Provides automated Cellpose deep learning segmentation, morphological quantifica
 phase classification (air bubbles vs. fat particles), and comparative KDE size distribution.
 """
 
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 from pathlib import Path
 import base64
 import inspect
@@ -2623,10 +2623,16 @@ def cached_segmentation(
     return masks
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def decode_image_bytes(file_bytes: bytes) -> np.ndarray:
     """
     Decode image bytes into a 2D grayscale uint8 numpy array.
     Supports JPG, PNG, and multi-mode TIFF files.
+
+    Cached via ``@st.cache_data`` (16 entries) because the same bytes are decoded
+    several times per rerun (sidebar calibration probe, preview rendering and the
+    analysis pass).  Re-decoding a 20 MP TIFF on every widget interaction is pure
+    overhead - the decoded array is a deterministic function of the raw bytes.
     """
     try:
         # First attempt decoding via tifffile (handles scientific 16-bit/8-bit TIFFs)
@@ -2651,6 +2657,61 @@ def decode_image_bytes(file_bytes: bytes) -> np.ndarray:
     except Exception as exc:
         st.error(f"Failed to read image file: {exc}")
         raise exc
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_detect_scale_bar(
+    file_bytes: bytes,
+    footer_height: int,
+) -> Tuple[int, Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+    """Cached SEM scale-bar probe used by the sidebar calibration panel.
+
+    ``detect_scale_bar`` runs a full morphological search (thresholding, contour
+    analysis, tick pairing) on the uploaded micrograph.  Re-running it on every
+    widget interaction of the Streamlit rerun loop is wasteful, so both the image
+    decoding and the detection are memoised on ``(file_bytes, footer_height)``.
+
+    Args:
+        file_bytes: Raw bytes of the uploaded micrograph.
+        footer_height: Height in pixels of the databar/footer band to search in.
+
+    Returns:
+        Tuple[int, Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+        Tick-to-tick bar length in pixels, an annotated RGB preview crop, and the
+        bar bounding box ``(x, y, w, h)`` in full-image coordinates.
+    """
+    probe_img = decode_image_bytes(file_bytes)
+    return detect_scale_bar(probe_img, footer_height=footer_height)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_extract_metrics(
+    original_image: np.ndarray,
+    mask: np.ndarray,
+    pixel_to_um_ratio: float,
+) -> pd.DataFrame:
+    """Cached ``regionprops`` extraction for a segmentation mask.
+
+    ``extract_metrics`` (from ``analyzer.py``) walks every labeled object to compute
+    area, perimeter-derived circularity, convex-hull solidity and the fitted ellipse
+    axes.  On micrographs with thousands of particles this dominates runtime, yet its
+    output depends ONLY on ``(image, mask, calibration)`` - it must never re-run when
+    the user merely moves an opacity slider, edits a size range or switches tabs.
+
+    Args:
+        original_image: 2D grayscale image the mask was computed on.
+        mask: Labeled integer mask (0 = background).
+        pixel_to_um_ratio: Spatial calibration in micrometres per pixel.
+
+    Returns:
+        pd.DataFrame: The morphological/photometric metrics table from
+        ``analyzer.extract_metrics`` (a fresh copy on every cache hit).
+    """
+    return extract_metrics(
+        original_image=original_image,
+        mask=mask,
+        pixel_to_um_ratio=pixel_to_um_ratio,
+    )
 
 
 def extract_scale_um_from_filename(image_name: str) -> float:
@@ -2706,7 +2767,7 @@ def create_sample_sem_image() -> bytes:
     img_uint8 = np.clip(base, 0, 255).astype(np.uint8)
 
     buf = io.BytesIO()
-    Image.fromarray(img_uint8).save(buf, format="PNG")
+    Image.fromarray(img_uint8).save(buf, format="PNG", compress_level=1)
     return buf.getvalue()
 
 
@@ -2785,6 +2846,55 @@ def _rasterize_manual_air_bubbles(
             continue
         cv2.fillPoly(canvas, [np.round(pts[:, :2]).astype(np.int32)], 1)
     return canvas.astype(bool)
+
+
+def _lut_label_filter(
+    mask: np.ndarray,
+    labels: Iterable[int],
+    keep: bool = True,
+) -> np.ndarray:
+    """Filter a labeled mask through an O(1) NumPy look-up table (LUT).
+
+    ``np.where(np.isin(mask, list(ids)), mask, 0)`` sorts every label of the *whole*
+    image and binary-searches it, which dominates runtime on multi-megapixel masks
+    holding thousands of objects.  Building a dense ``mask.max() + 1`` boolean LUT and
+    gathering it with the mask is a single vectorised pass:
+
+        keep_lut = np.zeros(int(mask.max()) + 1, dtype=bool)
+        keep_lut[valid_ids] = True
+        mask = mask * keep_lut[mask]
+
+    Args:
+        mask: Labeled 2D (or ``(H, W, 1)``) integer mask, 0 = background.
+        labels: Object ids to keep (``keep=True``) or to zero out (``keep=False``).
+        keep: When True only ``labels`` survive, otherwise ``labels`` are removed.
+
+    Returns:
+        np.ndarray: Filtered 2D mask with the original dtype and shape.
+    """
+    mask_2d = mask.squeeze() if mask.ndim == 3 else mask
+    if not np.issubdtype(mask_2d.dtype, np.integer):
+        mask_2d = mask_2d.astype(np.int32)
+    if mask_2d.size == 0:
+        return mask_2d
+
+    max_label = int(mask_2d.max())
+    if max_label <= 0:
+        # Only background present - nothing to keep or drop.
+        return mask_2d
+
+    accepted = np.zeros(max_label + 1, dtype=bool) if keep else np.ones(max_label + 1, dtype=bool)
+    # Background must always stay background, in both modes.
+    accepted[0] = True
+    for value in labels:
+        try:
+            label = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < label <= max_label:
+            accepted[label] = keep
+
+    return np.where(accepted[mask_2d], mask_2d, 0).astype(mask_2d.dtype, copy=False)
 
 
 def _remove_nested_matryoshka_masks(
@@ -2882,8 +2992,129 @@ def _remove_nested_matryoshka_masks(
     manual_ids = set(df_in.loc[df_in["id"] >= 10000, "id"].tolist())
     valid_ids = valid_auto_ids | manual_ids
     df_out = df_in[df_in["id"].isin(valid_ids)].copy().reset_index(drop=True)
-    mask_out = np.where(np.isin(mask_2d, list(valid_ids)), mask_2d, 0)
+    mask_out = _lut_label_filter(mask_2d, valid_ids, keep=True)
     return df_out, mask_out, occupied
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_remove_nested_matryoshka_masks(
+    df_in: pd.DataFrame,
+    mask_arr: Optional[np.ndarray],
+    prior_occupied: Optional[np.ndarray] = None,
+    overlap_thresh: float = 0.50,
+) -> Tuple[pd.DataFrame, Optional[np.ndarray], np.ndarray]:
+    """Streamlit-cached wrapper around :func:`_remove_nested_matryoshka_masks`.
+
+    The de-duplication pass walks every auto object (largest first), fills its external
+    contour and measures the overlap with the already-accepted canvas - i.e. one
+    ``cv2.findContours`` call per particle.  The result is a pure function of the
+    metrics table, the mask and the prior canvas, so it is memoised to keep slider,
+    tab and opacity re-runs instantaneous.
+
+    Args:
+        df_in: Metrics DataFrame with 'id' and 'area_um2'/'diameter_um'.
+        mask_arr: Labeled mask aligned with ``df_in`` (0 = background).
+        prior_occupied: Optional boolean canvas of already accepted regions.
+        overlap_thresh: Rejection threshold on the filled-footprint overlap fraction.
+
+    Returns:
+        Tuple[pd.DataFrame, Optional[np.ndarray], np.ndarray]: cleaned DataFrame,
+        cleaned mask and the updated occupied canvas.
+    """
+    return _remove_nested_matryoshka_masks(
+        df_in=df_in,
+        mask_arr=mask_arr,
+        prior_occupied=prior_occupied,
+        overlap_thresh=overlap_thresh,
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_prune_nested_auto_objects(
+    df_in: pd.DataFrame,
+    mask_arr: np.ndarray,
+    overlap_thresh: float = 0.60,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Cached "matryoshka" cleanup of the combined segmentation mask (Step 3b).
+
+    Auto objects (id < 10000) are visited from the largest to the smallest.  Each
+    external contour is hole-filled and compared with the canvas already occupied by
+    accepted, larger objects; candidates lying at least ``overlap_thresh`` of their
+    own area inside that canvas are detection artifacts and are dropped.  Manual
+    objects (id >= 10000) are always preserved.
+
+    The bookkeeping (``cv2.findContours`` + ``cv2.drawContours`` per particle, plus
+    ``find_objects`` slicing) is the single most expensive Python-level loop in the
+    analysis, so the whole pass is memoised on ``(df, mask, threshold)``: changing an
+    opacity slider, a size range or a tab must never re-run it.
+
+    Args:
+        df_in: Metrics DataFrame with 'id' and 'area_um2'/'diameter_um'.
+        mask_arr: Labeled mask aligned with ``df_in`` (0 = background).
+        overlap_thresh: Rejection threshold on the object-area overlap fraction.
+
+    Returns:
+        Tuple[pd.DataFrame, np.ndarray]: cleaned DataFrame and cleaned mask (rejected
+        labels zeroed out with an O(1) look-up table).
+    """
+    auto_df = df_in[df_in["id"] < 10000].sort_values(by="area_um2", ascending=False)
+    valid_auto_ids = []
+    occupied_canvas = np.zeros(mask_arr.shape, dtype=bool)
+    masks_int = (
+        mask_arr
+        if np.issubdtype(mask_arr.dtype, np.integer)
+        else mask_arr.astype(np.int32)
+    )
+    label_slices = None
+    try:
+        label_slices = find_objects(masks_int)
+    except Exception:
+        label_slices = None
+
+    for _, row in auto_df.iterrows():
+        obj_id = int(row["id"])
+        sl = None
+        if label_slices is not None and 0 < obj_id <= len(label_slices):
+            sl = label_slices[obj_id - 1]
+        if sl is None:
+            obj_mask_full = masks_int == obj_id
+            if not np.any(obj_mask_full):
+                continue
+            ys, xs = np.nonzero(obj_mask_full)
+            sl = (
+                slice(int(ys.min()), int(ys.max()) + 1),
+                slice(int(xs.min()), int(xs.max()) + 1),
+            )
+        obj_mask = masks_int[sl] == obj_id
+        obj_area = float(np.count_nonzero(obj_mask))
+        if obj_area <= 0:
+            continue
+        overlap_area = float(np.count_nonzero(obj_mask & occupied_canvas[sl]))
+        # If the object lies more than 60% inside an already accepted bigger object,
+        # it is a "matryoshka" detection artifact and is skipped.
+        if overlap_area / obj_area < float(overlap_thresh):
+            valid_auto_ids.append(obj_id)
+            filled = np.zeros(obj_mask.shape, dtype=np.uint8)
+            contours, _ = cv2.findContours(
+                obj_mask.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            if contours:
+                cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+            occupied_canvas[sl] |= filled.astype(bool)
+
+    # Keep valid auto objects and all manual objects (id >= 10000)
+    valid_all_ids = set(valid_auto_ids) | set(
+        df_in[df_in["id"] >= 10000]["id"].tolist()
+    )
+    if not valid_all_ids:
+        return df_in, mask_arr
+
+    df_out = df_in[df_in["id"].isin(valid_all_ids)].copy().reset_index(drop=True)
+    # Clean the mask itself from rejected artifacts through a fast LUT gather
+    mask_out = _lut_label_filter(mask_arr, valid_all_ids, keep=True)
+    return df_out, mask_out
 
 
 # ---------------- SIDEBAR CONFIGURATION ----------------
@@ -2921,7 +3152,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.27 (v1.3 - Docker & Canvas Patched)**")
+    st.caption("📦 **Build: 2026.10.28 (v1.5 - High-Speed Engine & Stateless Advisor)**")
 
     # Hardware Acceleration Status
     device, is_gpu = get_device()
@@ -3268,9 +3499,10 @@ with st.sidebar:
         scale_preview = None
         if image_bytes is not None:
             try:
-                probe_img = decode_image_bytes(image_bytes)
-                detected_bar_pixels, scale_preview, _ = detect_scale_bar(
-                    probe_img, footer_height=max(10, int(footer_height) or 70)
+                # Cached decode + morphological probe: the sidebar reruns on every
+                # widget interaction but the scale bar never changes.
+                detected_bar_pixels, scale_preview, _ = cached_detect_scale_bar(
+                    image_bytes, max(10, int(footer_height) or 70)
                 )
             except Exception:
                 detected_bar_pixels = 0
@@ -4153,16 +4385,16 @@ else:
         """
         Build cumulative binary mask of all confirmed air bubbles.
         Combines:
-        1. Binary mask of confirmed automatically detected bubbles:
-           if auto_air_layer is not None and confirmed_air_ids:
-               c_mask = c_mask | np.isin(auto_air_layer, list(confirmed_air_ids))
+        1. Binary mask of confirmed automatically detected bubbles (LUT gather, no
+           ``np.isin`` sorting pass): if auto_air_layer is not None and confirmed_air_ids:
+               c_mask = c_mask | (_lut_label_filter(auto_air_layer, confirmed_air_ids) > 0)
         2. Filled polygon masks of active manual objects from saved_manual_items marked
            as 'air_bubbles' via cv2.fillPoly.
         If no confirmed auto air bubbles and no manual air bubbles, mask is completely False.
         """
         c_mask = np.zeros(analysis_img.shape[:2], dtype=bool)
         if auto_air_layer is not None and confirmed_air_ids:
-            c_mask = c_mask | np.isin(auto_air_layer, list(confirmed_air_ids))
+            c_mask = c_mask | (_lut_label_filter(auto_air_layer, confirmed_air_ids, keep=True) > 0)
 
         cur_saved = st.session_state.get(manual_items_key, [])
         if cur_saved:
@@ -4203,7 +4435,7 @@ else:
         )
         air_masks = masks
         if masks is not None and np.any(masks > 0):
-            _air_df_raw = extract_metrics(
+            _air_df_raw = cached_extract_metrics(
                 original_image=analysis_img,
                 mask=masks,
                 pixel_to_um_ratio=pixel_to_um_ratio,
@@ -4227,7 +4459,7 @@ else:
             _air_df_pass,
             air_masks,
             _air_occupied,
-        ) = _remove_nested_matryoshka_masks(
+        ) = cached_remove_nested_matryoshka_masks(
             _air_df_pass,
             air_masks,
             prior_occupied=manual_air_canvas,
@@ -4257,7 +4489,7 @@ else:
                 cellprob_threshold=float(cellprob_threshold),
             )
         # Extract air metrics immediately so we can label them 'air_bubbles'
-        _air_df_raw = extract_metrics(
+        _air_df_raw = cached_extract_metrics(
             original_image=analysis_img,
             mask=air_masks,
             pixel_to_um_ratio=pixel_to_um_ratio,
@@ -4279,7 +4511,7 @@ else:
             _air_df_pass,
             air_masks,
             _air_occupied,
-        ) = _remove_nested_matryoshka_masks(
+        ) = cached_remove_nested_matryoshka_masks(
             _air_df_pass,
             air_masks,
             prior_occupied=manual_air_canvas,
@@ -4376,7 +4608,7 @@ else:
     combined_bubble_mask = compute_cumulative_bubble_mask(air_masks)
 
     # 3. Extract morphological and photometric metrics on analysis_img
-    raw_df = extract_metrics(
+    raw_df = cached_extract_metrics(
         original_image=analysis_img,
         mask=masks,
         pixel_to_um_ratio=pixel_to_um_ratio,
@@ -4385,68 +4617,14 @@ else:
     # 3b. Reject nested "matryoshka" double detections (small objects inside bigger ones).
     #     The occupied canvas stores hole-filled footprints, so a smaller detection sitting
     #     inside the hole of a donut-shaped parent is correctly flagged as an artifact.
+    #     Delegated to the memoised helper: one cv2.findContours + fill pass per particle
+    #     must never be repeated just because a slider or tab changed.
     if not raw_df.empty and masks is not None and np.any(masks > 0):
-        auto_df = raw_df[raw_df["id"] < 10000].sort_values(
-            by="area_um2", ascending=False
+        raw_df, masks = cached_prune_nested_auto_objects(
+            raw_df,
+            masks,
+            overlap_thresh=0.60,
         )
-        valid_auto_ids = []
-        occupied_canvas = np.zeros(masks.shape, dtype=bool)
-        masks_int = (
-            masks
-            if np.issubdtype(masks.dtype, np.integer)
-            else masks.astype(np.int32)
-        )
-        label_slices = None
-        try:
-            label_slices = find_objects(masks_int)
-        except Exception:
-            label_slices = None
-
-        for _, row in auto_df.iterrows():
-            obj_id = int(row["id"])
-            sl = None
-            if label_slices is not None and 0 < obj_id <= len(label_slices):
-                sl = label_slices[obj_id - 1]
-            if sl is None:
-                obj_mask_full = masks_int == obj_id
-                if not np.any(obj_mask_full):
-                    continue
-                ys, xs = np.nonzero(obj_mask_full)
-                sl = (
-                    slice(int(ys.min()), int(ys.max()) + 1),
-                    slice(int(xs.min()), int(xs.max()) + 1),
-                )
-            obj_mask = masks_int[sl] == obj_id
-            obj_area = float(np.count_nonzero(obj_mask))
-            if obj_area <= 0:
-                continue
-            overlap_area = float(np.count_nonzero(obj_mask & occupied_canvas[sl]))
-            # If the object lies more than 60% inside an already accepted bigger object,
-            # it is a "matryoshka" detection artifact and is skipped.
-            if overlap_area / obj_area < 0.60:
-                valid_auto_ids.append(obj_id)
-                filled = np.zeros(obj_mask.shape, dtype=np.uint8)
-                contours, _ = cv2.findContours(
-                    obj_mask.astype(np.uint8),
-                    cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE,
-                )
-                if contours:
-                    cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
-                occupied_canvas[sl] |= filled.astype(bool)
-
-        # Keep valid auto objects and all manual objects (id >= 10000)
-        valid_all_ids = set(valid_auto_ids) | set(
-            raw_df[raw_df["id"] >= 10000]["id"].tolist()
-        )
-        if valid_all_ids:
-            raw_df = (
-                raw_df[raw_df["id"].isin(valid_all_ids)]
-                .copy()
-                .reset_index(drop=True)
-            )
-            # Clean the mask itself from rejected artifacts
-            masks = np.where(np.isin(masks, list(valid_all_ids)), masks, 0)
 
     # 3c. Two-Pass safety net: Pass 2 (fat detector) must never recreate air bubbles.
     #     Any auto Pass-2 object larger than max_fat_size that overlaps the cumulative
@@ -4467,9 +4645,12 @@ else:
         except Exception:
             pass2_slices = None
 
-        for _, row in raw_df[raw_df["id"] < 10000].iterrows():
-            if float(row.get("diameter_um", 0.0)) <= float(max_fat_size):
-                continue
+        # Only oversized Pass-2 leftovers are candidates: filtering the frame up front
+        # keeps the Python loop over a handful of rows instead of thousands.
+        pass2_candidates = raw_df[
+            (raw_df["id"] < 10000) & (raw_df["diameter_um"] > float(max_fat_size))
+        ]
+        for _, row in pass2_candidates.iterrows():
             obj_id = int(row["id"])
             sl = None
             if pass2_slices is not None and 0 < obj_id <= len(pass2_slices):
@@ -4497,7 +4678,7 @@ else:
                 .copy()
                 .reset_index(drop=True)
             )
-            masks = np.where(np.isin(masks, list(pass2_rejected_ids)), 0, masks)
+            masks = _lut_label_filter(masks, pass2_rejected_ids, keep=False)
 
     # Re-synchronize manual objects with current spatial calibration
     saved_manual_items = st.session_state.get(manual_items_key, [])
@@ -4541,18 +4722,24 @@ else:
         all_air_ids = confirmed_air_ids | manual_air_ids
 
         # Rule 2: Coordinate centroid (centroid_x, centroid_y) of each automated object (id < 10000)
-        # is tested against cumulative bubble mask (combined_bubble_mask)
-        def _centroid_in_bubble(row: pd.Series) -> bool:
-            if int(row["id"]) in all_air_ids:
-                return False
-            cx = int(round(float(row["centroid_x"])))
-            cy = int(round(float(row["centroid_y"])))
-            cy = np.clip(cy, 0, combined_bubble_mask.shape[0] - 1)
-            cx = np.clip(cx, 0, combined_bubble_mask.shape[1] - 1)
-            return bool(combined_bubble_mask[cy, cx])
-
+        # is tested against cumulative bubble mask (combined_bubble_mask).
+        # Fully vectorised: a row-wise DataFrame.apply() costs ~100x more than a single
+        # fancy-index gather into the boolean bubble mask.
         if combined_bubble_mask.any() and not raw_df.empty:
-            in_bubble_vec = raw_df.apply(_centroid_in_bubble, axis=1)
+            cx_arr = np.clip(
+                np.rint(raw_df["centroid_x"].to_numpy(dtype=float)).astype(np.intp),
+                0,
+                combined_bubble_mask.shape[1] - 1,
+            )
+            cy_arr = np.clip(
+                np.rint(raw_df["centroid_y"].to_numpy(dtype=float)).astype(np.intp),
+                0,
+                combined_bubble_mask.shape[0] - 1,
+            )
+            in_bub = combined_bubble_mask[cy_arr, cx_arr] & (
+                ~raw_df["id"].isin(all_air_ids).to_numpy()
+            )
+            in_bubble_vec = pd.Series(in_bub, index=raw_df.index)
         else:
             in_bubble_vec = pd.Series(False, index=raw_df.index)
 
@@ -4623,7 +4810,7 @@ else:
         filtered_df = raw_df[circ_ok].copy().reset_index(drop=True)
         valid_ids = set(filtered_df["id"].tolist())
         # Zero out rejected object IDs from segmentation mask (non-destructive copy)
-        filtered_masks = np.where(np.isin(masks, list(valid_ids)), masks, 0)
+        filtered_masks = _lut_label_filter(masks, valid_ids, keep=True)
     else:
         filtered_df = raw_df.copy()
         filtered_masks = masks.copy()
@@ -4643,13 +4830,13 @@ else:
         if not filtered_df.empty:
             filtered_df = filtered_df[~filtered_df["id"].isin(active_excluded_ids)].copy().reset_index(drop=True)
         # Zero out excluded IDs in mask array
-        filtered_masks = np.where(np.isin(filtered_masks, list(active_excluded_ids)), 0, filtered_masks)
+        filtered_masks = _lut_label_filter(filtered_masks, active_excluded_ids, keep=False)
 
     # Filter air pass masks and dataframe in Two-Pass mode
     if _is_two_pass and air_masks is not None and not _air_df_pass.empty:
         valid_air_ids = set(_air_df_pass["id"].tolist()) - active_excluded_ids
         _air_df_pass = _air_df_pass[_air_df_pass["id"].isin(valid_air_ids)].copy()
-        filtered_air_masks = np.where(np.isin(air_masks, list(valid_air_ids)), air_masks, 0)
+        filtered_air_masks = _lut_label_filter(air_masks, valid_air_ids, keep=True)
     else:
         filtered_air_masks = None
 
@@ -4750,16 +4937,21 @@ else:
     # Rule 3 & Rule 4: Enforce 'adsorbed_fat' for all partial_ids inside bubbles, forbid outside
     if not classified_df.empty:
         if "in_bubble" not in classified_df.columns:
-            # Recompute in_bubble if not already attached
-            def _check_in_b(row: pd.Series) -> bool:
-                if str(row.get("phase_class", "")).lower() == "air_bubbles":
-                    return False
-                cx = int(round(float(row["centroid_x"])))
-                cy = int(round(float(row["centroid_y"])))
-                cy = np.clip(cy, 0, combined_bubble_mask.shape[0] - 1)
-                cx = np.clip(cx, 0, combined_bubble_mask.shape[1] - 1)
-                return bool(combined_bubble_mask[cy, cx])
-            classified_df["in_bubble"] = classified_df.apply(_check_in_b, axis=1)
+            # Recompute in_bubble if not already attached (vectorised centroid gather)
+            cx_arr = np.clip(
+                np.rint(classified_df["centroid_x"].to_numpy(dtype=float)).astype(np.intp),
+                0,
+                combined_bubble_mask.shape[1] - 1,
+            )
+            cy_arr = np.clip(
+                np.rint(classified_df["centroid_y"].to_numpy(dtype=float)).astype(np.intp),
+                0,
+                combined_bubble_mask.shape[0] - 1,
+            )
+            not_air_row = (
+                classified_df["phase_class"].astype(str).str.lower().to_numpy() != "air_bubbles"
+            )
+            classified_df["in_bubble"] = not_air_row & combined_bubble_mask[cy_arr, cx_arr]
 
         # Rule 3: Forcibly assign 'adsorbed_fat' to all partial_ids
         if partial_ids:
@@ -4903,16 +5095,12 @@ else:
                     .reset_index(drop=True)
                 )
                 if filtered_masks is not None:
-                    filtered_masks = np.where(
-                        np.isin(filtered_masks, list(rejected_air_ids)),
-                        0,
-                        filtered_masks,
+                    filtered_masks = _lut_label_filter(
+                        filtered_masks, rejected_air_ids, keep=False
                     )
                 if filtered_air_masks is not None:
-                    filtered_air_masks = np.where(
-                        np.isin(filtered_air_masks, list(rejected_air_ids)),
-                        0,
-                        filtered_air_masks,
+                    filtered_air_masks = _lut_label_filter(
+                        filtered_air_masks, rejected_air_ids, keep=False
                     )
                 confirmed_air_ids = set(confirmed_air_ids) - rejected_air_ids
                 manual_air_ids = set(manual_air_ids) - rejected_air_ids
@@ -4976,7 +5164,12 @@ else:
     })
 
     ads_particles_df_global = pd.DataFrame()
-    if selected_bubble_ids_for_ads and show_adsorbed and show_labels:
+    if (
+        selected_bubble_ids_for_ads
+        and show_adsorbed
+        and show_labels
+        and adsorbed_fat_count > 0
+    ):
         try:
             _, ads_particles_df_global, _ = compute_interfacial_adsorption_metrics(
                 df=classified_df,
@@ -5323,7 +5516,7 @@ else:
                 )
                 # Export segmented overlay button directly beneath
                 buf_overlay = io.BytesIO()
-                Image.fromarray(overlay).save(buf_overlay, format="PNG")
+                Image.fromarray(overlay).save(buf_overlay, format="PNG", compress_level=1)
                 st.download_button(
                     label="📥 Download Segmented Overlay (PNG)",
                     data=buf_overlay.getvalue(),
@@ -5340,7 +5533,7 @@ else:
                 )
                 # Export raw micrograph (with the burned-in scale bar when enabled)
                 buf_raw = io.BytesIO()
-                Image.fromarray(base_display_img).save(buf_raw, format="PNG")
+                Image.fromarray(base_display_img).save(buf_raw, format="PNG", compress_level=1)
                 st.download_button(
                     label="📥 Download Raw Micrograph (PNG)",
                     data=buf_raw.getvalue(),
@@ -5626,7 +5819,10 @@ else:
             # Single-phase: only the fat histogram exists — no unused air column
             fat_bin_width = st.select_slider(
                 "🟧 Fat Histogram Step (∆µm)",
-                options=[0.2, 0.25, 0.5, 1.0, 2.0],
+                options=[
+                    0.2, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+                    5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
+                ],
                 value=0.5,
                 key=f"fat_bin_width_{clean_stem}",
                 help=(
@@ -5640,7 +5836,10 @@ else:
             with col_bin_fat:
                 fat_bin_width = st.select_slider(
                     "🟧 Fat Histogram Step (∆µm)",
-                    options=[0.2, 0.25, 0.5, 1.0, 2.0],
+                    options=[
+                        0.2, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+                        5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
+                    ],
                     value=0.5,
                     key=f"fat_bin_width_{clean_stem}",
                     help=(
@@ -5651,7 +5850,7 @@ else:
             with col_bin_air:
                 air_bin_width = st.select_slider(
                     "🟦 Air Histogram Step (∆µm)",
-                    options=[2.0, 5.0, 10.0, 15.0, 20.0],
+                    options=[2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0],
                     value=10.0,
                     key=f"air_bin_width_{clean_stem}",
                     help=(
@@ -5918,7 +6117,10 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 (classified_df["phase_class"] == "air_bubbles") & (classified_df["id"] < 10000)
             ]["id"].tolist()
             if air_ids:
-                auto_air_binary = np.isin(filtered_masks, air_ids).astype(np.uint8)
+                # Fast LUT gather instead of an np.isin() sort over the whole mask
+                auto_air_binary = (
+                    _lut_label_filter(filtered_masks, air_ids, keep=True) > 0
+                ).astype(np.uint8)
 
         if np.any(auto_air_binary > 0):
             auto_cnts, _ = cv2.findContours(auto_air_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -6593,7 +6795,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             **_FULL_WIDTH_IMAGE_KWARGS,
                         )
                         buf_insp = io.BytesIO()
-                        Image.fromarray(inspection_img).save(buf_insp, format="PNG")
+                        Image.fromarray(inspection_img).save(buf_insp, format="PNG", compress_level=1)
                         st.download_button(
                             "📥 Download Inspection Overlay (PNG)",
                             data=buf_insp.getvalue(),
@@ -6692,7 +6894,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                     protocol_csv += inspect_particles.to_csv(index=False)
 
                                     buf_crop = io.BytesIO()
-                                    Image.fromarray(crop_img).save(buf_crop, format="PNG")
+                                    Image.fromarray(crop_img).save(buf_crop, format="PNG", compress_level=1)
                                     c1, c2 = st.columns(2)
                                     with c1:
                                         st.download_button(
@@ -6923,7 +7125,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     **_FULL_WIDTH_IMAGE_KWARGS,
                 )
                 buf_network = io.BytesIO()
-                Image.fromarray(network_img).save(buf_network, format="PNG")
+                Image.fromarray(network_img).save(buf_network, format="PNG", compress_level=1)
                 st.download_button(
                     label="📥 Download Network Map (PNG)",
                     data=buf_network.getvalue(),
@@ -7120,7 +7322,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
 
             # Export segmented overlay
             buf_overlay_tab = io.BytesIO()
-            Image.fromarray(overlay).save(buf_overlay_tab, format="PNG")
+            Image.fromarray(overlay).save(buf_overlay_tab, format="PNG", compress_level=1)
             st.download_button(
                 label="📥 Export Overlay (PNG)",
                 data=buf_overlay_tab.getvalue(),
