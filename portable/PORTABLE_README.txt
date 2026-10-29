@@ -15,7 +15,20 @@ and the base AI model weights. Nothing is installed on your PC.
    Closing it stops the PhasePix server.
 
 Optional: run Create_Desktop_Shortcut.bat once to place a PhasePix
-icon on your Desktop with the custom PhasePix.ico artwork.
+icon on your Desktop with the custom Icon.ico artwork.
+
+------------------------------------------------------------------
+ YOUR MICROGRAPHS
+------------------------------------------------------------------
+The images folders always start empty - no laboratory data is
+shipped inside this distribution.
+
+Double-click  Open_Images_Folder.bat  to open them directly:
+app\images\sem\    for SEM images
+app\images\light\  for light microscopy images
+
+Copies of your files stay in these folders and survive every
+automatic code update.
 
 ------------------------------------------------------------------
  AUTOMATIC UPDATES
@@ -40,6 +53,7 @@ app\images\             Put your micrographs here
 app\models_cache\       AI weights - Cellpose and Segment Anything
 PhasePix_Start.bat      Main launcher
 Create_Desktop_Shortcut.bat   Desktop icon helper
+Open_Images_Folder.bat  Opens app\images in Windows Explorer
 
 ------------------------------------------------------------------
  TROUBLESHOOTING

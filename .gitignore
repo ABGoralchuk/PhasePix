@@ -12,21 +12,52 @@ __pycache__/
 # Streamlit
 .streamlit/
 
-# Models and large cache
-models_cache/
+# Models and large cache (only models_cache/.gitkeep is tracked)
+models_cache/*
+!models_cache/.gitkeep
 *.onnx
 *.pth
 *.pt
 
-# Temporary & scratch files
+# Ignore experimental micrographs and manual mask JSONs in public repo
+images/*
+!images/.gitkeep
+!images/sem/
+images/sem/*
+!images/sem/.gitkeep
+!images/light/
+images/light/*
+!images/light/.gitkeep
+
+# Internal agent configuration and scratch material
+.agents/
+.cursor/
+.claude/
 scratch/
+test_*
+verify_*.py
+*.tmp
+
+# Docker tooling is not part of the public release
+Dockerfile
+docker-compose.yml
+docker-compose.cpu.yml
+.dockerignore
+run_windows_docker.bat
+docker_code.txt
+
+# Generated code dumps / bundle exports
+Phasepix.txt
+Phasepix_code.txt
+Phasepix_code_2.txt
+
+# Build stamps and disposable assets
+.phasepix_image_stamp
+Icon_full.ico
 
 # OS specific
 .DS_Store
 *.rtf
-
-# Docker image build stamp (written by run_windows_docker.bat)
-.phasepix_image_stamp
 
 # Portable Windows distribution output (build_portable_windows.bat)
 dist/

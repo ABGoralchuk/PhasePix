@@ -24,7 +24,7 @@ PhasePix is a high-performance Streamlit application designed for automated deep
 - **Dedicated Granulometry Export**: Interactive results table in the **Metrics** tab with an instant one-click download button (`📥 Download Results Table (CSV)`) for food science and colloidal dispersion publications.
 - **Interactive Table Editing & Manual Reclassification (`st.data_editor`)**: Researchers can check off artifact particles via the `Excluded` boolean checkbox column AND manually reclassify particles using the editable `phase_class` dropdown (`st.column_config.SelectboxColumn` with `['air_bubbles', 'fat_particles', 'Unclassified']`). Clicking `Apply Changes` synchronizes modifications to `st.session_state`, immediately recoloring the particle on the overlay, recalculating phase KPI counts, and updating granulometry metrics in real time (with a `Reset Modifications` option).
 - **Lime Green Unclassified Masks**: Unclassified particles (those not matching the Min/Max size boundaries) are highlighted on the segmentation overlay in distinct semi-transparent Lime Green (`RGB 50, 205, 50` / `#32cd32`), making them instantly recognizable for visual inspection and manual reclassification.
-- **Integrated Visual Ruler (Zero-Latency HTML5 Caliper)**: The **📊 Interactive Dashboard** column 1 exposes a third `Display Mode` — **📏 Interactive Ruler** — which renders the micrograph (or the segmentation overlay, switchable via *Ruler Base Image*) inside a self-contained HTML5 `<canvas>` component (`st.components.v1.html`), so a click-and-drag measurement is calculated **entirely in the browser** — no server rerun, no websocket round-trip, identical behaviour on Windows Docker, macOS and Linux. The component is styled to match Streamlit's own cards (white background, `1px solid #e6e9ef` borders, 8 px radius, `Source Sans Pro` typography, `#31333F` text), the canvas always spans 100 % of the column width (no dark letterboxing and identical geometry to the *Segmentation Overlay* / *Raw Micrograph* views), and the background micrograph is embedded as a fast `quality=92` JPEG data URL. Euclidean line length $\sqrt{\Delta x^2 + \Delta y^2}$ is mapped from CSS pixels → embedded bitmap pixels → **native micrograph pixels** using the exact `native/bitmap` ratio, then multiplied by the active calibration to report micrometres ($\mu\text{m}$). A compact top bar shows **Measured Size** (µm and px), **Suggested Min (80 %)** and **Suggested Max (120 %)** next to the *Line Color* / *Line Width* pickers and the *↩️ Undo* / *🗑️ Clear* buttons, while a live floating badge follows the drag. The measurement history table appears only after the first line is drawn (keeping the dashboard compact), and the suggested Min/Max values can be copied straight into **Section 4** of the sidebar while the Phase Classifications table stays visible on the right.
+- **Integrated Visual Ruler (Zero-Latency HTML5 Caliper)**: The **📊 Interactive Dashboard** column 1 exposes a third `Display Mode` — **📏 Interactive Ruler** — which renders the micrograph (or the segmentation overlay, switchable via *Ruler Base Image*) inside a self-contained HTML5 `<canvas>` component (`st.components.v1.html`), so a click-and-drag measurement is calculated **entirely in the browser** — no server rerun, no websocket round-trip, identical behaviour on Windows, macOS and Linux. The component is styled to match Streamlit's own cards (white background, `1px solid #e6e9ef` borders, 8 px radius, `Source Sans Pro` typography, `#31333F` text), the canvas always spans 100 % of the column width (no dark letterboxing and identical geometry to the *Segmentation Overlay* / *Raw Micrograph* views), and the background micrograph is embedded as a fast `quality=92` JPEG data URL. Euclidean line length $\sqrt{\Delta x^2 + \Delta y^2}$ is mapped from CSS pixels → embedded bitmap pixels → **native micrograph pixels** using the exact `native/bitmap` ratio, then multiplied by the active calibration to report micrometres ($\mu\text{m}$). A compact top bar shows **Measured Size** (µm and px), **Suggested Min (80 %)** and **Suggested Max (120 %)** next to the *Line Color* / *Line Width* pickers and the *↩️ Undo* / *🗑️ Clear* buttons, while a live floating badge follows the drag. The measurement history table appears only after the first line is drawn (keeping the dashboard compact), and the suggested Min/Max values can be copied straight into **Section 4** of the sidebar while the Phase Classifications table stays visible on the right.
 - **Manual Particle ID Exclusion**: Allows researchers to exclude specific particle IDs (e.g. `4, 12, 45`) via the sidebar text input.
 - **Flexible Phase Layering & Z-Order (Layering)**: Dedicated visualization controls to tune individual opacities (`Air Bubbles Opacity` and `Fat Particles Opacity`, default 0.3), toggle class visibility (`Show Air Bubbles` and `Show Fat Particles`), and control layering priority (`Fat over Air` vs. `Air over Fat`) so that overlying fat globule crusts do not obstruct air pore analysis on whipped emulsions.
 - **Sample Type Modes & Dynamic Sidebar UI**: Supports 3 distinct sample types via `st.radio('Sample Type', options=['Emulsion', 'Whipped Emulsion', 'Foam'])`:
@@ -41,87 +41,63 @@ PhasePix is a high-performance Streamlit application designed for automated deep
 
 ```text
 PhasePix/
-├── .agents/
-│   ├── rules/
-│   │   └── rules.md                  # Project architectural rules and constraints
-│   └── skills/
-│       └── developing-with-streamlit/
-├── .dockerignore                     # Docker build context exclusions (models_cache weights, datasets, git)
-├── Dockerfile                        # Multi-platform Linux container build based on python:3.11-slim
-├── docker-compose.yml                # Docker Compose orchestration with persistent host volumes
-├── run_windows_docker.bat            # 1-Click auto-updating Windows launcher with GitHub sync & Docker checks
-├── requirements.txt                  # Clean runtime dependencies for Linux container and local environments
-├── images/                           # SEM and light microscopy images (mounted as persistent volume)
-│   ├── sem/                          # SEM micrographs
-│   └── light/                        # Light microscopy images
-├── models_cache/                     # Downloaded neural network weights (SAM, Cellpose)
-├── light_calibration_presets.json    # Light microscopy objective calibration presets
-├── parameter_presets.json            # Segmentor recipe and parameter presets
-├── analyzer.py                       # Morphological, photometric & D[3,2]/D[4,3] feature extraction
 ├── app.py                            # Streamlit web application & UI dashboard
+├── analyzer.py                       # Morphological, photometric & D[3,2]/D[4,3] feature extraction
 ├── cellpose_model.py                 # Cellpose inference wrapper with MPS / CUDA / CPU handling
 ├── scale_detector.py                 # Automated SEM scale bar detection
 ├── visualizer.py                     # Size-based phase sorting, overlay rendering & KDE visualization
-├── install_python.txt                # Native Windows setup commands and dependency guide
-├── phasepix.bat                      # Native Windows virtual environment launch script
+├── requirements.txt                  # Clean runtime dependencies
+├── light_calibration_presets.json    # Light microscopy objective calibration presets
+├── parameter_presets.json            # Built-in SEM / Light parameter presets
+├── Icon.ico                          # Application icon
+├── phasepix.bat                      # Native Windows virtual environment launcher
+├── phasepix_run.command              # Native macOS Finder launcher script
 ├── build_portable_windows.bat        # One-time builder: zero-install dist\PhasePix_Portable folder
 ├── portable\                         # Launcher templates copied into the portable distribution
 │   ├── PhasePix_Start.bat            # End-user auto-updating launcher
 │   ├── Create_Desktop_Shortcut.bat   # Desktop shortcut helper with the custom .ico
 │   └── PORTABLE_README.txt           # Instructions shipped inside the portable folder
-├── phasepix_run.command              # Native macOS Finder launcher script
+├── images\                           # Micrographs - empty in the public repo (.gitkeep only)
+│   ├── sem\                          # SEM micrographs
+│   └── light\                        # Light microscopy images
+├── models_cache\                     # Downloaded AI weights - local only (.gitkeep only in git)
+├── SOP_SEM.docx                      # Standard operating procedure - SEM workflow
+├── SOP_light.docx                    # Standard operating procedure - light microscopy workflow
+├── Methodology_SEM.docx              # Segmentation methodology - SEM
+├── Methodology_light.docx            # Segmentation methodology - light microscopy
+├── METHODOLOGY_AI Parameter_Advisor .docx   # AI Parameter Advisor methodology
+├── .gitignore                        # Keeps micrographs, weights and caches out of Git
 └── README.md                         # Project documentation & run guide
 ```
 
 ---
 
-## Running with Docker (Recommended for Windows Production)
+## Running PhasePix
 
-Docker provides an identical, isolated runtime on Windows, macOS, and Linux without needing to manage local Python installations or system DLLs.
+The public repository ships **source code, presets and documentation only** — no laboratory micrographs are published. Put your own data into `images/sem/` or `images/light/` (both folders are preserved in Git by a `.gitkeep` placeholder), or upload files directly from the sidebar. Manual mask JSONs written by the *Manual Correction* tab land in the same folders and are git-ignored as well.
 
-### Windows (1-Click Auto-Updating Launcher)
+### Windows — zero-install portable folder (recommended)
 
-1. Ensure **Docker Desktop** is installed and running.
-2. Double-click **`run_windows_docker.bat`**.
+1. Build the distribution once with **`build_portable_windows.bat`** on a Windows build PC.
+2. Hand the resulting `PhasePix_Portable` folder to any Windows 10/11 x64 PC (USB stick, network share, zip).
+3. Double-click **`PhasePix_Start.bat`** — the dashboard opens at `http://localhost:8501`.
+4. Drop micrographs into `app\images\sem` / `app\images\light`, or double-click **`Open_Images_Folder.bat`** in the root of the portable folder to open that directory directly.
 
-The batch script automatically:
-- Syncs the latest updates directly from GitHub (`git fetch --all && git reset --hard origin/main`) **inline in the same window** — the launcher is never re-spawned through `cmd /c`, so the terminal can no longer close on its own.
-- Verifies that Docker Desktop is active (clear message + `pause` instead of a silent exit).
-- Ensures required host directories (`images\sem`, `images\light`, `models_cache`) and preset JSON files exist.
-- Starts the cached image with a plain `docker compose up -d` — **no `--build`, no `--force-recreate`**. Because every Python source file is bind-mounted, the `git reset` above already updates the code inside the container, so launches take seconds instead of re-downloading the ~2 GB PyTorch layer.
-- Rebuilds the image **only when it is genuinely needed**: the first launch, or after `Dockerfile` / `requirements.txt` change. A `.phasepix_image_stamp` file (git-ignored) stores the signature of those two files, so a normal launch skips the build entirely.
-- Tries NVIDIA GPU passthrough first (`docker-compose.yml`) and falls back automatically to `docker-compose.cpu.yml` when no GPU is available (`if errorlevel 1` + `goto`, never a parenthesised `if` block).
-- Launches the application in your default browser at `http://localhost:8501`.
-- Streams the live container log and then **always** hits `pause`, so the window stays open on every success and every error path.
+### Windows / macOS / Linux — native Python
 
-> `docker compose up` still reconciles configuration changes on its own: if you edit a volume mount in a compose file, Compose recreates the container automatically — `--force-recreate` is not required for that.
+Install Python 3.11, then `pip install -r requirements.txt` and launch with `phasepix.bat` (Windows) or `phasepix_run.command` (macOS Finder) — see [Native Installation & Setup](#native-installation--setup-alternative).
 
-The runtime is pinned in `requirements.txt` to **Streamlit 1.39.0**, the last release that still exposes `streamlit.elements.image.image_to_url` with the positional signature `streamlit-drawable-canvas==0.9.3` uses for its background micrograph. That keeps the **Manual Correction** canvas natively working — no monkey-patching, no data-URL workarounds. The Dockerfile asserts this pairing during the build and fails loudly if a future image ever breaks it.
+### Local data folders
 
-### macOS / Linux (Docker Compose)
-
-1. Make sure Docker is running.
-2. Start the container:
-   ```bash
-   docker compose up --build -d
-   ```
-3. Open `http://localhost:8501` in your browser.
-4. To stop the container:
-   ```bash
-   docker compose down
-   ```
-
-### Persistent Data Volumes
-All research assets are mounted directly from the host filesystem:
-- **`./images` $\rightarrow$ `/app/images`**: Micrographs added on the host are immediately accessible.
-- **`./models_cache` $\rightarrow$ `/app/models_cache`**: Downloaded Segment Anything (SAM) and Cellpose weights are saved on the host and never redownloaded.
-- **`./light_calibration_presets.json` & `./parameter_presets.json`**: Presets created or modified in the UI persist across container restarts.
+- **`images/`** — your micrographs (`images/sem`, `images/light`) plus the manual mask JSONs. Never committed.
+- **`models_cache/`** — Segment Anything and Cellpose weights downloaded on first run. Never committed.
+- **`parameter_presets.json` / `light_calibration_presets.json`** — recipes created in the sidebar persist here.
 
 ---
 
 ## 📦 Building & Distributing PhasePix Portable (Windows Zero-Install)
 
-`PhasePix_Portable` is a self-contained folder that runs PhasePix on **any Windows 10/11 x64 PC without Docker, Python, Git, CUDA or administrator rights** — yet it still receives automatic code updates from GitHub on every launch.
+`PhasePix_Portable` is a self-contained folder that runs PhasePix on **any Windows 10/11 x64 PC without Python, Git, CUDA or administrator rights** — yet it still receives automatic code updates from GitHub on every launch.
 
 ### 1. Build the folder once (on one Windows PC)
 
@@ -135,14 +111,16 @@ The builder produces `dist\PhasePix_Portable\` with:
 | --- | --- |
 | `python\` | Portable **CPython 3.11.9** (`indygreg`/`astral-sh` `python-build-standalone`, `x86_64-pc-windows-msvc-shared-install_only`) extracted with the Windows built-in `tar`. Full standard library, headers and a working `pip`. |
 | `git\` | Portable **MinGit 2.47.0** (`cmd\git.exe`) — no Git installation on the target PC. |
-| `app\` | A clean `git clone` of this repository **including `.git`**, so the launcher can self-update. |
+| `app\` | A clean `git clone` of this repository **including `.git`**, so the launcher can self-update. The `origin` remote is force-set to the public GitHub HTTPS URL, never to the local folder the builder ran from. |
+| `app\images\sem\` / `app\images\light\` | Created empty — no laboratory micrograph is ever shipped inside the distribution. |
 | `app\models_cache\` | Pre-downloaded `sam_vit_b_01ec64.pth` and Cellpose weights (`cyto2` / Cellpose-4 `cpsam`), so colleagues do not wait on first run. |
 | `Icon.ico` | Copied from the repository root and used by the Desktop shortcut. |
 | `PhasePix_Start.bat` | The end-user launcher (copied from `portable\`). |
 | `Create_Desktop_Shortcut.bat` | Creates a Desktop `.lnk` pointing at the launcher, with `$Shortcut.IconLocation` set to `Icon.ico`. |
+| `Open_Images_Folder.bat` | Opens `app\images` in Windows Explorer (`explorer.exe "%~dp0app\images"`) straight from the root of `PhasePix_Portable`. |
 | `PORTABLE_README.txt` | Plain-language instructions for colleagues. |
 
-Build steps executed by the script: download + extract portable Python → download + extract MinGit → `git clone` the repo → `pip install --upgrade pip setuptools wheel` → `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121` → `pip install --prefer-binary -r app\requirements.txt` → copy `Icon.ico` → pre-download AI checkpoints → install launchers. Expect **20–40 minutes and ~6 GB** of downloads; every step is idempotent, so re-running the builder resumes where it stopped.
+Build steps executed by the script: download + extract portable Python → download + extract MinGit → resolve the public GitHub URL from the builder's `origin` remote → `git clone` the repo → pin `origin` inside `app\` to that URL → `pip install --upgrade pip setuptools wheel` → `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121` → `pip install --prefer-binary -r app\requirements.txt` → copy `Icon.ico` → pre-download AI checkpoints → install launchers, create the empty `images` folders and generate `Open_Images_Folder.bat`. Expect **20–40 minutes and ~6 GB** of downloads; every step is idempotent, so re-running the builder resumes where it stopped.
 
 ### 2. Hand it to colleagues
 
@@ -150,6 +128,7 @@ Copy the whole `dist\PhasePix_Portable` folder (USB stick, network share, zip). 
 
 1. Double-click **`PhasePix_Start.bat`** → the dashboard opens at `http://localhost:8501`.
 2. Optional: run **`Create_Desktop_Shortcut.bat`** once to get a PhasePix icon on the Desktop.
+3. Put micrographs into `app\images\sem` / `app\images\light`, or double-click **`Open_Images_Folder.bat`** to open that directory in Explorer.
 
 ### 3. Automatic updates on every launch
 
@@ -163,14 +142,13 @@ The launcher also exports the portable environment: `PATH` (bundled Python + Git
 
 > `cellpose_model.py` resolves the checkpoint folder from `CELLPOSE_LOCAL_MODELS_PATH` (then `PHASEPIX_MODELS_DIR`, then `models_cache/`) and exports it before importing Cellpose, whose `MODEL_DIR` is only read at import time. The same folder holds the SAM checkpoints (`ensure_sam_checkpoint`) and the Cellpose weights (`ensure_cellpose_weights`) — the builder calls both to pre-seed the cache.
 
-`dist/` is git-ignored and Docker-ignored; only the builder and the `portable/` templates are committed.
+`dist/` is git-ignored; only the builder, the `portable/` templates and the documentation are committed.
 
 ---
 
 ## Native Installation & Setup (Alternative)
 
 ### Windows
-Follow the quick commands provided in [install_python.txt](install_python.txt):
 1. Install Python 3.11:
    ```cmd
    winget install -e --id Python.Python.3.11

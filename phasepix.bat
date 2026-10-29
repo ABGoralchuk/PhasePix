@@ -81,8 +81,8 @@ echo.
 echo Install the project dependencies with:
 echo   "%PY_EXE%" %PY_ARGS% -m pip install -r requirements.txt
 echo.
-echo Or skip Python entirely and use Docker:
-echo   run_windows_docker.bat
+echo Or ask your PhasePix administrator for the zero-install
+echo PhasePix_Portable folder and run PhasePix_Start.bat
 echo ==================================================
 echo.
 goto :end_pause
@@ -96,8 +96,8 @@ echo Option A - install Python 3.10 or newer:
 echo   https://www.python.org/downloads/windows/
 echo   Tick "Add python.exe to PATH" during installation.
 echo.
-echo Option B - skip Python entirely and use Docker:
-echo   run_windows_docker.bat
+echo Option B - ask your PhasePix administrator for the zero-install
+echo PhasePix_Portable folder and run PhasePix_Start.bat
 echo ==================================================
 echo.
 goto :end_pause

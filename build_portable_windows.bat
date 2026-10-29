@@ -30,7 +30,10 @@ set "TEMPLATES=%ROOT%portable"
 set "PY_URL=https://github.com/indygreg/python-build-standalone/releases/download/20240726/cpython-3.11.9%%2B20240726-x86_64-pc-windows-msvc-shared-install_only.tar.gz"
 set "GIT_URL=https://github.com/git-for-windows/git/releases/download/v2.47.0.windows.1/MinGit-2.47.0-64-bit.zip"
 set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-set "REPO_URL=https://github.com/ABGoralchuk/PhasePix.git"
+rem Public GitHub URL used by the portable clone. Overridden below by the
+rem origin remote of the repository this builder runs from (never a local path).
+set "DEFAULT_REPO_URL=https://github.com/ABGoralchuk/PhasePix.git"
+set "REPO_URL=%DEFAULT_REPO_URL%"
 
 echo ==================================================================
 echo   PhasePix Portable Builder - Windows x64
@@ -116,6 +119,24 @@ rem [3/7] Clean clone of the PhasePix repository - .git is preserved so
 rem      the portable launcher can auto-update from GitHub later.
 rem -------------------------------------------------------------------
 echo [3/7] Cloning PhasePix into %APP_DIR% ...
+
+rem Resolve the PUBLIC HTTPS URL of the repository this builder runs from.
+rem The parent clone's "origin" is the source of truth, so building from a
+rem local folder copy can never leak a local path into the distribution.
+pushd "%ROOT%"
+if exist ".git" "%GIT_EXE%" remote get-url origin > "%CACHE%\origin_url.txt" 2>nul
+popd
+if not exist "%CACHE%\origin_url.txt" goto :url_from_remote_done
+for /f "usebackq delims=" %%R in ("%CACHE%\origin_url.txt") do set "REPO_URL=%%R"
+del /q "%CACHE%\origin_url.txt" >nul 2>&1
+
+:url_from_remote_done
+rem Only an http(s) remote is usable by end users - otherwise keep GitHub.
+echo %REPO_URL%| findstr /i /b /c:"https://" /c:"http://" >nul
+if errorlevel 1 set "REPO_URL=%DEFAULT_REPO_URL%"
+echo Public repository URL: %REPO_URL%
+echo.
+
 if exist "%APP_DIR%\.git" goto :clone_ready
 if not exist "%APP_DIR%" goto :clone_now
 echo Removing the incomplete app folder from a previous build...
@@ -131,6 +152,17 @@ goto :clone_done
 echo Repository clone already present - clone skipped.
 
 :clone_done
+rem Force the origin remote inside %APP_DIR% to the public HTTPS URL. A clone
+rem made from a local folder would otherwise keep fetching from %ROOT%, which
+rem no end user has on their PC.
+"%GIT_EXE%" -C "%APP_DIR%" remote set-url origin "%REPO_URL%" >nul 2>&1
+if not errorlevel 1 goto :origin_ready
+"%GIT_EXE%" -C "%APP_DIR%" remote add origin "%REPO_URL%"
+if errorlevel 1 goto :remote_failed
+
+:origin_ready
+echo Origin remote of the portable clone:
+"%GIT_EXE%" -C "%APP_DIR%" remote get-url origin
 echo.
 
 rem -------------------------------------------------------------------
@@ -199,6 +231,16 @@ copy /y "%TEMPLATES%\Create_Desktop_Shortcut.bat" "%DIST%\Create_Desktop_Shortcu
 if errorlevel 1 goto :launcher_failed
 if exist "%TEMPLATES%\PORTABLE_README.txt" copy /y "%TEMPLATES%\PORTABLE_README.txt" "%DIST%\PORTABLE_README.txt" >nul
 
+rem One-click access to the micrograph folder from the root of the
+rem distribution, so colleagues never have to dig into app\images.
+> "%DIST%\Open_Images_Folder.bat" echo @echo off
+>> "%DIST%\Open_Images_Folder.bat" echo rem Opens the PhasePix micrograph folder in Windows Explorer.
+>> "%DIST%\Open_Images_Folder.bat" echo explorer.exe "%%~dp0app\images"
+>> "%DIST%\Open_Images_Folder.bat" echo exit /b 0
+if not exist "%DIST%\Open_Images_Folder.bat" goto :launcher_failed
+
+rem The clone carries only .gitkeep placeholders, so the end-user folder
+rem starts completely empty - no experimental micrograph is ever shipped.
 if not exist "%APP_DIR%\models_cache" mkdir "%APP_DIR%\models_cache"
 if not exist "%APP_DIR%\images" mkdir "%APP_DIR%\images"
 if not exist "%APP_DIR%\images\sem" mkdir "%APP_DIR%\images\sem"
@@ -213,13 +255,16 @@ echo ==================================================================
 echo   BUILD COMPLETE
 echo ==================================================================
 echo   Portable folder : %DIST%
+echo   Repository URL  : %REPO_URL%
 echo.
 echo   Next steps:
 echo     1. Test it: double-click PhasePix_Start.bat
 echo     2. Optional: run Create_Desktop_Shortcut.bat for a Desktop icon
-echo     3. Copy the whole PhasePix_Portable folder to a USB stick or
+echo     3. Put your micrographs into app\images\sem and app\images\light
+echo        (or run Open_Images_Folder.bat to open the folder directly)
+echo     4. Copy the whole PhasePix_Portable folder to a USB stick or
 echo        a network share and hand it to your colleagues
-echo     4. They double-click PhasePix_Start.bat - no installs needed
+echo     5. They double-click PhasePix_Start.bat - no installs needed
 echo.
 echo   Updates are pulled from GitHub automatically on every launch.
 echo ==================================================================
@@ -314,10 +359,23 @@ goto :end_pause
 echo.
 echo ==================================================================
 echo [ERROR] Cloning the PhasePix repository failed.
+echo Repository URL used: %REPO_URL%
 echo Useful checks:
 echo   1. Internet access to github.com
 echo   2. The portable MinGit folder was extracted correctly
 echo   3. Delete dist\PhasePix_Portable\app and re-run the builder
+echo ==================================================================
+echo.
+goto :end_pause
+
+:remote_failed
+echo.
+echo ==================================================================
+echo [ERROR] The origin remote inside the portable clone could not be set.
+echo Repository URL used: %REPO_URL%
+echo Path checked: %APP_DIR%\.git
+echo Without a GitHub origin the end-user launcher cannot pull updates.
+echo Delete dist\PhasePix_Portable\app and re-run the builder.
 echo ==================================================================
 echo.
 goto :end_pause
@@ -360,6 +418,8 @@ echo [ERROR] Copying the launcher templates failed.
 echo Expected templates:
 echo   %TEMPLATES%\PhasePix_Start.bat
 echo   %TEMPLATES%\Create_Desktop_Shortcut.bat
+echo Also expected a writable output folder:
+echo   %DIST%\Open_Images_Folder.bat
 echo ==================================================================
 echo.
 goto :end_pause

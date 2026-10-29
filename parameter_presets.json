@@ -74,22 +74,6 @@
       "sem_ads_circ_slider": 0.3,
       "sem_deepscan_checkbox": false,
       "shared_clahe_checkbox": true
-    },
-    "SEM_Whipped_emulsion": {
-      "sem_sample_type_radio": "Whipped Emulsion",
-      "sem_detection_focus_radio": "🫧+🟠 Both Air Bubbles & Fat Particles (Two-Pass)",
-      "sem_min_air_um": 10.0,
-      "sem_max_air_um": 100.0,
-      "sem_min_fat_um": 0.2,
-      "sem_max_fat_um": 5.0,
-      "shared_flow_slider": 0.7,
-      "shared_cellprob_slider": -1.0,
-      "shared_fat_circ_slider": 0.6,
-      "sem_air_circ_slider": 0.5,
-      "sem_ads_circ_slider": 0.3,
-      "sem_deepscan_checkbox": true,
-      "shared_clahe_checkbox": true,
-      "shared_model_type_select": "cyto2"
     }
   }
 }
