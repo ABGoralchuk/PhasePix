@@ -27,3 +27,8 @@ scratch/
 
 # Docker image build stamp (written by run_windows_docker.bat)
 .phasepix_image_stamp
+
+# Portable Windows distribution output (build_portable_windows.bat)
+dist/
+.portable_req_stamp
+

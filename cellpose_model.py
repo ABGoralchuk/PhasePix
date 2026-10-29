@@ -15,13 +15,53 @@ from pathlib import Path
 import numpy as np
 import scipy.ndimage as ndi
 import torch
-from cellpose import models
 import streamlit as st
 
 # Setup module logger
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+
+# ---------------- PORTABLE MODEL CACHE LOCATION ----------------
+# The Windows portable distribution ships ``PhasePix_Start.bat``, which exports
+# ``CELLPOSE_LOCAL_MODELS_PATH`` so that every checkpoint lands inside the
+# portable folder instead of ``C:\Users\<user>\.cellpose``. Cellpose resolves that
+# variable only once, at import time, so it must be exported *before* the cellpose
+# import further down.
+def _resolve_models_cache_dir() -> Path:
+    """
+    Return the folder that stores every downloaded AI checkpoint.
+
+    Priority:
+        1. ``CELLPOSE_LOCAL_MODELS_PATH`` - exported by the portable Windows
+           launcher and honoured identically by the Cellpose library itself.
+        2. ``PHASEPIX_MODELS_DIR`` - optional project-level override.
+        3. ``models_cache/`` in the working directory - the classic layout used by
+           the Docker image and the native launchers.
+
+    Returns:
+        Path: Cache directory, created when missing.
+    """
+    cache_dir = Path("models_cache")
+    for env_name in ("CELLPOSE_LOCAL_MODELS_PATH", "PHASEPIX_MODELS_DIR"):
+        override = os.environ.get(env_name, "").strip()
+        if override:
+            cache_dir = Path(override).expanduser()
+            break
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Could not create the models cache folder %s: %s", cache_dir, exc)
+    return cache_dir
+
+
+MODELS_CACHE_DIR = _resolve_models_cache_dir()
+# Export the resolved location so Cellpose itself writes cyto2 / cyto3 / cpsam
+# weights into the same folder (it reads this variable once, at import time).
+os.environ["CELLPOSE_LOCAL_MODELS_PATH"] = str(MODELS_CACHE_DIR)
+
+from cellpose import models  # noqa: E402  (must follow the cache-path export)
 
 
 # ---------------- SEGMENT ANYTHING (SAM) BACKBONE REGISTRY ----------------
@@ -55,6 +95,166 @@ def _normalize_sam_model_type(sam_model_type: Optional[str]) -> str:
             "Unknown SAM backbone '%s'; defaulting to 'vit_b'.", sam_model_type
         )
     return "vit_b"
+
+
+def get_models_cache_dir() -> Path:
+    """
+    Return the shared checkpoint folder used by every AI backend.
+
+    Resolved once at import time from ``CELLPOSE_LOCAL_MODELS_PATH`` (portable
+    Windows build), then ``PHASEPIX_MODELS_DIR``, then ``models_cache/``.
+
+    Returns:
+        Path: Directory holding the SAM and Cellpose weights.
+    """
+    return MODELS_CACHE_DIR
+
+
+def ensure_sam_checkpoint(sam_model_type: str = "vit_b") -> Optional[Path]:
+    """
+    Download a SAM checkpoint into the shared cache when it is missing.
+
+    The file is streamed in 8 MB chunks into a ``.part`` file and atomically
+    moved into place, so an interrupted download can never poison the cache.
+    Used both by the interactive predictor and by the portable Windows builder
+    to pre-seed ``models_cache`` before the folder is handed to colleagues.
+
+    Args:
+        sam_model_type: One of ``"vit_b"``, ``"vit_l"``, ``"vit_h"``.
+
+    Returns:
+        Optional[Path]: Path to the checkpoint, or None when it cannot be fetched.
+    """
+    sam_type = _normalize_sam_model_type(sam_model_type)
+    config = SAM_MODEL_CONFIGS[sam_type]
+    ckpt_path = get_models_cache_dir() / config["filename"]
+    min_bytes = int(config["min_bytes"])
+
+    # A truncated/partial checkpoint would break torch.load, so anything
+    # suspiciously small is treated as missing and re-downloaded.
+    if ckpt_path.exists() and ckpt_path.stat().st_size >= min_bytes:
+        logger.info("SAM %s checkpoint already cached at %s.", sam_type, ckpt_path)
+        return ckpt_path
+
+    url = config["url"]
+    logger.info("SAM %s checkpoint missing or truncated. Downloading from %s ...", sam_type, url)
+    tmp_path = ckpt_path.with_name(ckpt_path.name + ".part")
+    try:
+        # macOS Python often lacks a proper CA bundle, which makes
+        # urllib.request.urlretrieve fail with SSLCertVerificationError.
+        # Use an explicitly unverified SSL context for this one download.
+        ssl_ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(url, context=ssl_ctx) as response, open(
+            tmp_path, "wb"
+        ) as out_file:
+            # Stream in 8 MB chunks: vit_h is ~2.56 GB, so never buffer it whole.
+            shutil.copyfileobj(response, out_file, length=8 * 1024 * 1024)
+
+        downloaded_bytes = tmp_path.stat().st_size if tmp_path.exists() else 0
+        if downloaded_bytes < min_bytes:
+            logger.warning(
+                "SAM %s download incomplete (%d of at least %d bytes); aborting.",
+                sam_type,
+                downloaded_bytes,
+                min_bytes,
+            )
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            return None
+
+        os.replace(tmp_path, ckpt_path)
+        logger.info(
+            "SAM %s checkpoint downloaded to %s (%.1f MB).",
+            sam_type,
+            ckpt_path,
+            downloaded_bytes / 1e6,
+        )
+        return ckpt_path
+    except Exception as net_exc:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        logger.warning("Failed to download SAM checkpoint (%s): %s", url, net_exc)
+        return None
+
+
+def ensure_cellpose_weights(model_type: str = "cyto2") -> Optional[Path]:
+    """
+    Download Cellpose pretrained weights into the shared cache folder.
+
+    Supports both Cellpose 3.x (``models.model_path``) and Cellpose 4.x
+    (``models.cache_model_path`` + ``MODEL_NAMES``), so the portable Windows
+    builder can pre-seed the cache for whatever version pip resolved. Missing
+    weight files are skipped gracefully - PhasePix would simply download them on
+    first use.
+
+    Args:
+        model_type: Preferred Cellpose model name, e.g. ``"cyto2"`` or ``"cyto3"``.
+
+    Returns:
+        Optional[Path]: Path to the first weight file that exists, else None.
+    """
+    try:
+        # Local import: keeps this module importable when Cellpose is absent.
+        from cellpose import models as cellpose_models
+    except Exception as exc:
+        logger.warning("Cellpose is not installed; cannot pre-download weights: %s", exc)
+        return None
+
+    cache_dir = get_models_cache_dir()
+    cellpose_dir = getattr(cellpose_models, "MODEL_DIR", None)
+    if cellpose_dir is not None:
+        try:
+            if Path(cellpose_dir).resolve() != cache_dir.resolve():
+                logger.warning(
+                    "Cellpose MODEL_DIR is %s but PhasePix caches weights in %s. "
+                    "Export CELLPOSE_LOCAL_MODELS_PATH before importing cellpose.",
+                    cellpose_dir,
+                    cache_dir,
+                )
+        except OSError:
+            pass
+
+    # Cellpose 3.x exposes model_path(); Cellpose 4.x exposes cache_model_path().
+    model_path_fn = getattr(cellpose_models, "model_path", None)
+    cache_path_fn = getattr(cellpose_models, "cache_model_path", None)
+    bundled_names = tuple(getattr(cellpose_models, "MODEL_NAMES", ()) or ())
+
+    candidates = []
+    for name in (model_type, "cyto2", "cyto3", "cpsam_v2", "cpsam", "cpdino-vitb"):
+        if name and name not in candidates:
+            candidates.append(name)
+
+    for name in candidates:
+        if callable(cache_path_fn) and name in bundled_names:
+            try:
+                resolved = cache_path_fn(name)
+            except Exception as exc:
+                logger.info("Cellpose cache_model_path('%s') failed: %s", name, exc)
+                resolved = None
+            if resolved and Path(resolved).exists():
+                logger.info("Cellpose weights ready (%s): %s", name, resolved)
+                return Path(resolved)
+        if callable(model_path_fn):
+            try:
+                resolved = model_path_fn(name)
+            except Exception as exc:
+                logger.info("Cellpose model_path('%s') failed: %s", name, exc)
+                resolved = None
+            if resolved and Path(resolved).exists():
+                logger.info("Cellpose weights ready (%s): %s", name, resolved)
+                return Path(resolved)
+
+    logger.warning(
+        "Could not pre-download Cellpose weights for %s; they will be fetched on first use.",
+        model_type,
+    )
+    return None
 
 
 def apply_clahe(
@@ -850,10 +1050,10 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
     - ``vit_l`` (1.25 GB) and ``vit_h`` (2.56 GB) trade loading time/RAM for
       noticeably better boundary precision on faint, blurry or crystallized edges.
 
-    The checkpoint is stored under ``models_cache/{filename}``; missing or truncated
-    files are downloaded in 8 MB chunks into a ``.part`` file and atomically moved
-    into place. SAM always runs on CPU (safe default; avoids float64/MPS decoder
-    issues on Apple Silicon).
+    The checkpoint is stored under ``get_models_cache_dir()/{filename}``; missing
+    or truncated files are downloaded in 8 MB chunks into a ``.part`` file and
+    atomically moved into place (see :func:`ensure_sam_checkpoint`). SAM always
+    runs on CPU (safe default; avoids float64/MPS decoder issues on Apple Silicon).
 
     Args:
         sam_model_type: One of ``"vit_b"``, ``"vit_l"``, ``"vit_h"``.
@@ -862,7 +1062,6 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
         SamPredictor | None: A ready-to-use predictor, or None if SAM is unavailable.
     """
     sam_type = _normalize_sam_model_type(sam_model_type)
-    config = SAM_MODEL_CONFIGS[sam_type]
 
     try:
         from segment_anything import sam_model_registry, SamPredictor  # type: ignore
@@ -871,62 +1070,9 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
         return None
 
     try:
-        models_dir = Path("models_cache")
-        models_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = models_dir / config["filename"]
-        min_bytes = int(config["min_bytes"])
-
-        # A truncated/partial checkpoint would break torch.load, so anything
-        # suspiciously small is treated as missing and re-downloaded.
-        if not ckpt_path.exists() or ckpt_path.stat().st_size < min_bytes:
-            url = config["url"]
-            logger.info(
-                "SAM %s checkpoint missing or truncated. Downloading from %s ...",
-                sam_type,
-                url,
-            )
-            tmp_path = ckpt_path.with_name(ckpt_path.name + ".part")
-            try:
-                # macOS Python often lacks a proper CA bundle, which makes
-                # urllib.request.urlretrieve fail with SSLCertVerificationError.
-                # Use an explicitly unverified SSL context for this one download.
-                ssl_ctx = ssl._create_unverified_context()
-                with urllib.request.urlopen(url, context=ssl_ctx) as response, open(
-                    tmp_path, "wb"
-                ) as out_file:
-                    # Stream in 8 MB chunks: vit_h is ~2.56 GB, so never buffer it whole.
-                    shutil.copyfileobj(response, out_file, length=8 * 1024 * 1024)
-
-                downloaded_bytes = tmp_path.stat().st_size if tmp_path.exists() else 0
-                if downloaded_bytes < min_bytes:
-                    logger.warning(
-                        "SAM %s download incomplete (%d of at least %d bytes); aborting.",
-                        sam_type,
-                        downloaded_bytes,
-                        min_bytes,
-                    )
-                    if tmp_path.exists():
-                        try:
-                            tmp_path.unlink()
-                        except OSError:
-                            pass
-                    return None
-
-                os.replace(tmp_path, ckpt_path)
-                logger.info(
-                    "SAM %s checkpoint downloaded to %s (%.1f MB).",
-                    sam_type,
-                    ckpt_path,
-                    downloaded_bytes / 1e6,
-                )
-            except Exception as net_exc:
-                if tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        pass
-                logger.warning("Failed to download SAM checkpoint (%s): %s", url, net_exc)
-                return None
+        ckpt_path = ensure_sam_checkpoint(sam_type)
+        if ckpt_path is None:
+            return None
 
         # On macOS Apple Silicon, the MPS decoder can hit float64 errors.
         # Running SAM on CPU is the safe, reliable choice.

@@ -64,6 +64,11 @@ PhasePix/
 ├── visualizer.py                     # Size-based phase sorting, overlay rendering & KDE visualization
 ├── install_python.txt                # Native Windows setup commands and dependency guide
 ├── phasepix.bat                      # Native Windows virtual environment launch script
+├── build_portable_windows.bat        # One-time builder: zero-install dist\PhasePix_Portable folder
+├── portable\                         # Launcher templates copied into the portable distribution
+│   ├── PhasePix_Start.bat            # End-user auto-updating launcher
+│   ├── Create_Desktop_Shortcut.bat   # Desktop shortcut helper with the custom .ico
+│   └── PORTABLE_README.txt           # Instructions shipped inside the portable folder
 ├── phasepix_run.command              # Native macOS Finder launcher script
 └── README.md                         # Project documentation & run guide
 ```
@@ -111,6 +116,54 @@ All research assets are mounted directly from the host filesystem:
 - **`./images` $\rightarrow$ `/app/images`**: Micrographs added on the host are immediately accessible.
 - **`./models_cache` $\rightarrow$ `/app/models_cache`**: Downloaded Segment Anything (SAM) and Cellpose weights are saved on the host and never redownloaded.
 - **`./light_calibration_presets.json` & `./parameter_presets.json`**: Presets created or modified in the UI persist across container restarts.
+
+---
+
+## 📦 Building & Distributing PhasePix Portable (Windows Zero-Install)
+
+`PhasePix_Portable` is a self-contained folder that runs PhasePix on **any Windows 10/11 x64 PC without Docker, Python, Git, CUDA or administrator rights** — yet it still receives automatic code updates from GitHub on every launch.
+
+### 1. Build the folder once (on one Windows PC)
+
+```bat
+build_portable_windows.bat
+```
+
+The builder produces `dist\PhasePix_Portable\` with:
+
+| Folder / file | What it is |
+| --- | --- |
+| `python\` | Portable **CPython 3.11.9** (`indygreg`/`astral-sh` `python-build-standalone`, `x86_64-pc-windows-msvc-shared-install_only`) extracted with the Windows built-in `tar`. Full standard library, headers and a working `pip`. |
+| `git\` | Portable **MinGit 2.47.0** (`cmd\git.exe`) — no Git installation on the target PC. |
+| `app\` | A clean `git clone` of this repository **including `.git`**, so the launcher can self-update. |
+| `app\models_cache\` | Pre-downloaded `sam_vit_b_01ec64.pth` and Cellpose weights (`cyto2` / Cellpose-4 `cpsam`), so colleagues do not wait on first run. |
+| `Icon.ico` | Copied from the repository root and used by the Desktop shortcut. |
+| `PhasePix_Start.bat` | The end-user launcher (copied from `portable\`). |
+| `Create_Desktop_Shortcut.bat` | Creates a Desktop `.lnk` pointing at the launcher, with `$Shortcut.IconLocation` set to `Icon.ico`. |
+| `PORTABLE_README.txt` | Plain-language instructions for colleagues. |
+
+Build steps executed by the script: download + extract portable Python → download + extract MinGit → `git clone` the repo → `pip install --upgrade pip setuptools wheel` → `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121` → `pip install --prefer-binary -r app\requirements.txt` → copy `Icon.ico` → pre-download AI checkpoints → install launchers. Expect **20–40 minutes and ~6 GB** of downloads; every step is idempotent, so re-running the builder resumes where it stopped.
+
+### 2. Hand it to colleagues
+
+Copy the whole `dist\PhasePix_Portable` folder (USB stick, network share, zip). On the target PC:
+
+1. Double-click **`PhasePix_Start.bat`** → the dashboard opens at `http://localhost:8501`.
+2. Optional: run **`Create_Desktop_Shortcut.bat`** once to get a PhasePix icon on the Desktop.
+
+### 3. Automatic updates on every launch
+
+`PhasePix_Start.bat` performs a **smart, non-destructive** update in three numbered phases:
+
+* **`[1/3] Checking for PhasePix updates...`** — backs up `parameter_presets.json` and `light_calibration_presets.json` to `.tmp` files, runs `git fetch --all`, then `git reset --hard origin/main` (falling back to `origin/master`) and restores the user's preset files. Lab recipes are therefore never lost. Without a network connection it prints `[INFO] Offline mode - starting current local version.` and continues with the local copy.
+* **`[2/3] Verifying Python dependencies...`** — re-runs `pip install -r requirements.txt` only when `.portable_req_stamp` shows that `requirements.txt` changed in the fetched update.
+* **`[3/3] Starting PhasePix...`** — launches `python -m streamlit run app.py --server.port=8501 --browser.gatherUsageStats=false`.
+
+The launcher also exports the portable environment: `PATH` (bundled Python + Git first), `CELLPOSE_LOCAL_MODELS_PATH` and `TORCH_HOME` (both pointing at `app\models_cache`, so **no weights are ever written to `C:\Users\<user>\.cellpose`**), `STREAMLIT_SERVER_HEADLESS=false` and `STREAMLIT_BROWSER_GATHER_USAGE_STATS=false`.
+
+> `cellpose_model.py` resolves the checkpoint folder from `CELLPOSE_LOCAL_MODELS_PATH` (then `PHASEPIX_MODELS_DIR`, then `models_cache/`) and exports it before importing Cellpose, whose `MODEL_DIR` is only read at import time. The same folder holds the SAM checkpoints (`ensure_sam_checkpoint`) and the Cellpose weights (`ensure_cellpose_weights`) — the builder calls both to pre-seed the cache.
+
+`dist/` is git-ignored and Docker-ignored; only the builder and the `portable/` templates are committed.
 
 ---
 
