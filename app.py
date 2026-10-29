@@ -328,9 +328,11 @@ def load_parameter_presets() -> dict:
     """
     Load Section 4 / Section 5 widget recipes from ``parameter_presets.json``.
 
-    Built-in laboratory presets are always available; user-saved entries override
-    their same-named built-in counterparts. Corrupted files fall back silently to
-    the built-ins so the sidebar never breaks during a lab session.
+    A modality that is stored in ``parameter_presets.json`` is authoritative: the
+    file holds the exact dictionary of active recipes, so presets deleted from the
+    sidebar stay deleted across restarts. Modalities that were never written (or a
+    missing / corrupted file) fall back to the built-in laboratory recipes.
+    :func:`restore_builtin_parameter_presets` re-seeds the built-ins on demand.
 
     Returns:
         dict: ``{"SEM": {name: {widget_key: value}}, "Light": {...}}``.
@@ -345,14 +347,46 @@ def load_parameter_presets() -> dict:
                 stored = json.load(fh)
             if isinstance(stored, dict):
                 for modality in ("SEM", "Light"):
-                    recipes = stored.get(modality, {})
+                    if modality not in stored:
+                        # Never written yet: keep the built-in laboratory recipes.
+                        continue
+                    recipes = stored.get(modality)
                     if not isinstance(recipes, dict):
                         continue
-                    for name, values in recipes.items():
-                        if isinstance(values, dict):
-                            presets[modality][str(name)] = dict(values)
+                    # The stored dictionary replaces the built-ins verbatim so that
+                    # user deletions survive the next app start.
+                    presets[modality] = {
+                        str(name): dict(values)
+                        for name, values in recipes.items()
+                        if isinstance(values, dict)
+                    }
     except (OSError, json.JSONDecodeError):
         pass
+    return presets
+
+
+def restore_builtin_parameter_presets(modality: str) -> dict:
+    """
+    Re-seed the built-in laboratory recipes for one modality.
+
+    Custom presets saved by the operator are preserved; only missing built-in
+    recipes are re-added (e.g. after they were deleted from the sidebar).
+
+    Args:
+        modality: ``"SEM"`` or ``"Light"``.
+
+    Returns:
+        dict: The updated ``modality -> {preset_name: {widget_key: value}}`` map,
+        ready to be handed to :func:`save_parameter_presets`.
+    """
+    presets = load_parameter_presets()
+    builtin_recipes = default_parameter_presets().get(modality, {})
+    # Built-ins first (canonical order), then any user-only presets.
+    merged = {name: dict(values) for name, values in builtin_recipes.items()}
+    for name, values in presets.get(modality, {}).items():
+        if name not in merged:
+            merged[name] = dict(values)
+    presets[modality] = merged
     return presets
 
 
@@ -3149,10 +3183,16 @@ with st.sidebar:
     _preset_loaded_flash = st.session_state.pop("_preset_loaded_flash", None)
     if _preset_loaded_flash:
         st.toast(f"📂 Loaded preset: {_preset_loaded_flash}", icon="📂")
+    _preset_deleted_flash = st.session_state.pop("_preset_deleted_flash", None)
+    if _preset_deleted_flash:
+        st.toast(f"🗑️ Deleted preset: {_preset_deleted_flash}", icon="🗑️")
+    _preset_restored_flash = st.session_state.pop("_preset_restored_flash", None)
+    if _preset_restored_flash:
+        st.toast(f"🔄 Restored built-in presets: {_preset_restored_flash}", icon="🔄")
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.28 (v1.5 - High-Speed Engine & Stateless Advisor)**")
+    st.caption("📦 **Build: 2026.10.29 (v1.6 - Cropped Export & Preset Manager)**")
 
     # Hardware Acceleration Status
     device, is_gpu = get_device()
@@ -4160,11 +4200,27 @@ with st.sidebar:
                 key=f"parameter_preset_select_{_preset_modality.lower()}",
                 help="Built-in laboratory recipes plus every preset you saved yourself.",
             )
-            if st.button(
-                "📂 Load Preset",
-                use_container_width=True,
-                key=f"load_parameter_preset_{_preset_modality.lower()}",
-            ):
+            _preset_select_key = f"parameter_preset_select_{_preset_modality.lower()}"
+            # Load / delete side-by-side so stale recipes can be pruned from the UI
+            p_col1, p_col2 = st.columns(2)
+            with p_col1:
+                _load_preset_clicked = st.button(
+                    "📂 Load Preset",
+                    use_container_width=True,
+                    key=f"load_parameter_preset_{_preset_modality.lower()}",
+                )
+            with p_col2:
+                _delete_preset_clicked = st.button(
+                    "🗑️ Delete Preset",
+                    use_container_width=True,
+                    key=f"delete_parameter_preset_{_preset_modality.lower()}",
+                    help=(
+                        f"Permanently removes '{_selected_preset_name}' from "
+                        f"`{PARAMETER_PRESETS_FILE}`."
+                    ),
+                )
+
+            if _load_preset_clicked:
                 st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
                     _preset_modality, _live_parameter_values
                 )
@@ -4174,8 +4230,28 @@ with st.sidebar:
                 st.session_state.pop("autotune_proposal", None)
                 st.session_state["_preset_loaded_flash"] = _selected_preset_name
                 st.rerun()
+            elif _delete_preset_clicked:
+                _parameter_presets[_preset_modality] = {
+                    _name: _values
+                    for _name, _values in _modality_presets.items()
+                    if _name != _selected_preset_name
+                }
+                try:
+                    save_parameter_presets(_parameter_presets)
+                    # Discard the stale widget value so the selectbox re-seeds from
+                    # the remaining recipes instead of a deleted entry.
+                    if st.session_state.get(_preset_select_key) == _selected_preset_name:
+                        del st.session_state[_preset_select_key]
+                    st.session_state["_preset_deleted_flash"] = _selected_preset_name
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"Could not write `{PARAMETER_PRESETS_FILE}`: {exc}")
         else:
-            st.info("No presets stored for this modality yet.")
+            st.info(
+                "No presets stored for this modality yet — the file now holds the exact "
+                "recipe list, so deleted presets stay deleted. Use "
+                "**🔄 Restore Built-in Presets** below to bring the built-ins back."
+            )
 
         _new_preset_name = st.text_input(
             "New preset name",
@@ -4204,6 +4280,22 @@ with st.sidebar:
                     st.rerun()
                 except OSError as exc:
                     st.error(f"Could not write `{PARAMETER_PRESETS_FILE}`: {exc}")
+
+        if st.button(
+            "🔄 Restore Built-in Presets",
+            use_container_width=True,
+            key=f"restore_parameter_presets_{_preset_modality.lower()}",
+            help=(
+                "Re-adds the built-in laboratory recipes for this modality. Custom "
+                "presets you saved are kept."
+            ),
+        ):
+            try:
+                save_parameter_presets(restore_builtin_parameter_presets(_preset_modality))
+                st.session_state["_preset_restored_flash"] = _preset_modality
+                st.rerun()
+            except OSError as exc:
+                st.error(f"Could not write `{PARAMETER_PRESETS_FILE}`: {exc}")
 
         st.caption(
             "ℹ️ Presets capture the full Section 4 & 5 recipe so a lab protocol can be "
@@ -5514,16 +5606,49 @@ else:
                     + (f" ({effective_footer}px footer excluded)" if effective_footer > 0 else ""),
                     **_FULL_WIDTH_IMAGE_KWARGS,
                 )
-                # Export segmented overlay button directly beneath
+                # Export segmented overlay button(s) directly beneath
                 buf_overlay = io.BytesIO()
                 Image.fromarray(overlay).save(buf_overlay, format="PNG", compress_level=1)
-                st.download_button(
-                    label="📥 Download Segmented Overlay (PNG)",
-                    data=buf_overlay.getvalue(),
-                    file_name=f"segmented_overlay_{clean_stem}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
+                if effective_footer > 0:
+                    # Publication workflow: full micrograph (dimmed databar) next to a
+                    # footer-free crop, which keeps a burned-in scale bar intact.
+                    dl_c1, dl_c2 = st.columns(2)
+                    with dl_c1:
+                        st.download_button(
+                            label="📥 Download Full Overlay (PNG)",
+                            data=buf_overlay.getvalue(),
+                            file_name=f"segmented_overlay_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            help=(
+                                "Complete micrograph including the dimmed SEM databar "
+                                f"({effective_footer}px) for traceability."
+                            ),
+                        )
+                    with dl_c2:
+                        buf_overlay_crop = io.BytesIO()
+                        Image.fromarray(overlay[:-effective_footer, :]).save(
+                            buf_overlay_crop, format="PNG", compress_level=1
+                        )
+                        st.download_button(
+                            label="✂️ Download Cropped Overlay — No Footer (PNG)",
+                            data=buf_overlay_crop.getvalue(),
+                            file_name=f"segmented_overlay_cropped_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            help=(
+                                "Publication-ready micrograph with the bottom SEM databar "
+                                "cropped out (preserves burned-in scale bar if enabled)."
+                            ),
+                        )
+                else:
+                    st.download_button(
+                        label="📥 Download Segmented Overlay (PNG)",
+                        data=buf_overlay.getvalue(),
+                        file_name=f"segmented_overlay_{clean_stem}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
             else:
                 st.image(
                     base_display_img,
@@ -5534,13 +5659,44 @@ else:
                 # Export raw micrograph (with the burned-in scale bar when enabled)
                 buf_raw = io.BytesIO()
                 Image.fromarray(base_display_img).save(buf_raw, format="PNG", compress_level=1)
-                st.download_button(
-                    label="📥 Download Raw Micrograph (PNG)",
-                    data=buf_raw.getvalue(),
-                    file_name=f"raw_micrograph_{clean_stem}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
+                if effective_footer > 0:
+                    dl_r1, dl_r2 = st.columns(2)
+                    with dl_r1:
+                        st.download_button(
+                            label="📥 Download Full Raw Micrograph (PNG)",
+                            data=buf_raw.getvalue(),
+                            file_name=f"raw_micrograph_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            help=(
+                                "Complete micrograph including the dimmed SEM databar "
+                                f"({effective_footer}px) for traceability."
+                            ),
+                        )
+                    with dl_r2:
+                        buf_raw_crop = io.BytesIO()
+                        Image.fromarray(base_display_img[:-effective_footer, :]).save(
+                            buf_raw_crop, format="PNG", compress_level=1
+                        )
+                        st.download_button(
+                            label="✂️ Download Cropped Raw — No Footer (PNG)",
+                            data=buf_raw_crop.getvalue(),
+                            file_name=f"raw_micrograph_cropped_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            help=(
+                                "Publication-ready raw micrograph with the bottom SEM "
+                                "databar cropped out (preserves burned-in scale bar if enabled)."
+                            ),
+                        )
+                else:
+                    st.download_button(
+                        label="📥 Download Raw Micrograph (PNG)",
+                        data=buf_raw.getvalue(),
+                        file_name=f"raw_micrograph_{clean_stem}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
 
         # Column 2: Filtered Metrics Table & Interactive Exclusion
         with col_df:
@@ -7330,6 +7486,24 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 mime="image/png",
                 use_container_width=True,
             )
+
+            # Publication-ready export with the SEM databar cropped away
+            if effective_footer > 0:
+                buf_overlay_tab_crop = io.BytesIO()
+                Image.fromarray(overlay[:-effective_footer, :]).save(
+                    buf_overlay_tab_crop, format="PNG", compress_level=1
+                )
+                st.download_button(
+                    label="✂️ Export Cropped Overlay (No Footer, PNG)",
+                    data=buf_overlay_tab_crop.getvalue(),
+                    file_name=f"segmented_overlay_cropped_{clean_stem}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    help=(
+                        "Publication-ready micrograph with the bottom SEM databar "
+                        "cropped out (preserves burned-in scale bar if enabled)."
+                    ),
+                )
 
             # Export for Cellpose retraining
             training_zip_export = prepare_cellpose_training_package(
