@@ -39,6 +39,17 @@ pytesseract
 # ---------------------------------------------------------------------------
 # Deep learning segmentation (Cellpose + Segment Anything)
 # ---------------------------------------------------------------------------
+# torch / torchvision are intentionally LEFT UNPINNED (no version constraints).
+#
+# The Windows portable builder (build_portable_windows.bat) installs the CUDA
+# 12.1 wheels BEFORE this file is processed:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# An unconstrained requirement is already satisfied by the installed build
+# (e.g. 2.5.1+cu121), so `pip install -r requirements.txt` keeps the CUDA
+# wheels instead of pulling the CPU-only wheels from PyPI. Never add a bound
+# here (e.g. `torch>=2.6`): any constraint the +cu121 build cannot satisfy makes
+# pip swap in CPU wheels and GPU acceleration silently disappears. The builder
+# re-verifies torch.version.cuda after this step and repairs it if needed.
 torch
 torchvision
 cellpose

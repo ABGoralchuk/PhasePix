@@ -313,26 +313,92 @@ def smooth_internal_crystals(image: np.ndarray, strength: int = 2) -> np.ndarray
     return smooth
 
 
+def get_cuda_device_name() -> Optional[str]:
+    """
+    Return the marketing name of CUDA device 0 (e.g. ``NVIDIA GeForce RTX 4060``).
+
+    Returns:
+        Optional[str]: The GPU model name, or None when CUDA is not available.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return str(torch.cuda.get_device_name(0))
+    except Exception as exc:
+        logger.warning("Could not read the CUDA device name: %s", exc)
+        return None
+
+
 def get_device() -> Tuple[torch.device, bool]:
     """
-    Detect and return the optimal compute device.
-    Prioritizes Apple Silicon MPS (Metal Performance Shaders), then CUDA, and falls back to CPU.
+    Detect and return the fastest compute device available at startup.
+
+    Priority order:
+        1. NVIDIA CUDA (``torch.cuda.is_available()``) - fastest backend.
+        2. Apple Silicon MPS (Metal Performance Shaders).
+        3. CPU fallback - every feature keeps working, just slower.
+
+    The result is consumed by :func:`get_cellpose_model` (``gpu=`` / ``device=``)
+    and :func:`get_sam_predictor`, so the backend is selected without any user
+    configuration.
 
     Returns:
         Tuple[torch.device, bool]: (device, is_gpu_active)
     """
     try:
+        if torch.cuda.is_available():
+            logger.info(
+                "NVIDIA CUDA detected and enabled (%s).", get_cuda_device_name() or "unknown GPU"
+            )
+            return torch.device("cuda"), True
         if torch.backends.mps.is_available() and torch.backends.mps.is_built():
             logger.info("Apple Silicon MPS (Metal Performance Shaders) detected and enabled.")
             return torch.device("mps"), True
-        if torch.cuda.is_available():
-            logger.info("NVIDIA CUDA detected and enabled.")
-            return torch.device("cuda"), True
     except Exception as exc:
         logger.warning("Hardware acceleration probe encountered an issue: %s. Defaulting to CPU.", exc)
 
     logger.info("Using CPU backend.")
     return torch.device("cpu"), False
+
+
+def detect_hardware() -> Tuple[torch.device, bool, str]:
+    """
+    Detect the active backend and return a short human-readable accelerator label.
+
+    Used by the sidebar badge so the exact hardware in use is always visible:
+        * CUDA   -> the GPU model reported by ``torch.cuda.get_device_name(0)``
+        * MPS    -> ``Apple Metal (MPS)``
+        * CPU    -> ``CPU``
+
+    Returns:
+        Tuple[torch.device, bool, str]: (device, is_gpu_active, accelerator_name)
+    """
+    device, is_gpu = get_device()
+    if device.type == "cuda":
+        return device, True, get_cuda_device_name() or "NVIDIA GPU"
+    if device.type == "mps":
+        return device, True, "Apple Metal (MPS)"
+    return device, False, "CPU"
+
+
+def get_sam_device() -> torch.device:
+    """
+    Return the device used by Segment Anything (SAM) predictors.
+
+    SAM mirrors the Cellpose policy for NVIDIA CUDA, but stays on CPU on Apple
+    Silicon: the SAM mask decoder mixes ``float64`` coordinates with ``float32``
+    tensors, which raises on the Metal (MPS) backend, so interactive Smart Box
+    segmentation would silently stop working. CPU keeps SAM reliable there.
+
+    Returns:
+        torch.device: ``cuda`` when an NVIDIA GPU is present, otherwise ``cpu``.
+    """
+    device, is_gpu = get_device()
+    if is_gpu and device.type == "cuda":
+        return device
+    if device.type == "mps":
+        logger.info("SAM stays on CPU on Apple Silicon (MPS float64 decoder limitation).")
+    return torch.device("cpu")
 
 
 def _instantiate_cellpose_model(
@@ -1052,8 +1118,9 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
 
     The checkpoint is stored under ``get_models_cache_dir()/{filename}``; missing
     or truncated files are downloaded in 8 MB chunks into a ``.part`` file and
-    atomically moved into place (see :func:`ensure_sam_checkpoint`). SAM always
-    runs on CPU (safe default; avoids float64/MPS decoder issues on Apple Silicon).
+    atomically moved into place (see :func:`ensure_sam_checkpoint`). The device
+    follows :func:`get_sam_device`: CUDA when an NVIDIA GPU is present, CPU
+    otherwise (avoids the float64/MPS decoder issues on Apple Silicon).
 
     Args:
         sam_model_type: One of ``"vit_b"``, ``"vit_l"``, ``"vit_h"``.
@@ -1074,12 +1141,14 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
         if ckpt_path is None:
             return None
 
-        # On macOS Apple Silicon, the MPS decoder can hit float64 errors.
-        # Running SAM on CPU is the safe, reliable choice.
+        # CUDA is selected automatically when an NVIDIA GPU is present.
+        # Apple Silicon stays on CPU: the SAM mask decoder raises float64 /
+        # float32 dtype errors on the Metal (MPS) backend.
+        sam_device = get_sam_device()
         sam = sam_model_registry[sam_type](checkpoint=str(ckpt_path))
-        sam.to(device="cpu")
+        sam.to(device=sam_device)
         predictor = SamPredictor(sam)
-        logger.info("SAM SamPredictor (%s) initialized on CPU.", sam_type)
+        logger.info("SAM SamPredictor (%s) initialized on %s.", sam_type, sam_device.type)
         return predictor
     except Exception as exc:
         logger.warning("Failed to initialize SAM predictor (%s): %s", sam_type, exc)

@@ -25,7 +25,7 @@ import seaborn as sns
 from scipy.ndimage import find_objects
 
 # Internal application modules
-from cellpose_model import get_cellpose_model, run_inference, get_device, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, smooth_internal_crystals
+from cellpose_model import get_cellpose_model, run_inference, get_device, detect_hardware, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, smooth_internal_crystals
 from analyzer import (
     extract_metrics,
     calculate_granulometry_metrics,
@@ -2563,10 +2563,10 @@ def encode_image_data_url(
 
     A high-quality JPEG keeps the HTML component payload small (a 1600 px
     micrograph lands well below 1 MB), so the browser-side caliper appears
-    instantly - even inside Windows Docker, where a multi-megabyte base64 PNG
-    used to stall the component. The returned bitmap dimensions are used by the
-    browser-side caliper to convert dragged (CSS) distances back into *native*
-    micrograph pixels, so downscaling never changes the physical measurement.
+    instantly, whereas a multi-megabyte base64 PNG used to stall the component.
+    The returned bitmap dimensions are used by the browser-side caliper to
+    convert dragged (CSS) distances back into *native* micrograph pixels, so
+    downscaling never changes the physical measurement.
 
     Args:
         image: Grayscale (H, W) or colour (H, W, 3/4) uint8 array.
@@ -3192,27 +3192,29 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.29 (v1.6 - Cropped Export & Preset Manager)**")
+    st.caption("📦 **Build: 2026.10.30 (v1.7 - Auto-Hardware Acceleration & Portable Release)**")
 
-    # Hardware Acceleration Status
-    device, is_gpu = get_device()
-    if is_gpu and device.type == "mps":
-        st.success("⚡ Hardware Acceleration: **Apple Silicon (MPS)** active", icon="🍏")
-    elif is_gpu:
-        try:
-            device_name = torch.cuda.get_device_name(0)
-            st.success(f"⚡ Hardware Acceleration: **CUDA ({device_name})** active", icon="🚀")
-        except Exception:
-            st.success(f"⚡ Hardware Acceleration: **CUDA ({device})** active", icon="🚀")
+    # Hardware Acceleration Status — the fastest backend is picked automatically at
+    # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
+    device, is_gpu, accelerator_name = detect_hardware()
+    if device.type == "cuda":
+        st.success(f"🚀 Hardware Acceleration: CUDA ({accelerator_name})")
+    elif device.type == "mps":
+        st.success("🚀 Hardware Acceleration: Apple Metal (MPS)")
     else:
-        st.info("💻 Hardware Backend: **CPU**", icon="⚙️")
+        st.info("🖥️ Hardware Backend: CPU Mode")
         with st.expander("ℹ️ GPU Acceleration Guide", expanded=False):
             st.markdown(
-                "PhasePix is currently running on **CPU**.\n\n"
-                "**To enable NVIDIA GPU acceleration:**\n"
-                "1. **Host Drivers:** Ensure NVIDIA Game Ready or Studio Drivers are installed on Windows.\n"
-                "2. **Docker Desktop:** Open *Settings* → *General* → ensure **'Use the WSL 2 based engine'** is checked.\n"
-                "3. **Native Alternative:** You can also run natively on Windows via `phasepix.bat` (Python directly utilizes CUDA).\n"
+                "**PhasePix is currently running in CPU mode.**\n\n"
+                "Hardware acceleration is detected and enabled **automatically** at startup:\n"
+                "* **NVIDIA GPU (Windows/Linux):** Automatically activates CUDA acceleration "
+                "if a compatible NVIDIA GPU and up-to-date NVIDIA Driver (531+) are installed "
+                "on this PC.\n"
+                "* **Apple Silicon (macOS):** Automatically activates Apple Metal (MPS) "
+                "acceleration.\n"
+                "* **Standard PC (Intel / AMD Graphics):** Runs safely in CPU mode. All features "
+                "work identically, though neural network segmentation takes slightly longer per "
+                "image.\n"
             )
 
     st.divider()
@@ -7427,7 +7429,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Brightfield Inversion": (
                 bool(invert_brightfield) if is_light_mode else "N/A (SEM Mode)"
             ),
-            "Hardware Accelerator": f"{device} (GPU: {is_gpu})",
+            "Hardware Accelerator": f"{device} ({accelerator_name}, GPU: {is_gpu})",
             "Total Segmented Objects (Raw)": len(raw_df),
             "Retained Objects (After Filters)": total_objects,
             "Air Bubbles Count": air_count,
