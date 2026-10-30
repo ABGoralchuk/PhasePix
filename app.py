@@ -13,7 +13,16 @@ import json
 import math
 import re
 import time
-import cv2
+
+# ---------------- CPU THREADING HOTFIX ----------------
+# Windows + MKL/OpenMP thread contention freezes the CPU backend for 10+ minutes
+# on tiny images. The cap must be exported before numpy (MKL) and torch are
+# imported, so it sits above every third-party import in this entry point.
+from cpu_thread_guard import apply_cpu_thread_env  # noqa: E402
+
+CPU_THREADS = apply_cpu_thread_env()
+
+import cv2  # noqa: E402  (must follow the CPU thread cap)
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -3192,7 +3201,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.30 (v1.7 - Auto-Hardware Acceleration & Portable Release)**")
+    st.caption("📦 **Build: 2026.10.30 (v1.7.1 - CPU Threading Hotfix)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.

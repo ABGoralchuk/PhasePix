@@ -4,7 +4,6 @@ Provides model caching and inference utilities for PhasePix.
 """
 
 from typing import Optional, Tuple
-import cv2
 import logging
 import math
 import os
@@ -12,10 +11,24 @@ import shutil
 import ssl
 import urllib.request
 from pathlib import Path
-import numpy as np
-import scipy.ndimage as ndi
-import torch
-import streamlit as st
+
+# ---------------- CPU THREADING HOTFIX ----------------
+# PyTorch's CPU backend can deadlock for 10+ minutes on tiny images (e.g. 700x700)
+# on Windows, because MKL / OpenMP oversubscribe the logical cores. The safe cap
+# has to be exported *before* numpy (MKL) and torch are imported -- those runtimes
+# read OMP_NUM_THREADS / MKL_NUM_THREADS exactly once, at initialisation.
+from cpu_thread_guard import apply_cpu_thread_env, apply_torch_thread_cap  # noqa: E402
+
+CPU_THREADS = apply_cpu_thread_env()
+
+import cv2  # noqa: E402  (must follow the CPU thread cap)
+import numpy as np  # noqa: E402  (must follow the CPU thread cap)
+import scipy.ndimage as ndi  # noqa: E402
+import torch  # noqa: E402  (must follow the CPU thread cap)
+import streamlit as st  # noqa: E402
+
+# PyTorch sizes its intra-op pool through its own API, not through OMP_*.
+apply_torch_thread_cap(CPU_THREADS)
 
 # Setup module logger
 logger = logging.getLogger(__name__)
