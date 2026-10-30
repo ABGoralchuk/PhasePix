@@ -14,12 +14,19 @@ from pathlib import Path
 
 # ---------------- CPU THREADING HOTFIX ----------------
 # PyTorch's CPU backend can deadlock for 10+ minutes on tiny images (e.g. 700x700)
-# on Windows, because MKL / OpenMP oversubscribe the logical cores. The safe cap
-# has to be exported *before* numpy (MKL) and torch are imported -- those runtimes
-# read OMP_NUM_THREADS / MKL_NUM_THREADS exactly once, at initialisation.
-from cpu_thread_guard import apply_cpu_thread_env, apply_torch_thread_cap  # noqa: E402
+# on Windows, because MKL / OpenMP / OpenCV oversubscribe the logical cores. The
+# safe cap has to be exported *before* numpy (MKL) and torch are imported -- those
+# runtimes read OMP_NUM_THREADS / MKL_NUM_THREADS exactly once, at initialisation.
+from cpu_thread_guard import (  # noqa: E402
+    apply_cpu_thread_env,
+    apply_opencv_thread_limits,
+    apply_torch_thread_cap,
+)
 
 CPU_THREADS = apply_cpu_thread_env()
+# OpenCV gets no threads of its own: the PyTorch pool must own the cores while
+# Cellpose resizes images and runs the flow dynamics (v1.7.2 hotfix).
+OPENCV_THREADS = apply_opencv_thread_limits()
 
 import cv2  # noqa: E402  (must follow the CPU thread cap)
 import numpy as np  # noqa: E402  (must follow the CPU thread cap)
