@@ -12,29 +12,38 @@ import ssl
 import urllib.request
 from pathlib import Path
 
-# ---------------- CPU THREADING HOTFIX ----------------
+# ---------------- CPU THREADING GUARD (v1.7.3) ----------------
 # PyTorch's CPU backend can deadlock for 10+ minutes on tiny images (e.g. 700x700)
-# on Windows, because MKL / OpenMP / OpenCV oversubscribe the logical cores. The
-# safe cap has to be exported *before* numpy (MKL) and torch are imported -- those
-# runtimes read OMP_NUM_THREADS / MKL_NUM_THREADS exactly once, at initialisation.
+# on Windows, because MKL / OpenMP / OpenCV oversubscribe the logical cores. That
+# guard now applies ONLY to the Windows CPU-only fallback: on macOS (darwin),
+# Linux and CUDA-enabled Windows machines these helpers are complete no-ops, so
+# native multi-core (and multi-threaded OpenCV) performance is preserved.
+# On the guarded path the safe cap has to be exported *before* numpy (MKL) and
+# torch are imported -- those runtimes read OMP_NUM_THREADS / MKL_NUM_THREADS
+# exactly once, at initialisation.
 from cpu_thread_guard import (  # noqa: E402
     apply_cpu_thread_env,
     apply_opencv_thread_limits,
     apply_torch_thread_cap,
 )
 
+# No-op on macOS / CUDA machines (returns the native logical CPU count there).
 CPU_THREADS = apply_cpu_thread_env()
-# OpenCV gets no threads of its own: the PyTorch pool must own the cores while
-# Cellpose resizes images and runs the flow dynamics (v1.7.2 hotfix).
+# OpenCV is serialised only on the Windows CPU fallback; everywhere else it keeps
+# its full multi-threaded pool while Cellpose resizes images and runs the flow
+# dynamics (v1.7.3 restored native speed).
 OPENCV_THREADS = apply_opencv_thread_limits()
 
-import cv2  # noqa: E402  (must follow the CPU thread cap)
-import numpy as np  # noqa: E402  (must follow the CPU thread cap)
+import cv2  # noqa: E402  (must follow the threading guard)
+import numpy as np  # noqa: E402  (must follow the threading guard)
 import scipy.ndimage as ndi  # noqa: E402
-import torch  # noqa: E402  (must follow the CPU thread cap)
+import torch  # noqa: E402  (must follow the threading guard)
 import streamlit as st  # noqa: E402
 
 # PyTorch sizes its intra-op pool through its own API, not through OMP_*.
+# Called after ``import torch`` so the CUDA decision uses the authoritative
+# torch.cuda.is_available(): no-op on macOS/Linux, os.cpu_count() on Windows+CUDA
+# and a 4-thread cap only for the Windows CPU-only fallback.
 apply_torch_thread_cap(CPU_THREADS)
 
 # Setup module logger

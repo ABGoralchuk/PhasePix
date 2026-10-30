@@ -1,24 +1,35 @@
 """
-CPU threading guard for PhasePix.
+CPU threading guard for PhasePix (build v1.7.3 - native speed restoration).
 
-PyTorch on Windows can deadlock for 10+ minutes on tiny images (e.g. 700x700)
-when the CPU backend falls back and the MKL / OpenMP thread pools oversubscribe
-every logical core. The fix is to cap the thread count *before* PyTorch and the
-math runtimes allocate their worker pools:
+History
+-------
+PyTorch on **Windows CPU-only** machines can deadlock for 10+ minutes on tiny
+images (e.g. 700x700) when the CPU backend falls back and the MKL / OpenMP
+thread pools oversubscribe every logical core. v1.7.1 / v1.7.2 fixed that by
+capping every thread pool in the process *unconditionally* -- which also slowed
+macOS (Apple Silicon / MPS) and NVIDIA CUDA machines down, because
+``cv2.setNumThreads(0)`` forces ``bilateralFilter`` / ``medianBlur`` /
+``findContours`` / morphology into single-threaded execution and a 4-thread
+MKL/NumPy cap throttles the CPU post-processing of Cellpose flow dynamics.
 
-    1. ``apply_cpu_thread_env()`` writes ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS``
-       (plus the OpenBLAS / NumExpr equivalents) and sets
-       ``KMP_DUPLICATE_LIB_OK=TRUE``. OpenMP and MKL read these once, when their
-       runtime is initialised, so this MUST run before ``numpy`` (MKL) and
-       ``torch`` are imported.
-    2. ``apply_opencv_thread_limits()`` forces ``cv2.setNumThreads(0)`` so OpenCV
-       never spawns its own TBB/OpenMP pool that competes with the PyTorch pool
-       while resizing images and computing Cellpose flow dynamics.
-    3. ``apply_torch_thread_cap()`` calls ``torch.set_num_threads()`` right after
-       ``torch`` is imported, because the intra-op pool is created by PyTorch
-       itself and ignores the environment variables set by a later import.
+v1.7.3 makes the guard platform- and hardware-aware. The helpers below are
+complete no-ops unless the Windows CPU fallback is really in play:
 
-Why every step is needed on Windows:
+    * ``sys.platform != "win32"`` (macOS ``darwin``, Linux): nothing is touched.
+      No ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` / ``OPENBLAS_NUM_THREADS`` /
+      ``NUMEXPR_NUM_THREADS`` exports, no ``cv2.setNumThreads(0)`` call and no
+      ``torch.set_num_threads`` cap -> native full-speed threading.
+    * ``sys.platform == "win32"`` **with** ``torch.cuda.is_available()``: the
+      NVIDIA GPU owns the heavy work, so the guard stays off as well. OpenCV is
+      reset to its system default pool (``cv2.setNumThreads(-1)``) and PyTorch
+      gets ``os.cpu_count()`` intra-op threads.
+    * ``sys.platform == "win32"`` **without** CUDA (the CPU-only fallback): the
+      strict v1.7.2 guard runs -- 4 threads exported to OMP / MKL / OpenBLAS /
+      NumExpr, ``cv2.setNumThreads(0)`` and ``torch.set_num_threads(4)``.
+    * ``PHASEPIX_FORCE_THREAD_CAP=1`` forces the strict guard on any platform and
+      backend (diagnostic escape hatch for an oversubscribed macOS / Linux box).
+
+Why the Windows CPU guard needs every step:
 
     * ``KMP_DUPLICATE_LIB_OK=TRUE`` stops the Intel OpenMP (``libiomp5md.dll``)
       vs. LLVM OpenMP (``libomp.dll``) conflict that ships with PyTorch + MKL +
@@ -35,6 +46,9 @@ the user (or the portable launcher) already exported.
 from typing import Optional
 import logging
 import os
+import shutil
+import subprocess
+import sys
 
 # Setup module logger
 logger = logging.getLogger(__name__)
@@ -42,16 +56,34 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 
-# Safe ceiling: 4 threads keeps MKL/OpenMP well below the oversubscription point
-# on typical Windows office machines while still beating single-threaded Cellpose.
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Strict ceiling used ONLY by the Windows CPU-only fallback: 4 threads keeps
+# MKL/OpenMP well below the oversubscription point on typical Windows office
+# machines while still beating single-threaded Cellpose.
 DEFAULT_CPU_THREAD_CAP = 4
+
+# Thread count assumed when ``os.cpu_count()`` cannot report one (native mode).
+NATIVE_THREADS_FALLBACK = 8
+
+# The platform string Python reports on Windows. Every other value (``darwin``
+# for macOS, ``linux`` for Linux) runs without any thread cap.
+WINDOWS_PLATFORM = "win32"
 
 # Environment variables read at runtime-initialisation time by the BLAS / OpenMP
 # libraries bundled with numpy, SciPy and PyTorch.
 _THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
 
-# Optional PhasePix-specific override (e.g. ``PHASEPIX_CPU_THREADS=2``).
+# Optional PhasePix-specific override (e.g. ``PHASEPIX_CPU_THREADS=2``) that can
+# only *lower* the Windows CPU-fallback ceiling.
 _REQUESTED_THREADS_ENV = "PHASEPIX_CPU_THREADS"
+
+# Diagnostic escape hatch: ``PHASEPIX_FORCE_THREAD_CAP=1`` re-engages the strict
+# Windows CPU-fallback guard on any platform / backend combination.
+_FORCE_THREAD_CAP_ENV = "PHASEPIX_FORCE_THREAD_CAP"
+_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
 
 # Intel OpenMP duplicate-runtime escape hatch. PyTorch bundles ``libiomp5md.dll``
 # while MKL / scikit-learn / OpenCV can drag in a second OpenMP runtime; the two
@@ -59,20 +91,167 @@ _REQUESTED_THREADS_ENV = "PHASEPIX_CPU_THREADS"
 # (typically inside ``model.eval()``). "TRUE" makes them coexist.
 _KMP_DUPLICATE_LIB_OK_ENV = "KMP_DUPLICATE_LIB_OK"
 
-# OpenCV thread count. ``0`` disables OpenCV's internal thread pool entirely
-# (documented OpenCV semantics: "if threads == 0, OpenCV will disable threading
-# optimizations and run all its functions sequentially"), which is exactly what
-# we want while PyTorch owns the CPU cores for Cellpose dynamics.
+# OpenCV thread count used by the guarded (Windows CPU-only) path. ``0`` disables
+# OpenCV's internal thread pool entirely (documented OpenCV semantics: "if
+# threads == 0, OpenCV will disable threading optimizations and run all its
+# functions sequentially"), freeing the cores for the PyTorch pool.
 OPENCV_THREADS = 0
+
+# Any negative value restores OpenCV's system default pool (= CPU count). Used on
+# the native path so a stale guard call cannot leave OpenCV single-threaded.
+OPENCV_DEFAULT_THREADS = -1
+
+# Upper bound for the ``nvidia-smi`` probe performed before ``torch`` is imported.
+_NVIDIA_SMI_TIMEOUT_S = 5.0
 
 # Cached values so that logging happens once per process.
 _effective_cpu_threads: Optional[int] = None
 _effective_opencv_threads: Optional[int] = None
+_cuda_available_cache: Optional[bool] = None
+_logged_messages: set = set()
+
+
+# ---------------------------------------------------------------------------
+# Platform / hardware detection
+# ---------------------------------------------------------------------------
+
+
+def is_windows() -> bool:
+    """
+    Return ``True`` when PhasePix runs on Windows (``sys.platform == "win32"``).
+
+    Only Windows needs the CPU thread guard; macOS (``darwin``) and Linux keep
+    native full-speed threading.
+    """
+    return sys.platform == WINDOWS_PLATFORM
+
+
+def force_thread_cap_requested() -> bool:
+    """
+    Return ``True`` when the strict thread cap was explicitly requested.
+
+    ``PHASEPIX_FORCE_THREAD_CAP=1`` re-engages the v1.7.2 behaviour on macOS and
+    on CUDA machines (e.g. to diagnose an oversubscribed CI container or a
+    virtualised Linux host).
+    """
+    return os.environ.get(_FORCE_THREAD_CAP_ENV, "").strip().lower() in _TRUTHY_VALUES
+
+
+def native_thread_count() -> int:
+    """
+    Return the number of logical CPU cores Python can see (never below 1).
+
+    Used as the PyTorch intra-op pool size on the native (macOS / CUDA) path.
+    """
+    try:
+        count = os.cpu_count()
+    except Exception:  # pragma: no cover - defensive, os.cpu_count does not raise
+        count = None
+    if not count:
+        return NATIVE_THREADS_FALLBACK
+    return max(1, int(count))
+
+
+def _probe_nvidia_driver() -> bool:
+    """
+    Cheap NVIDIA-driver probe used while ``torch`` is still unimported.
+
+    The guard has to run before ``import torch`` (the ``OMP_*`` variables are
+    read once, at runtime initialisation), so ``torch.cuda.is_available()``
+    cannot be consulted at that point. Querying ``nvidia-smi -L`` -- which ships
+    with every NVIDIA driver -- answers the same question without dragging the
+    whole PyTorch runtime into memory at startup.
+
+    Returns:
+        bool: ``True`` when at least one NVIDIA GPU is visible to this process.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and visible.strip() in ("", "-1"):
+        # The GPU was deliberately hidden from this process.
+        return False
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return False
+    extra_kwargs = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):  # keep the portable build windowless
+        extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        completed = subprocess.run(
+            [executable, "-L"],
+            capture_output=True,
+            text=True,
+            timeout=_NVIDIA_SMI_TIMEOUT_S,
+            check=False,
+            **extra_kwargs,
+        )
+    except Exception as exc:  # pragma: no cover - driver layouts vary
+        logger.debug("nvidia-smi probe failed: %s", exc)
+        return False
+    output = (completed.stdout or "").strip()
+    return completed.returncode == 0 and "GPU" in output
+
+
+def detect_cuda_available() -> bool:
+    """
+    Return ``True`` when an NVIDIA CUDA GPU is usable by this process.
+
+    ``torch.cuda.is_available()`` is authoritative and is always preferred once
+    ``torch`` has been imported. Before that moment :func:`_probe_nvidia_driver`
+    is used instead, so the guard can decide without an early ``import torch``.
+    Never raises: an unreadable CUDA runtime simply means "no CUDA".
+    """
+    global _cuda_available_cache
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception as exc:  # pragma: no cover - defensive, torch builds vary
+            logger.warning("torch.cuda.is_available() failed (%s); assuming CPU-only.", exc)
+            return False
+    if _cuda_available_cache is None:
+        _cuda_available_cache = _probe_nvidia_driver()
+    return _cuda_available_cache
+
+
+def should_apply_thread_cap() -> bool:
+    """
+    Decide whether the strict Windows CPU-fallback guard must run.
+
+    Returns:
+        bool: ``True`` only on Windows *without* an NVIDIA CUDA GPU, or when the
+        strict guard was explicitly requested through
+        ``PHASEPIX_FORCE_THREAD_CAP=1``. macOS (``darwin``), Linux and
+        CUDA-enabled Windows machines always keep native full-speed threading.
+    """
+    if force_thread_cap_requested():
+        return True
+    if not is_windows():
+        return False
+    return not detect_cuda_available()
+
+
+def _log_once(key: str, message: str, *args) -> None:
+    """Emit ``message`` a single time per process for the given ``key``."""
+    if key in _logged_messages:
+        return
+    _logged_messages.add(key)
+    logger.info(message, *args)
+
+
+def _export_thread_env(cap: int) -> None:
+    """Write ``cap`` into the OMP / MKL / OpenBLAS / NumExpr variables."""
+    for name in _THREAD_ENV_VARS:
+        os.environ[name] = str(int(cap))
+
+
+# ---------------------------------------------------------------------------
+# Guard helpers
+# ---------------------------------------------------------------------------
 
 
 def resolve_cpu_thread_cap(default: int = DEFAULT_CPU_THREAD_CAP) -> int:
     """
-    Compute the CPU thread count PhasePix should use.
+    Compute the CPU thread count the Windows CPU fallback should use.
 
     A value that is already exported through ``PHASEPIX_CPU_THREADS`` or one of
     the OpenMP / MKL variables is respected when it is *smaller* than the safe
@@ -104,115 +283,164 @@ def resolve_cpu_thread_cap(default: int = DEFAULT_CPU_THREAD_CAP) -> int:
 
 def apply_cpu_thread_env(threads: Optional[int] = None) -> int:
     """
-    Export the capped thread count for OpenMP / MKL / OpenBLAS / NumExpr.
+    Export the thread count OpenMP / MKL / OpenBLAS / NumExpr should use.
 
-    Also sets ``KMP_DUPLICATE_LIB_OK=TRUE`` so the Intel OpenMP runtime shipped
-    with PyTorch can coexist with the second OpenMP runtime pulled in by MKL /
+    On macOS (``darwin``), Linux and CUDA-enabled Windows machines this is a
+    complete no-op: ``os.environ`` keeps its native configuration, so every
+    runtime starts with full multi-core speed (v1.7.3). Only the Windows
+    CPU-only fallback exports the strict cap -- together with
+    ``KMP_DUPLICATE_LIB_OK=TRUE``, which lets the Intel OpenMP runtime shipped
+    with PyTorch coexist with the second OpenMP runtime pulled in by MKL /
     OpenCV instead of hanging ``model.eval()``.
 
     Must be called before ``numpy`` and ``torch`` are imported: those runtimes
-    read the variables only once, at initialisation.
+    read the variables only once, at initialisation. That early position is why
+    the CUDA check falls back to an ``nvidia-smi`` probe while ``torch`` is not
+    imported yet (see :func:`detect_cuda_available`).
 
     Args:
-        threads: Explicit thread count; ``None`` derives the safe cap.
+        threads: Explicit ceiling for the guarded (Windows CPU-only) path;
+            ``None`` derives the safe cap through :func:`resolve_cpu_thread_cap`.
 
     Returns:
-        int: The thread count that was exported.
+        int: The effective CPU thread count -- the native logical CPU count when
+        the guard is inactive, otherwise the exported cap.
     """
     global _effective_cpu_threads
-    cap = resolve_cpu_thread_cap() if threads is None else max(1, int(threads))
-    for name in _THREAD_ENV_VARS:
-        os.environ[name] = str(cap)
-    # Allow duplicate Intel/LLVM OpenMP runtimes in one process (PyTorch + MKL +
-    # OpenCV on Windows); without this the clash can hard-hang the first parallel
-    # region inside ``model.eval()``.
-    os.environ[_KMP_DUPLICATE_LIB_OK_ENV] = "TRUE"
-    if _effective_cpu_threads != cap:
-        logger.info("CPU threading capped to %d thread(s) to prevent MKL/OpenMP deadlock.", cap)
+    if is_windows():
+        # Harmless on every Windows backend, essential on the CPU-only fallback
+        # (libiomp5md.dll vs. libomp.dll clash).
+        os.environ[_KMP_DUPLICATE_LIB_OK_ENV] = "TRUE"
+
+    if not should_apply_thread_cap():
+        native = native_thread_count()
+        _log_once(
+            "env_native",
+            "Native full-speed threading active (%s%s): OMP/MKL/OpenBLAS/NumExpr limits "
+            "left untouched - no CPU thread cap applied.",
+            sys.platform,
+            ", NVIDIA CUDA backend" if is_windows() and detect_cuda_available() else "",
+        )
+        _effective_cpu_threads = native
+        return native
+
+    cap = max(1, int(threads)) if threads is not None else resolve_cpu_thread_cap()
+    _export_thread_env(cap)
+    _log_once(
+        "env_guarded",
+        "Windows CPU-fallback thread guard engaged: OMP/MKL/OpenBLAS/NumExpr capped to %d "
+        "thread(s) to prevent the MKL/OpenMP deadlock.",
+        cap,
+    )
     _effective_cpu_threads = cap
     return cap
 
 
-def apply_opencv_thread_limits(threads: Optional[int] = None) -> Optional[int]:
+def _set_opencv_threads(requested: int) -> Optional[int]:
     """
-    Force OpenCV to run sequentially (``cv2.setNumThreads(0)`` by default).
-
-    OpenCV keeps its own parallel-for backend (TBB / OpenMP / pthreads). When it
-    runs concurrently with the PyTorch intra-op pool - resizing micrographs and
-    computing Cellpose flow dynamics at the same time - the two pools
-    oversubscribe the CPU and deadlock. Deferring all parallelism to PyTorch is
-    both deadlock-free and, on small SEM images, just as fast.
-
-    ``cv2.setNumThreads(0)`` disables OpenCV's threading optimisations, so
-    ``cv2.getNumThreads()`` afterwards reports ``1`` (sequential execution).
-    ``0`` is the only value that does this: OpenCV 4.x/5.x report the parallel
-    backend's own concurrency (e.g. the CPU count) for every *positive* value,
-    including ``1``, so asking for "one thread" would not actually serialise it.
-    If a build ignores ``0`` the guard logs a warning instead of pretending the
-    pool was capped.
-
-    Safe to call repeatedly and before or after ``import cv2``; failure is only
-    logged so a broken OpenCV build can never block startup.
+    Apply ``cv2.setNumThreads(requested)`` and report the resulting pool size.
 
     Args:
-        threads: Explicit value forwarded to ``cv2.setNumThreads``; ``0`` (the
-            default) disables OpenCV's thread pool.
+        requested: ``0`` disables OpenCV threading, a negative value restores the
+            system default pool, positive values request an explicit size.
 
     Returns:
-        Optional[int]: The pool size OpenCV reports after the call (``1`` when
-        threading is disabled), or ``None`` when the API is unavailable.
+        Optional[int]: The pool size OpenCV reports afterwards, or ``None`` when
+        the API is unavailable (failure is only logged, never raised).
     """
     global _effective_opencv_threads
-    requested = OPENCV_THREADS if threads is None else int(threads)
+    requested = int(requested)
     try:
         import cv2  # local import: keeps this module free of heavy dependencies
 
         cv2.setNumThreads(requested)
         applied = int(cv2.getNumThreads())
     except Exception as exc:  # pragma: no cover - defensive, OpenCV builds vary
-        logger.warning("Could not limit OpenCV threads: %s", exc)
+        logger.warning("Could not set OpenCV threads: %s", exc)
         return None
-    if requested <= 0 and applied > 1:
+    if requested == 0 and applied > 1:
         logger.warning(
             "OpenCV ignored setNumThreads(0) and still reports %d thread(s); "
             "the PyTorch/OpenCV pool clash may persist on this build.",
             applied,
         )
-    elif _effective_opencv_threads != applied:
-        if applied <= 1:
-            logger.info(
-                "OpenCV threading disabled (cv2.setNumThreads(%d) -> %d thread) to avoid a "
-                "PyTorch/OpenCV pool clash.",
-                requested,
-                applied,
-            )
-        else:
-            logger.info(
-                "OpenCV thread pool set to %d (requested %d) to avoid a PyTorch/OpenCV clash.",
-                applied,
-                requested,
-            )
+    elif requested >= 0 and _effective_opencv_threads != applied:
+        logger.info("OpenCV thread pool set to %d (requested %d).", applied, requested)
     _effective_opencv_threads = applied
     return applied
 
 
-def apply_torch_thread_cap(threads: Optional[int] = None) -> Optional[int]:
+def apply_opencv_thread_limits(threads: Optional[int] = None) -> Optional[int]:
     """
-    Cap PyTorch's intra-op thread pool via ``torch.set_num_threads``.
+    Keep OpenCV's own parallel-for pool at full speed unless the guard is needed.
 
-    Call this immediately after ``import torch`` - the environment variables set
-    by :func:`apply_cpu_thread_env` only cover the OpenMP/MKL runtimes, whereas
-    the PyTorch intra-op pool is configured through this API.
+    OpenCV runs its own TBB / OpenMP / pthreads pool. On the Windows CPU-only
+    fallback that pool oversubscribes the cores alongside the PyTorch intra-op
+    pool while Cellpose resizes micrographs and computes flow dynamics, so it is
+    disabled with ``cv2.setNumThreads(0)``.
+
+    On macOS, Linux and CUDA-enabled Windows machines (v1.7.3) the pool is left
+    alone, or restored to the system default, because serialising
+    ``bilateralFilter``, ``medianBlur``, ``findContours`` and the morphology
+    kernels is what made v1.7.1 / v1.7.2 several times slower there. Outside
+    Windows, ``cv2.setNumThreads`` is never called at all unless
+    ``PHASEPIX_FORCE_THREAD_CAP=1`` is set.
+
+    Safe to call repeatedly and before or after ``import cv2``; failure is only
+    logged so a broken OpenCV build can never block startup.
 
     Args:
-        threads: Explicit thread count; ``None`` reuses the exported safe cap.
+        threads: Explicit value forwarded to ``cv2.setNumThreads`` on the guarded
+            path; ``0`` (the default) disables OpenCV's thread pool.
+
+    Returns:
+        Optional[int]: The pool size OpenCV reports after the call, or ``None``
+        when OpenCV was not touched / the API is unavailable.
+    """
+    if not should_apply_thread_cap():
+        if is_windows():
+            # Windows + NVIDIA CUDA: restore the default pool so a stale guard
+            # call can never leave the image pipeline single-threaded.
+            applied = _set_opencv_threads(OPENCV_DEFAULT_THREADS)
+            _log_once(
+                "opencv_native_cuda",
+                "Native full-speed threading active (win32, NVIDIA CUDA backend): OpenCV "
+                "keeps its multi-threaded pool (%s thread(s)) - no cv2.setNumThreads(0) call.",
+                applied if applied is not None else native_thread_count(),
+            )
+            return applied
+        _log_once(
+            "opencv_native_platform",
+            "Native full-speed threading active (%s): OpenCV thread pool left untouched "
+            "(no cv2.setNumThreads call) - multi-threaded image processing preserved.",
+            sys.platform,
+        )
+        return None
+
+    requested = OPENCV_THREADS if threads is None else int(threads)
+    applied = _set_opencv_threads(requested)
+    if requested <= 0:
+        _log_once(
+            "opencv_guarded",
+            "Windows CPU-fallback thread guard engaged: OpenCV threading disabled "
+            "(cv2.setNumThreads(%d) -> %s thread) to avoid a PyTorch/OpenCV pool clash.",
+            requested,
+            applied if applied is not None else "unknown",
+        )
+    return applied
+
+
+def _set_torch_threads(threads: int) -> Optional[int]:
+    """
+    Apply ``torch.set_num_threads`` and report the resulting intra-op pool size.
+
+    Args:
+        threads: Requested intra-op thread count (clamped to at least 1).
 
     Returns:
         Optional[int]: The applied thread count, or ``None`` when PyTorch does
-        not expose the API (never raises, so startup cannot be broken).
+        not expose the API (failure is only logged, never raised).
     """
-    if threads is None:
-        threads = _effective_cpu_threads or resolve_cpu_thread_cap()
     threads = max(1, int(threads))
     try:
         import torch  # local import: caller has normally imported it already
@@ -220,10 +448,91 @@ def apply_torch_thread_cap(threads: Optional[int] = None) -> Optional[int]:
         torch.set_num_threads(threads)
         applied = int(torch.get_num_threads())
     except Exception as exc:  # pragma: no cover - defensive, torch builds vary
-        logger.warning("Could not cap PyTorch CPU threads: %s", exc)
+        logger.warning("Could not set PyTorch CPU threads: %s", exc)
         return None
     if applied != threads:
         logger.info("PyTorch reported %d CPU thread(s) after requesting %d.", applied, threads)
-    else:
-        logger.info("PyTorch CPU thread pool capped at %d thread(s).", applied)
     return applied
+
+
+def _report_torch_threads() -> Optional[int]:
+    """
+    Report PyTorch's intra-op pool size without changing it (native path).
+
+    Returns:
+        Optional[int]: The current intra-op thread count, or ``None`` when
+        PyTorch is unavailable.
+    """
+    try:
+        import torch  # local import: caller has normally imported it already
+
+        applied = int(torch.get_num_threads())
+    except Exception as exc:  # pragma: no cover - defensive, torch builds vary
+        logger.debug("Could not read the PyTorch CPU thread count: %s", exc)
+        return None
+    _log_once(
+        "torch_native_platform",
+        "Native full-speed threading active (%s): PyTorch intra-op pool left at its "
+        "default (%d thread(s)) - no torch.set_num_threads cap applied.",
+        sys.platform,
+        applied,
+    )
+    return applied
+
+
+def apply_torch_thread_cap(threads: Optional[int] = None) -> Optional[int]:
+    """
+    Configure PyTorch's intra-op thread pool via ``torch.set_num_threads``.
+
+    Call this immediately after ``import torch`` - the environment variables set
+    by :func:`apply_cpu_thread_env` only cover the OpenMP/MKL runtimes, whereas
+    the PyTorch intra-op pool is configured through this API. Because ``torch``
+    is imported at this point, the CUDA decision here is the authoritative
+    ``torch.cuda.is_available()`` answer.
+
+    Behaviour (v1.7.3):
+
+        * macOS / Linux: nothing is changed; PyTorch keeps its native pool.
+        * Windows + CUDA: ``torch.set_num_threads(os.cpu_count())`` so the CPU
+          post-processing of the flow dynamics uses every core.
+        * Windows CPU-only (or ``PHASEPIX_FORCE_THREAD_CAP=1``): the pool is
+          capped at 4 threads to prevent the MKL/OpenMP deadlock.
+
+    Args:
+        threads: Explicit thread count; ``None`` reuses the exported safe cap on
+            the guarded path (ignored on the native path).
+
+    Returns:
+        Optional[int]: The applied thread count, or ``None`` when PyTorch does
+        not expose the API (never raises, so startup cannot be broken).
+    """
+    if not should_apply_thread_cap():
+        if is_windows():
+            target = native_thread_count()
+            applied = _set_torch_threads(target)
+            _log_once(
+                "torch_native_cuda",
+                "Native full-speed threading active (win32, NVIDIA CUDA backend): PyTorch "
+                "intra-op pool set to %s thread(s) - CPU thread guard disabled.",
+                applied if applied is not None else target,
+            )
+            return applied
+        return _report_torch_threads()
+
+    cap = max(1, int(threads)) if threads is not None else (
+        _effective_cpu_threads or resolve_cpu_thread_cap()
+    )
+    applied = _set_torch_threads(cap)
+    # Keep the environment in sync: when ``torch`` reports no CUDA although the
+    # early ``nvidia-smi`` probe saw a GPU, this is the first moment the guard is
+    # known to be needed, so export the cap for runtimes that initialise later.
+    _export_thread_env(cap)
+    _log_once(
+        "torch_guarded",
+        "Windows CPU-fallback thread guard engaged: PyTorch CPU thread pool capped at %s "
+        "thread(s) (requested %d) to prevent the MKL/OpenMP deadlock.",
+        applied if applied is not None else cap,
+        cap,
+    )
+    return applied
+

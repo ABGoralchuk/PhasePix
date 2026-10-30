@@ -14,14 +14,21 @@ import math
 import re
 import time
 
-# ---------------- CPU THREADING HOTFIX ----------------
-# Windows + MKL/OpenMP/OpenCV thread contention freezes the CPU backend for 10+
-# minutes on tiny images. The cap must be exported before numpy (MKL) and torch
-# are imported, so it sits above every third-party import in this entry point.
+# ---------------- CPU THREADING GUARD (v1.7.3) ----------------
+# The strict MKL/OpenMP/OpenCV cap only exists for the Windows CPU-only fallback,
+# where the oversubscribed pools freeze the backend for 10+ minutes on tiny
+# images. On macOS (darwin), Linux and CUDA-enabled Windows machines both helpers
+# below are complete no-ops, so OpenCV keeps its multi-threaded bilateralFilter /
+# medianBlur / morphology kernels and PyTorch keeps a full-size intra-op pool.
+# They still sit above every third-party import because the guarded path (and the
+# PHASEPIX_FORCE_THREAD_CAP=1 override) must export OMP_NUM_THREADS /
+# MKL_NUM_THREADS before numpy and torch read them at initialisation.
 from cpu_thread_guard import apply_cpu_thread_env, apply_opencv_thread_limits  # noqa: E402
 
+# No-op on macOS / CUDA machines (returns the native logical CPU count there);
+# logs which threading mode is active.
 CPU_THREADS = apply_cpu_thread_env()
-# cv2.setNumThreads(0): OpenCV must not spawn a rival pool next to PyTorch's.
+# cv2.setNumThreads(0) only on the Windows CPU fallback; same log line reports it.
 OPENCV_THREADS = apply_opencv_thread_limits()
 
 import cv2  # noqa: E402  (must follow the CPU thread cap)
@@ -3203,7 +3210,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.30 (v1.7.2 - OpenCV Threading Hotfix)**")
+    st.caption("📦 **Build: 2026.10.30 (v1.7.3 - Native Speed Restoration)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
