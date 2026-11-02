@@ -7,6 +7,7 @@ phase classification (air bubbles vs. fat particles), and comparative KDE size d
 from typing import Iterable, Optional, Tuple
 from pathlib import Path
 import base64
+import hashlib
 import inspect
 import io
 import json
@@ -215,6 +216,15 @@ SEM_FOCUS_TWO_PASS = "🫧+🟠 Both Air Bubbles & Fat Particles (Two-Pass)"
 LIGHT_PROFILE_LIQUID = "💧 Liquid Fat (Smooth Globules)"
 LIGHT_PROFILE_CRYSTALLIZED = "❄️ Crystallized Fat (Textured / Internal Crystals)"
 
+# Pickering corona capture: a globule counts as corona-adsorbed when at least this
+# fraction of its own segmented area overlaps the dilated bubble-rim band. Matches
+# ``analyzer._CORONA_OVERLAP_MIN`` so classification and interfacial metrics agree.
+CORONA_OVERLAP_MIN = 0.15
+# Canonical ``👑 Corona Rim Capture Distance (µm)`` default (1.2 µm rim band).
+CORONA_CAPTURE_UM_DEFAULT = 1.2
+# Smallest rim band even at 0 µm: absorbs the anti-aliased edge of the air contour.
+CORONA_PX_FLOOR = 2
+
 # Stable widget-key defaults for every Section 4 / Section 5 control.
 # They are used (a) as fallbacks when a control is hidden by the active
 # profile/sample-type branch and (b) to snapshot "current settings" when the
@@ -233,6 +243,7 @@ PARAMETER_WIDGET_DEFAULTS: dict = {
         "sem_air_circ_slider": 0.50,
         "sem_ads_circ_slider": 0.30,
         "sem_deepscan_checkbox": False,
+        "sem_corona_Capture_um": CORONA_CAPTURE_UM_DEFAULT,
         "shared_clahe_checkbox": True,
         "shared_model_type_select": "cyto2",
     },
@@ -306,6 +317,7 @@ def default_parameter_presets() -> dict:
                 "sem_air_circ_slider": 0.50,
                 "sem_ads_circ_slider": 0.30,
                 "sem_deepscan_checkbox": True,
+                "sem_corona_Capture_um": 1.2,
                 "shared_clahe_checkbox": True,
             },
             "🫧 Whipped Emulsion (Fast Air Bubbles Preview)": {
@@ -321,6 +333,7 @@ def default_parameter_presets() -> dict:
                 "sem_air_circ_slider": 0.50,
                 "sem_ads_circ_slider": 0.30,
                 "sem_deepscan_checkbox": False,
+                "sem_corona_Capture_um": 1.2,
                 "shared_clahe_checkbox": True,
             },
             "🟠 SEM Single-Phase Emulsion": {
@@ -336,6 +349,7 @@ def default_parameter_presets() -> dict:
                 "sem_air_circ_slider": 0.50,
                 "sem_ads_circ_slider": 0.30,
                 "sem_deepscan_checkbox": False,
+                "sem_corona_Capture_um": 1.2,
                 "shared_clahe_checkbox": True,
             },
         },
@@ -1148,20 +1162,33 @@ def _diagnose_light_microscopy(gray: np.ndarray, um_per_px: float, current_param
     }
 
 
-def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params: dict) -> dict:
+def _diagnose_sem_micrograph(
+    gray: np.ndarray,
+    um_per_px: float,
+    current_params: dict,
+    sample_type: str = "Whipped Emulsion",
+) -> dict:
     """
     SEM diagnostics: dark craters/pores, fine matrix globules, shadow depth.
 
-    The recommended widget state is a *pure function* of the pixels and the
-    calibration. ``current_params`` is accepted only so the caller can render the
-    "Current" column of the comparison table next to the proposal - it must never
-    influence a recommended value, otherwise a range tuned on a previous
-    micrograph would be echoed back as if it had been measured on this one.
+    The recommended widget state is a *pure function* of the pixels, the
+    calibration and the user-selected ``sample_type``. ``current_params`` is
+    accepted only so the caller can render the "Current" column of the comparison
+    table next to the proposal - it must never influence a recommended value,
+    otherwise a range tuned on a previous micrograph would be echoed back as if it
+    had been measured on this one.
+
+    The analysis mode itself is **never** recommended: ``Sample Type`` is the
+    researcher's explicit choice in Section 4, so only the parameters that belong
+    to that mode are diagnosed (Emulsion -> fat only, Foam -> air only,
+    Whipped Emulsion -> full multi-phase recipe).
 
     Args:
         gray: Cropped SEM micrograph (footer already excluded).
         um_per_px: Active calibration in µm per pixel.
         current_params: Sidebar values, used by the comparison table only.
+        sample_type: Active ``Sample Type`` from Section 4
+            (``"Emulsion"`` / ``"Whipped Emulsion"`` / ``"Foam"``).
 
     Returns:
         dict: Measured statistics plus the ``recommended`` widget-state mapping.
@@ -1411,19 +1438,26 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
     internal_speck = bool(
         (inner_stds and float(np.median(inner_stds)) >= 14.0) or speck_density >= 0.02
     )
-    # 4. Sample type / detection target - derived from the measured phases ONLY.
+    # 4. Phase evidence + the user's analysis mode.
     #    current_params is deliberately not read here: the recommendation must be
     #    identical for identical pixels, regardless of what the sidebar currently
     #    holds (the "Current" column of the comparison table shows those values).
+    #    ``sample_type`` is an explicit input, not sidebar leakage: the researcher
+    #    chose the analysis mode, and the advisor must never override it.
     both_present = bool(has_pores and has_fine and fat_p95 < max(air_p50 * 0.75, 1.0))
-    if both_present:
-        rec_type, rec_focus = "Whipped Emulsion", SEM_FOCUS_TWO_PASS
-    else:
-        # Canonical modality defaults keep the air pass enabled, so a weakly
-        # detected (or genuinely absent) crater population can never silently
-        # disable bubble search for this image.
-        rec_type = str(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_sample_type_radio"])
-        rec_focus = str(PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_detection_focus_radio"])
+    _sem_modes = ("Emulsion", "Whipped Emulsion", "Foam")
+    active_sample_type = str(sample_type or "Whipped Emulsion").strip()
+    if active_sample_type not in _sem_modes:
+        active_sample_type = "Whipped Emulsion"
+    # Emulsion -> fat phase only; Foam -> air phase only; Whipped -> both phases.
+    diagnoses_air = active_sample_type in ("Whipped Emulsion", "Foam")
+    diagnoses_fat = active_sample_type in ("Whipped Emulsion", "Emulsion")
+    # AI Detection Target / Two-Pass exists only for Whipped Emulsion in Section 4.
+    rec_focus = (
+        SEM_FOCUS_TWO_PASS
+        if (active_sample_type == "Whipped Emulsion" and both_present)
+        else SEM_FOCUS_AIR
+    )
     if rec_focus not in (SEM_FOCUS_AIR, SEM_FOCUS_TWO_PASS):
         rec_focus = SEM_FOCUS_AIR
 
@@ -1477,29 +1511,37 @@ def _diagnose_sem_micrograph(gray: np.ndarray, um_per_px: float, current_params:
         np.clip(0.5 * (shadow_depth / 80.0) + 0.5 * (1.0 if internal_speck else 0.0), 0.0, 1.0)
     )
 
-    recommended_state = {
-        "sem_sample_type_radio": rec_type,
-        "sem_detection_focus_radio": rec_focus,
-        "sem_min_air_um": float(rec_min_air),
-        "sem_max_air_um": float(rec_max_air),
-        "sem_min_fat_um": float(rec_min_fat),
-        "sem_max_fat_um": float(rec_max_fat),
-        "shared_flow_slider": float(flow),
-        "shared_cellprob_slider": float(cellprob),
-        "shared_fat_circ_slider": 0.60,
-        "sem_air_circ_slider": 0.50,
-        "sem_ads_circ_slider": 0.30,
-        "sem_deepscan_checkbox": bool(deepscan),
-        "shared_clahe_checkbox": True,
-        # Low-contrast craters or internal shadow speckle benefit from cyto3's
-        # much broader training distribution.
-        "shared_model_type_select": (
-            "cyto3" if (low_contrast or internal_speck) else "cyto2"
-        ),
-    }
+    # Only parameters that actually exist for the active Sample Type are proposed:
+    # an Emulsion run has no air-bubble controls in Section 4, a Foam run has no fat
+    # controls, and `Sample Type` itself is never recommended.
+    recommended_state = {}
+    if active_sample_type == "Whipped Emulsion":
+        recommended_state["sem_detection_focus_radio"] = rec_focus
+    if diagnoses_air:
+        recommended_state["sem_min_air_um"] = float(rec_min_air)
+        recommended_state["sem_max_air_um"] = float(rec_max_air)
+    if diagnoses_fat:
+        recommended_state["sem_min_fat_um"] = float(rec_min_fat)
+        recommended_state["sem_max_fat_um"] = float(rec_max_fat)
+    recommended_state["shared_flow_slider"] = float(flow)
+    recommended_state["shared_cellprob_slider"] = float(cellprob)
+    if diagnoses_fat:
+        recommended_state["shared_fat_circ_slider"] = 0.60
+    if diagnoses_air:
+        recommended_state["sem_air_circ_slider"] = 0.50
+    if active_sample_type == "Whipped Emulsion":
+        recommended_state["sem_ads_circ_slider"] = 0.30
+        recommended_state["sem_deepscan_checkbox"] = bool(deepscan)
+    recommended_state["shared_clahe_checkbox"] = True
+    # Low-contrast craters or internal shadow speckle benefit from cyto3's much
+    # broader training distribution.
+    recommended_state["shared_model_type_select"] = (
+        "cyto3" if (low_contrast or internal_speck) else "cyto2"
+    )
     return {
         "n_pores": int(air_vals.size),
         "n_globules": int(fat_vals.size),
+        "sample_type": active_sample_type,
         "air_p10": air_p10,
         "air_p50": air_p50,
         "air_p95": air_p95,
@@ -1781,8 +1823,25 @@ def _sem_summary_metrics(diag: dict) -> dict:
 
 
 def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
-    """Educational Current vs. Recommended table for SEM micrographs."""
-    rec = diag["recommended"]
+    """
+    Educational Current vs. Recommended table for SEM micrographs.
+
+    The rows are scoped by the *user's* ``Sample Type``: ``Sample Type`` itself is
+    never proposed (the advisor must not talk the researcher out of an explicit
+    choice), an Emulsion run only compares fat-particle parameters, a Foam run only
+    compares air-bubble parameters, and Whipped Emulsion keeps the full multi-phase
+    recipe.
+    """
+    rec = dict(diag["recommended"])
+    active_sample_type = str(diag.get("sample_type", "Whipped Emulsion"))
+    # Parameters outside the active Sample Type are not proposed; the canonical
+    # defaults only keep their (filtered-out) formatting paths harmless.
+    rec.setdefault("sem_detection_focus_radio", SEM_FOCUS_AIR)
+    rec.setdefault("sem_min_air_um", PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_min_air_um"])
+    rec.setdefault("sem_max_air_um", PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_max_air_um"])
+    rec.setdefault("sem_min_fat_um", PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_min_fat_um"])
+    rec.setdefault("sem_max_fat_um", PARAMETER_WIDGET_DEFAULTS["SEM"]["sem_max_fat_um"])
+    rec.setdefault("sem_deepscan_checkbox", False)
     pore_text = (
         f"{diag['n_pores']} near-circular dark craters spanning "
         f"{diag['air_d_min']:.1f}-{diag['air_d_max']:.1f} µm (min-max)"
@@ -1795,14 +1854,14 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
         if diag["has_fine"]
         else "no dense fine-globule population was isolated by the top-hat filter"
     )
-    sample_why = (
+    phase_evidence = (
         f"{pore_text} coexist with {globule_text}. Two physically distinct phases "
-        "require a two-pass workflow so large air pores and fine fat globules are "
-        "measured with separate detection scales."
+        "are measured with separate detection scales: the air pass captures dark "
+        "craters, the fat pass captures the fine matrix emulsion."
         if diag["both_present"]
         else f"{pore_text}; {globule_text}. Only one phase is statistically dominant, "
-        "so the validated Whipped Emulsion recipe (air pass enabled) is used instead "
-        "of switching the classification logic on weak evidence."
+        "so the air pass stays on the single measurable phase instead of switching the "
+        "detection logic on weak evidence."
     )
     focus_why = (
         "Two-pass is recommended because the pore and globule size distributions barely "
@@ -1813,14 +1872,8 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
         "dominant phase measured in this field of view; a second pass would only add "
         "runtime and false positives."
     )
+    focus_why = f"{phase_evidence} {focus_why}"
     rows = [
-        _comparison_row(
-            "sem_sample_type_radio",
-            "Sample Type",
-            rec["sem_sample_type_radio"],
-            current_params,
-            sample_why,
-        ),
         _comparison_row(
             "sem_detection_focus_radio",
             "AI Detection Target",
@@ -1985,7 +2038,27 @@ def _sem_comparison_rows(diag: dict, current_params: dict) -> list:
             ),
         ]
     )
-    return rows
+
+    # Scope the educational table to the user's explicit Sample Type: rows whose
+    # parameter does not exist in that mode are hidden instead of being "recommended"
+    # (e.g. air-bubble bounds in Emulsion, fat bounds in Foam).
+    _row_scope = {
+        "AI Detection Target": ("Whipped Emulsion",),
+        "Min Air Bubble Size (µm)": ("Whipped Emulsion", "Foam"),
+        "Max Air Bubble Size (µm)": ("Whipped Emulsion", "Foam"),
+        "Min Fat Particle Size (µm)": ("Whipped Emulsion", "Emulsion"),
+        "Max Fat Particle Size (µm)": ("Whipped Emulsion", "Emulsion"),
+        "Air Bubbles Min Circularity": ("Whipped Emulsion", "Foam"),
+        "Matrix Fat Min Circularity": ("Whipped Emulsion", "Emulsion"),
+        "Adsorbed Fat Min Circularity": ("Whipped Emulsion",),
+        "Deep-Scan Adsorbed Fat inside Bubbles": ("Whipped Emulsion",),
+    }
+    all_modes = ("Emulsion", "Whipped Emulsion", "Foam")
+    return [
+        row
+        for row in rows
+        if active_sample_type in _row_scope.get(row["Parameter"], all_modes)
+    ]
 
 
 def diagnose_and_recommend_parameters(
@@ -1993,6 +2066,7 @@ def diagnose_and_recommend_parameters(
     pixel_to_um_ratio: float,
     is_light_mode: bool,
     current_params: dict,
+    sample_type: str = "Whipped Emulsion",
 ) -> dict:
     """
     Measure the current micrograph and translate the optics into Cellpose settings.
@@ -2007,10 +2081,14 @@ def diagnose_and_recommend_parameters(
         pixel_to_um_ratio: Active calibration in µm per pixel.
         is_light_mode: ``True`` for brightfield light microscopy, ``False`` for SEM.
         current_params: Mapping of Section 4 / 5 widget keys to their current values.
+        sample_type: User-selected SEM ``Sample Type`` (``"Emulsion"`` /
+            ``"Whipped Emulsion"`` / ``"Foam"``). The advisor tailors — and never
+            overrides — this explicit analysis mode.
 
     Returns:
-        dict: ``modality``, ``summary_metrics``, ``recommended_widget_state`` and
-        ``comparison_rows`` (Parameter / Current / Recommended / Rationale).
+        dict: ``modality``, ``summary_metrics``, ``recommended_widget_state``,
+        ``sample_type`` and ``comparison_rows`` (Parameter / Current / Recommended /
+        Rationale).
 
     Raises:
         ValueError: If the analysis image is empty.
@@ -2028,9 +2106,12 @@ def diagnose_and_recommend_parameters(
             "comparison_rows": _light_comparison_rows(diag, current_params),
         }
 
-    diag = _diagnose_sem_micrograph(gray, pixel_to_um_ratio, current_params)
+    diag = _diagnose_sem_micrograph(
+        gray, pixel_to_um_ratio, current_params, sample_type=sample_type
+    )
     return {
         "modality": "🔬 SEM Micrograph",
+        "sample_type": str(diag.get("sample_type", sample_type)),
         "summary_metrics": _sem_summary_metrics(diag),
         "recommended_widget_state": dict(diag["recommended"]),
         "comparison_rows": _sem_comparison_rows(diag, current_params),
@@ -2949,6 +3030,206 @@ def _lut_label_filter(
     return np.where(accepted[mask_2d], mask_2d, 0).astype(mask_2d.dtype, copy=False)
 
 
+def _parse_particle_id_filter(raw_text: str) -> Optional[set]:
+    """
+    Parse the ``🔍 Search / Filter by Particle ID`` box into a set of object IDs.
+
+    The box accepts a single ID (``142``), a comma / semicolon / whitespace
+    separated list (``12, 45, 142``) and inclusive ranges (``100-120`` or
+    ``100..120``), so a whole neighbourhood of interest can be inspected at once.
+
+    Args:
+        raw_text: Raw widget text.
+
+    Returns:
+        Optional[set]: Parsed integer IDs, or ``None`` when the box is empty or
+        holds no numeric token (``None`` means "no filter" — the full table stays
+        visible instead of being silently emptied by a typo).
+    """
+    if raw_text is None:
+        return None
+    text = str(raw_text).strip()
+    if not text:
+        return None
+
+    tokens = [token for token in re.split(r"[,;\s]+", text) if token]
+    ids: set = set()
+    for token in tokens:
+        range_match = re.fullmatch(r"(\d+)\s*(?:-|\.\.|:)\s*(\d+)", token)
+        if range_match:
+            start, end = int(range_match.group(1)), int(range_match.group(2))
+            low, high = (start, end) if start <= end else (end, start)
+            # Guard against a typo like "1-999999" flooding the filter with IDs.
+            if high - low <= 100000:
+                ids.update(range(low, high + 1))
+            continue
+        if token.isdigit():
+            ids.add(int(token))
+
+    return ids or None
+
+
+def _apply_particle_editor_changes(
+    edited_view: pd.DataFrame,
+    classified_df: pd.DataFrame,
+    excluded_ids: set,
+    phase_overrides: dict,
+) -> Tuple[set, dict]:
+    """
+    Merge the rows visible in the Phase Classifications editor into session state.
+
+    Only rows present in ``edited_view`` are written, so the 🔍 ID filter narrows
+    the *edit scope*: particles hidden by the filter keep their exclusions and
+    phase overrides untouched. Checked ``Excluded`` rows are added to
+    ``excluded_ids``; every remaining row whose ``Phase Class`` differs from the
+    classified value is recorded in ``phase_overrides``.
+
+    Args:
+        edited_view: Table returned by ``st.data_editor`` (possibly ID-filtered).
+        classified_df: Full classified metrics table (source of truth for phases).
+        excluded_ids: Mutable set of excluded particle IDs (updated in place).
+        phase_overrides: Mutable dict of manual phase overrides (updated in place).
+
+    Returns:
+        Tuple[set, dict]: The updated ``excluded_ids`` and ``phase_overrides``.
+    """
+    if edited_view is None or edited_view.empty:
+        return excluded_ids, phase_overrides
+
+    marked_ids: set = set()
+    for value in edited_view.loc[edited_view["Excluded"] == True, "id"].tolist():
+        try:
+            marked_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    if marked_ids:
+        excluded_ids.update(marked_ids)
+        # An excluded particle is dropped from the analysis entirely, so a stale
+        # phase override would only resurface if it were ever restored.
+        for marked_id in marked_ids:
+            phase_overrides.pop(marked_id, None)
+
+    for _, row in edited_view.iterrows():
+        try:
+            particle_id = int(row["id"])
+        except (TypeError, ValueError):
+            continue
+        if particle_id in marked_ids:
+            continue
+        new_phase = str(row["phase_class"])
+        original = classified_df.loc[
+            classified_df["id"] == particle_id, "phase_class"
+        ].values
+        if len(original) > 0 and str(original[0]) != new_phase:
+            phase_overrides[particle_id] = new_phase
+
+    return excluded_ids, phase_overrides
+
+
+def _dilate_bubble_mask(mask: Optional[np.ndarray], radius_px: int) -> np.ndarray:
+    """
+    Grow a binary bubble mask by ``radius_px`` with an elliptical structuring element.
+
+    Used to build the Pickering "corona" rim band: fat globules that form the
+    adsorbed monolayer sit ON the bubble boundary, so a strictly-inside test misses
+    them whenever the segmented air contour runs along their inner edge.
+
+    Args:
+        mask: Boolean/uint8 bubble mask (non-zero = bubble).
+        radius_px: Dilation radius in pixels (<= 0 returns the mask unchanged).
+
+    Returns:
+        np.ndarray: Boolean mask of the same shape, grown by ``radius_px``.
+    """
+    if mask is None:
+        return np.zeros((0, 0), dtype=bool)
+    mask_bool = np.asarray(mask).astype(bool)
+    if mask_bool.size == 0 or not mask_bool.any() or int(radius_px) <= 0:
+        return mask_bool
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * int(radius_px) + 1, 2 * int(radius_px) + 1)
+    )
+    return cv2.dilate(mask_bool.astype(np.uint8), kernel, iterations=1) > 0
+
+
+def _corona_rim_flags(
+    df: pd.DataFrame,
+    masks: Optional[np.ndarray],
+    corona_bubble_mask: Optional[np.ndarray],
+    overlap_min_fraction: float = CORONA_OVERLAP_MIN,
+) -> np.ndarray:
+    """
+    Flag particles that belong to the Pickering corona around a bubble rim.
+
+    A corona globule touches the interface, so the segmented air-bubble contour
+    frequently follows its inner edge and the geometric centroid lands a few pixels
+    OUTSIDE ``combined_bubble_mask``. Under the previous centroid-only test those
+    globules were silently demoted to orange matrix fat. A particle is flagged when
+    **either**
+
+      a) its centroid falls inside the dilated ``corona_bubble_mask``, or
+      b) at least ``overlap_min_fraction`` (15 %) of its own segmented area
+         (``masks == obj_id``) overlaps that band.
+
+    Bubbles themselves are handled by the caller (they are excluded from the
+    fat/adsorbed decision), so no additional filtering is applied here.
+
+    Args:
+        df: Metrics table with 'id', 'centroid_x' and 'centroid_y'.
+        masks: Labeled segmentation mask (0 = background); may be None.
+        corona_bubble_mask: Dilated bubble mask (see ``_dilate_bubble_mask``).
+        overlap_min_fraction: Minimum fraction of the particle's own area inside
+            the band to count as corona-adsorbed.
+
+    Returns:
+        np.ndarray: Boolean array aligned with ``df``'s rows.
+    """
+    if df is None or df.empty:
+        return np.zeros(0, dtype=bool)
+    flags = np.zeros(len(df), dtype=bool)
+    if corona_bubble_mask is None or not np.any(corona_bubble_mask):
+        return flags
+
+    shape = corona_bubble_mask.shape[:2]
+    try:
+        cx_arr = np.clip(
+            np.rint(df["centroid_x"].to_numpy(dtype=float)).astype(np.intp), 0, shape[1] - 1
+        )
+        cy_arr = np.clip(
+            np.rint(df["centroid_y"].to_numpy(dtype=float)).astype(np.intp), 0, shape[0] - 1
+        )
+    except (KeyError, TypeError, ValueError):
+        return flags
+
+    flags |= corona_bubble_mask[cy_arr, cx_arr]
+
+    if masks is None or not isinstance(masks, np.ndarray) or masks.size == 0:
+        return flags
+    mask_2d = masks.squeeze() if masks.ndim == 3 else masks
+    if mask_2d.shape[:2] != shape:
+        return flags
+    mask_int = mask_2d if np.issubdtype(mask_2d.dtype, np.integer) else mask_2d.astype(np.int32)
+    max_label = int(mask_int.max())
+    if max_label <= 0:
+        return flags
+
+    # Two O(N) bincount passes: per-label total area and per-label area inside the
+    # rim band. Particles that are not in the mask (manual objects) simply read 0.
+    area_lut = np.bincount(mask_int.ravel(), minlength=max_label + 1)
+    band = corona_bubble_mask & (mask_int > 0)
+    band_lut = np.bincount(mask_int[band], minlength=max_label + 1)
+
+    ids = pd.to_numeric(df["id"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(ids) & (ids > 0) & (ids <= max_label)
+    ids_int = np.where(valid, np.nan_to_num(ids), 0).astype(np.intp)
+    areas = area_lut[ids_int]
+    overlaps = band_lut[ids_int]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fractions = np.where(areas > 0, overlaps / np.maximum(areas, 1), 0.0)
+    flags |= valid & (fractions >= float(overlap_min_fraction))
+    return flags
+
+
 def _remove_nested_matryoshka_masks(
     df_in: pd.DataFrame,
     mask_arr: Optional[np.ndarray],
@@ -3210,7 +3491,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.10.30 (v1.7.3 - Native Speed Restoration)**")
+    st.caption("📦 **Build: 2026.11.02 (v1.7.4 - Corona Rim & Scale-Bar Fix)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
@@ -3995,6 +4276,8 @@ with st.sidebar:
     fat_min_solidity = 0.0
     crystal_smooth_strength = 0
     enable_multiscale_crystal = False
+    # Pickering corona rim band (µm) - SEM Whipped Emulsion only, inert elsewhere.
+    corona_capture_um = 0.0
 
     if is_light_mode:
         # Light microscopy (single-phase emulsion): air-bubble / adsorbed-fat
@@ -4055,6 +4338,37 @@ with st.sidebar:
             help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
             key="sem_deepscan_checkbox",
         )
+        # ── 👑 Pickering corona capture ───────────────────────────────────────
+        # Corona globules sit ON the interface, so their centroid can fall a few
+        # pixels outside the segmented air-bubble contour. This band captures them
+        # as adsorbed_fat instead of demoting them to orange matrix fat.
+        if sample_type == "Whipped Emulsion":
+            corona_capture_um = float(
+                st.slider(
+                    "👑 Corona Rim Capture Distance (µm)",
+                    min_value=0.0,
+                    max_value=5.0,
+                    value=CORONA_CAPTURE_UM_DEFAULT,
+                    step=0.1,
+                    help=(
+                        "Fat globules forming the Pickering corona straddle the bubble "
+                        "boundary, so the segmented blue contour often runs along their "
+                        "inner edge and their centroid falls outside the bubble mask. "
+                        "Every fat globule within this distance of the bubble rim (centroid "
+                        "inside the band, or ≥ 15 % of its own area overlapping it) is "
+                        "classified as gold **adsorbed_fat** and counted in the interfacial "
+                        "coverage / contact-angle metrics. 0.0 keeps a minimal 2 px "
+                        "anti-aliasing margin."
+                    ),
+                    key="sem_corona_Capture_um",
+                )
+            )
+        else:
+            # Emulsion / Foam have no air–fat interface: the band is unused, but the
+            # user's stored setting is preserved for their next Whipped Emulsion run.
+            corona_capture_um = float(
+                st.session_state.get("sem_corona_Capture_um", CORONA_CAPTURE_UM_DEFAULT)
+            )
         st.caption("ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat.")
 
     min_circularity = fat_min_circularity  # Fallback alias for backward compatibility
@@ -4094,6 +4408,14 @@ with st.sidebar:
         "Measures the current micrograph in physical µm and *proposes* Section 4/5 "
         "settings. Nothing changes until you review the diagnostics and apply."
     )
+    if not is_light_mode:
+        st.info(
+            "ℹ️ **Reminder:** Please ensure the correct **Sample Type** "
+            "(Emulsion, Whipped Emulsion, or Foam) is selected in **Section 4** before "
+            "running the advisor. Recommendations are tailored strictly to your active "
+            f"Sample Type — currently **{sample_type}**.",
+            icon="ℹ️",
+        )
 
     # Single source of truth for "current" values (also used by preset saving).
     _live_parameter_values = {
@@ -4119,6 +4441,7 @@ with st.sidebar:
         "sem_air_circ_slider": float(air_min_circularity) if not is_light_mode else None,
         "sem_ads_circ_slider": float(ads_min_circularity) if not is_light_mode else None,
         "sem_deepscan_checkbox": bool(enable_deepscan) if not is_light_mode else None,
+        "sem_corona_Capture_um": float(corona_capture_um) if not is_light_mode else None,
     }
 
     if st.button(
@@ -4129,7 +4452,8 @@ with st.sidebar:
         help=(
             "Runs optical and morphological diagnostics on the current image and opens a "
             "review card with measured µm ranges, a parameter comparison table and the "
-            "scientific rationale for every suggestion."
+            "scientific rationale for every suggestion. The active Sample Type is always "
+            "respected and never overwritten."
         ),
     ):
         if image_bytes is None:
@@ -4148,9 +4472,11 @@ with st.sidebar:
                     float(pixel_to_um_ratio),
                     bool(is_light_mode),
                     dict(_live_parameter_values),
+                    sample_type=str(sample_type),
                 )
                 _advisor_proposal["image_name"] = image_name
                 _advisor_proposal["is_light_mode"] = bool(is_light_mode)
+                _advisor_proposal["sample_type"] = str(sample_type)
                 _advisor_proposal["calibration_um_per_px"] = float(pixel_to_um_ratio)
                 st.session_state["autotune_proposal"] = _advisor_proposal
             except Exception as exc:
@@ -4487,6 +4813,9 @@ else:
     confirmed_air_ids = set()
     manual_air_ids = set()
     combined_bubble_mask = np.zeros(analysis_img.shape[:2], dtype=bool)
+    # Pickering corona rim band, recomputed once the bubble mask is final ("3d").
+    corona_px = 0
+    corona_bubble_mask = combined_bubble_mask
     manual_air_canvas = _rasterize_manual_air_bubbles(
         saved_manual_items,
         analysis_img.shape[:2],
@@ -4818,6 +5147,21 @@ else:
     # Refresh cumulative bubble mask to ensure all latest manual items are integrated (Rule 1)
     combined_bubble_mask = compute_cumulative_bubble_mask(air_masks)
 
+    # 3d. Pickering corona rim band (SEM Whipped Emulsion only).
+    #     Corona globules straddle the interface, so the segmented air contour often
+    #     follows their inner edge and their centroid lands a few px OUTSIDE the
+    #     bubble mask. Legitimate globules are therefore captured on a dilated band
+    #     instead of being demoted to matrix fat. The 2 px floor absorbs the
+    #     anti-aliased contour edge even at a 0.0 µm capture distance.
+    if not is_light_mode and corona_capture_um >= 0.0 and sample_type == "Whipped Emulsion":
+        corona_px = max(
+            CORONA_PX_FLOOR,
+            int(round(float(corona_capture_um) / max(float(pixel_to_um_ratio), 1e-6))),
+        )
+    else:
+        corona_px = 0
+    corona_bubble_mask = _dilate_bubble_mask(combined_bubble_mask, corona_px)
+
     # 4. Spatial Phase Filtering & Classification (Colloid Chemistry Rules)
     partial_ids = set()
     if not raw_df.empty:
@@ -4848,9 +5192,12 @@ else:
                 0,
                 combined_bubble_mask.shape[0] - 1,
             )
-            in_bub = combined_bubble_mask[cy_arr, cx_arr] & (
-                ~raw_df["id"].isin(all_air_ids).to_numpy()
-            )
+            # Corona band: a globule on the rim is accepted when its centroid sits in
+            # the dilated band OR >= 15 % of its own area overlaps that band.
+            corona_flags = _corona_rim_flags(raw_df, masks, corona_bubble_mask)
+            in_bub = (
+                combined_bubble_mask[cy_arr, cx_arr] | corona_flags
+            ) & (~raw_df["id"].isin(all_air_ids).to_numpy())
             in_bubble_vec = pd.Series(in_bub, index=raw_df.index)
         else:
             in_bubble_vec = pd.Series(False, index=raw_df.index)
@@ -5063,7 +5410,13 @@ else:
             not_air_row = (
                 classified_df["phase_class"].astype(str).str.lower().to_numpy() != "air_bubbles"
             )
-            classified_df["in_bubble"] = not_air_row & combined_bubble_mask[cy_arr, cx_arr]
+            # Include the Pickering corona band so rim-straddling globules stay inside
+            corona_flags_cls = _corona_rim_flags(
+                classified_df, masks, corona_bubble_mask
+            )
+            classified_df["in_bubble"] = not_air_row & (
+                combined_bubble_mask[cy_arr, cx_arr] | corona_flags_cls
+            )
 
         # Rule 3: Forcibly assign 'adsorbed_fat' to all partial_ids
         if partial_ids:
@@ -5291,6 +5644,7 @@ else:
                 manual_polygons=active_manual_polygons,
                 image_shape=base_display_img.shape[:2],
                 pixel_to_um_ratio=float(pixel_to_um_ratio),
+                corona_margin_px=int(corona_px),
             )
         except Exception:
             # Keep the dashboard renderable even if contact-angle estimation fails
@@ -5447,9 +5801,16 @@ else:
         _proposal_matches_image = (
             _autotune_proposal.get("image_name") == image_name
             and bool(_autotune_proposal.get("is_light_mode")) == bool(is_light_mode)
+            # Recommendations are scoped to the Sample Type they were computed for,
+            # so switching the mode invalidates the card instead of applying
+            # parameters that belong to a different phase recipe.
+            and (
+                bool(_autotune_proposal.get("is_light_mode"))
+                or str(_autotune_proposal.get("sample_type", sample_type)) == str(sample_type)
+            )
         )
         if not _proposal_matches_image:
-            # Stale proposal from another image/modality: silently discard it.
+            # Stale proposal from another image/modality/sample type: discard it.
             st.session_state.pop("autotune_proposal", None)
         else:
             with st.container(border=True):
@@ -5463,6 +5824,16 @@ else:
                     "Review the physical evidence below before applying — no sidebar "
                     "parameter has been changed yet."
                 )
+                if not bool(_autotune_proposal.get("is_light_mode")):
+                    st.info(
+                        "ℹ️ **Reminder:** Please ensure the correct **Sample Type** "
+                        "(Emulsion, Whipped Emulsion, or Foam) is selected in **Section 4** "
+                        "before running the advisor. Recommendations are tailored strictly "
+                        "to your active Sample Type — this proposal was computed for "
+                        f"**{_autotune_proposal.get('sample_type', sample_type)}** and "
+                        "never changes it.",
+                        icon="ℹ️",
+                    )
 
                 _proposal_metrics = _autotune_proposal.get("summary_metrics", {})
                 if _proposal_metrics:
@@ -5722,7 +6093,6 @@ else:
         with col_df:
             st.subheader("2. Phase Classifications")
             editor_rev = int(st.session_state.get("particle_editor_rev", 0))
-            editor_key = f"particle_data_editor_{editor_rev}"
             if classified_df.empty:
                 st.warning("No particles passed the circularity and segmentation filter.")
                 if st.session_state.get("interactive_excluded_ids"):
@@ -5746,32 +6116,92 @@ else:
                 else:
                     phase_class_options = ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
 
-                edited_table = st.data_editor(
-                    editor_df,
-                    column_config={
-                        "Excluded": st.column_config.CheckboxColumn(
-                            "Excluded",
-                            help="Check to mark this particle for deletion as an artifact.",
-                            default=False,
-                        ),
-                        "id": st.column_config.NumberColumn("ID", format="%d", disabled=True),
-                        "phase_class": st.column_config.SelectboxColumn(
-                            "Phase Class",
-                            help="Manually reclassify this object (options depend on the selected Sample Type).",
-                            options=phase_class_options,
-                            required=True,
-                        ),
-                        "diameter_um": st.column_config.NumberColumn("Diameter (µm)", format="%.2f", disabled=True),
-                        "area_um2": st.column_config.NumberColumn("Area (µm²)", format="%.2f", disabled=True),
-                        "circularity": st.column_config.NumberColumn("Circularity", format="%.2f", disabled=True),
-                        "mean_intensity": st.column_config.NumberColumn("Intensity", format="%.1f", disabled=True),
-                    },
-                    disabled=["id", "diameter_um", "area_um2", "circularity", "mean_intensity"],
-                    hide_index=True,
-                    height=320,
-                    use_container_width=True,
-                    key=editor_key,
+                # ── 🔍 Search / Filter by Particle ID ────────────────────────
+                # Hundreds of rows make marking a single artifact slow; the filter
+                # narrows the *editable view* only, so "Apply Changes" still writes
+                # exclusively the rows the user actually sees and touches.
+                id_filter_raw = st.text_input(
+                    "🔍 Search / Filter by Particle ID",
+                    value="",
+                    placeholder="e.g. 142 · 12, 45, 142 · 100-120",
+                    key=f"particle_id_filter_{clean_stem}",
+                    help=(
+                        "Shows only the matching particles in the table below. Accepts a "
+                        "single ID (142), a comma/semicolon/space separated list "
+                        "(12, 45, 142) or an inclusive range (100-120). Clear the field "
+                        "to bring every particle back - applied exclusions and phase "
+                        "changes are never lost."
+                    ),
                 )
+                filtered_ids = _parse_particle_id_filter(id_filter_raw)
+                editor_view = editor_df
+                if filtered_ids is not None:
+                    editor_view = editor_df[
+                        editor_df["id"].isin(filtered_ids)
+                    ].reset_index(drop=True)
+
+                if filtered_ids is None:
+                    filter_signature = "all"
+                    if str(id_filter_raw).strip():
+                        st.warning(
+                            "No numeric particle IDs were recognised in "
+                            f"`{str(id_filter_raw).strip()}` — showing all particles. "
+                            "Use e.g. `142`, `12, 45, 142` or `100-120`."
+                        )
+                else:
+                    filter_signature = hashlib.md5(
+                        ",".join(map(str, sorted(filtered_ids))).encode("utf-8")
+                    ).hexdigest()[:8]
+                    st.caption(
+                        f"🔍 Filter active — showing **{len(editor_view):,}** of "
+                        f"**{len(editor_df):,}** particles (IDs: "
+                        f"`{str(id_filter_raw).strip()}`)."
+                    )
+
+                # The editor key carries the filter signature so switching filters
+                # never re-applies positional edits from a different row subset.
+                editor_key = f"particle_data_editor_{editor_rev}_{filter_signature}"
+                for _stale_key in [
+                    k
+                    for k in list(st.session_state.keys())
+                    if str(k).startswith("particle_data_editor") and k != editor_key
+                ]:
+                    del st.session_state[_stale_key]
+
+                editor_view_empty = editor_view.empty
+                if editor_view_empty:
+                    st.info(
+                        "No particles match the current ID filter. Clear the "
+                        "`🔍 Search / Filter by Particle ID` field to see all particles again."
+                    )
+                    edited_table = editor_view
+                else:
+                    edited_table = st.data_editor(
+                        editor_view,
+                        column_config={
+                            "Excluded": st.column_config.CheckboxColumn(
+                                "Excluded",
+                                help="Check to mark this particle for deletion as an artifact.",
+                                default=False,
+                            ),
+                            "id": st.column_config.NumberColumn("ID", format="%d", disabled=True),
+                            "phase_class": st.column_config.SelectboxColumn(
+                                "Phase Class",
+                                help="Manually reclassify this object (options depend on the selected Sample Type).",
+                                options=phase_class_options,
+                                required=True,
+                            ),
+                            "diameter_um": st.column_config.NumberColumn("Diameter (µm)", format="%.2f", disabled=True),
+                            "area_um2": st.column_config.NumberColumn("Area (µm²)", format="%.2f", disabled=True),
+                            "circularity": st.column_config.NumberColumn("Circularity", format="%.2f", disabled=True),
+                            "mean_intensity": st.column_config.NumberColumn("Intensity", format="%.1f", disabled=True),
+                        },
+                        disabled=["id", "diameter_um", "area_um2", "circularity", "mean_intensity"],
+                        hide_index=True,
+                        height=320,
+                        use_container_width=True,
+                        key=editor_key,
+                    )
 
                 if unclass_count > 0:
                     unclass_mask = classified_df["phase_class"].astype(str).str.lower().eq("unclassified")
@@ -5944,19 +6374,25 @@ else:
 
                 col_btn1, col_btn2 = st.columns([1.2, 1.0])
                 with col_btn1:
-                    if st.button("Apply Changes", type="primary", use_container_width=True, help="Apply particle deletions and phase reclassifications"):
-                        marked_ids = set(edited_table.loc[edited_table["Excluded"] == True, "id"].tolist())
-                        if marked_ids:
-                            st.session_state["interactive_excluded_ids"].update(marked_ids)
-
-                        for _, row in edited_table.iterrows():
-                            p_id = int(row["id"])
-                            if p_id in marked_ids:
-                                continue
-                            new_phase = str(row["phase_class"])
-                            orig_match = classified_df.loc[classified_df["id"] == p_id, "phase_class"].values
-                            if len(orig_match) > 0 and str(orig_match[0]) != new_phase:
-                                st.session_state["manual_phase_overrides"][p_id] = new_phase
+                    if st.button(
+                        "Apply Changes",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=editor_view_empty,
+                        help=(
+                            "Applies deletions and phase reclassifications for the rows "
+                            "currently shown in the table. Particles hidden by the ID filter "
+                            "keep their existing state."
+                        ),
+                    ):
+                        # Only the visible (possibly filtered) rows are written: rows the
+                        # user never saw keep their current exclusions/overrides.
+                        _apply_particle_editor_changes(
+                            edited_view=edited_table,
+                            classified_df=classified_df,
+                            excluded_ids=st.session_state["interactive_excluded_ids"],
+                            phase_overrides=st.session_state["manual_phase_overrides"],
+                        )
 
                         editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
                         for k in editor_keys:
@@ -6900,6 +7336,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     image_shape=base_display_img.shape[:2],
                     pixel_to_um_ratio=float(pixel_to_um_ratio),
                     d_ref_um=d_ref_argument,
+                    corona_margin_px=int(corona_px),
                 )
                 resolved_d_ref = float(ads_summary.get("d_ref_um", resolved_d_ref or 0.0))
 
@@ -6961,6 +7398,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             manual_polygons=active_manual_polygons,
                             ads_particles_df=ads_particles_df,
                             show_contact_angles=bool(show_theta_labels),
+                            corona_margin_px=int(corona_px),
                         )
                         st.image(
                             inspection_img,
@@ -6986,6 +7424,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             "Bubble to inspect closely (ID):",
                             options=inspect_options,
                             format_func=lambda value: f"Bubble #{int(value)}",
+                        )
+                        crop_show_labels = st.checkbox(
+                            "🔢 Show Labels / Contact Angles on Crop",
+                            value=bool(show_theta_labels),
+                            help=(
+                                "Uncheck for a label-free close-up: only the cyan bubble "
+                                "boundary and the gold adsorbed-fat masks are drawn, so the "
+                                "adsorption corona can be inspected without text clutter."
+                            ),
                         )
                         inspect_row = per_bubble_df.loc[
                             per_bubble_df["Bubble ID"] == inspect_id
@@ -7027,10 +7474,32 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                 x0 = max(0, center_x - half_side)
                                 x1 = min(full_w, center_x + half_side)
                                 if y1 > y0 and x1 > x0:
-                                    crop_img = inspection_img[y0:y1, x0:x1]
+                                    crop_source_img = inspection_img
+                                    if not crop_show_labels:
+                                        # Label-free render: cyan bubble boundary and gold
+                                        # adsorbed-fat masks only (no theta / ID text), so the
+                                        # adsorption corona can be verified without clutter.
+                                        crop_source_img = (
+                                            render_selected_bubbles_inspection_overlay(
+                                                image=base_display_img,
+                                                df=classified_df,
+                                                selected_bubble_ids=selected_bubble_ids,
+                                                air_masks=padded_air_masks,
+                                                fat_masks=padded_masks,
+                                                manual_polygons=active_manual_polygons,
+                                                ads_particles_df=ads_particles_df,
+                                                show_contact_angles=False,
+                                                show_labels=False,
+                                                corona_margin_px=int(corona_px),
+                                            )
+                                        )
+                                    crop_img = crop_source_img[y0:y1, x0:x1]
+                                    crop_caption = f"Bubble #{inspect_id} — close-up"
+                                    if not crop_show_labels:
+                                        crop_caption += " (labels hidden)"
                                     st.image(
                                         crop_img,
-                                        caption=f"Bubble #{inspect_id} — close-up",
+                                        caption=crop_caption,
                                         **_FULL_WIDTH_IMAGE_KWARGS,
                                     )
                                     st.caption(

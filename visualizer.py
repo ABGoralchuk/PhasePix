@@ -1016,6 +1016,8 @@ def render_selected_bubbles_inspection_overlay(
     manual_polygons: Optional[list[dict]],
     ads_particles_df: Optional[pd.DataFrame] = None,
     show_contact_angles: bool = True,
+    show_labels: bool = True,
+    corona_margin_px: int = 0,
 ) -> np.ndarray:
     """
     Build a QA inspection overlay for the user-selected bubbles and their adsorbed fat.
@@ -1037,6 +1039,14 @@ def render_selected_bubbles_inspection_overlay(
             containing 'id', 'parent_bubble_id' and 'contact_angle_deg'.
         show_contact_angles: Annotate adsorbed globules with theta when
             ads_particles_df is supplied (defaults to True).
+        show_labels: Master switch for every text annotation (theta values and
+            bubble IDs). Set to False for a label-free close-up that shows only the
+            cyan bubble boundary and the gold adsorbed-fat masks, so the adsorption
+            corona can be inspected without text clutter.
+        corona_margin_px: Width in pixels of the corona rim band. When > 0 the gold
+            adsorbed-fat layer is allowed to extend that far beyond the bubble
+            contour, so Pickering globules straddling the interface are drawn in
+            full instead of being clipped at the rim (0 keeps the strict clipping).
 
     Returns:
         np.ndarray: RGB uint8 inspection overlay.
@@ -1122,7 +1132,19 @@ def render_selected_bubbles_inspection_overlay(
     for pid in [pid for pid in ads_ids if pid >= 10000]:
         ads_union |= _object_binary_mask(pid, shape, manual_polygons, fat_masks, air_masks)
 
-    ads_union = (ads_union > 0) & selected_bool
+    # Corona band: corona (Pickering) globules straddle the rim, so their gold mask is
+    # allowed to extend a few pixels beyond the bubble contour instead of being clipped.
+    ads_region_bool = selected_bool
+    corona_margin = max(0, int(corona_margin_px or 0))
+    if corona_margin > 0:
+        corona_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * corona_margin + 1, 2 * corona_margin + 1)
+        )
+        ads_region_bool = (
+            cv2.dilate(selected_union.astype(np.uint8), corona_kernel) > 0
+        )
+
+    ads_union = (ads_union > 0) & ads_region_bool
     _apply_color_overlay(rgb, ads_union, (255, 215, 0), 0.50)
     if np.any(ads_union):
         ads_cnts, _ = cv2.findContours(
@@ -1139,7 +1161,8 @@ def render_selected_bubbles_inspection_overlay(
 
     # Compact contact-angle annotations next to each adsorbed globule centroid
     if (
-        show_contact_angles
+        show_labels
+        and show_contact_angles
         and isinstance(ads_particles_df, pd.DataFrame)
         and not ads_particles_df.empty
         and "id" in ads_particles_df.columns
@@ -1191,7 +1214,9 @@ def render_selected_bubbles_inspection_overlay(
             cx, cy = centroid
             if not (0 <= cx < shape[1] and 0 <= cy < shape[0]):
                 continue
-            if not selected_bool[int(round(cy)), int(round(cx))]:
+            # Corona globules sit on the rim, so the label anchor may fall just
+            # outside the bubble contour: accept the widened corona band as well.
+            if not ads_region_bool[int(round(cy)), int(round(cx))]:
                 continue
 
             theta_val = row.get("contact_angle_deg")
@@ -1213,23 +1238,25 @@ def render_selected_bubbles_inspection_overlay(
                 thickness=font_thickness, lineType=cv2.LINE_AA,
             )
 
-    # Large bubble ID labels exactly at each bubble-mask centroid (drawn on top)
-    for b_id, b_mask in bubble_masks.items():
-        ys_b, xs_b = np.nonzero(b_mask)
-        if len(xs_b) > 0:
-            cx, cy = int(xs_b.mean()), int(ys_b.mean())
-            text = str(b_id)
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            tx = int(np.clip(cx - tw // 2, 1, max(1, shape[1] - tw - 2)))
-            ty = int(np.clip(cy + th // 2, th + 1, shape[0] - 2))
-            cv2.putText(
-                rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 0, 0), 3, cv2.LINE_AA,
-            )
-            cv2.putText(
-                rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (255, 255, 255), 2, cv2.LINE_AA,
-            )
+    # Large bubble ID labels exactly at each bubble-mask centroid (drawn on top).
+    # Skipped entirely when ``show_labels`` is False so the close-up crop stays clean.
+    if show_labels:
+        for b_id, b_mask in bubble_masks.items():
+            ys_b, xs_b = np.nonzero(b_mask)
+            if len(xs_b) > 0:
+                cx, cy = int(xs_b.mean()), int(ys_b.mean())
+                text = str(b_id)
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                tx = int(np.clip(cx - tw // 2, 1, max(1, shape[1] - tw - 2)))
+                ty = int(np.clip(cy + th // 2, th + 1, shape[0] - 2))
+                cv2.putText(
+                    rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 0, 0), 3, cv2.LINE_AA,
+                )
+                cv2.putText(
+                    rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2, cv2.LINE_AA,
+                )
 
     return rgb
 

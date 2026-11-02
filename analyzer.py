@@ -16,6 +16,12 @@ from skimage.measure import regionprops
 from skimage.segmentation import watershed
 import tifffile
 
+# Fraction of a globule's own segmented area that must fall inside the dilated
+# bubble-rim band for it to count as Pickering corona (adsorbed) fat. A globule
+# that merely touches the bubble still has its inner cap inside the band, while a
+# free matrix globule that happens to sit in the neighbourhood does not.
+_CORONA_OVERLAP_MIN = 0.15
+
 
 def extract_metrics(
     original_image: np.ndarray,
@@ -2165,6 +2171,7 @@ def compute_interfacial_adsorption_metrics(
     image_shape: Tuple[int, int],
     pixel_to_um_ratio: float,
     d_ref_um: Optional[float] = None,
+    corona_margin_px: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Quantify Pickering-type interfacial adsorption of fat globules on selected air bubbles.
@@ -2172,8 +2179,17 @@ def compute_interfacial_adsorption_metrics(
     For every bubble the function rasterizes its individual mask (automatic ids from
     ``air_masks`` / ``fat_masks`` or manual polygons with id >= 10000), then collects all
     fat globules (``phase_class`` in {'adsorbed_fat', 'fat_particles'}) whose centroid lies
-    inside that mask. From these it derives surface coverage, packing density, rim coverage
-    and an apparent contact angle theta for every adsorbed globule:
+    inside that mask **or inside the dilated corona rim band** (``corona_margin_px``).
+    Corona globules straddle the interface, so the segmented bubble contour often runs
+    along their inner edge and their centroid lands a few pixels outside the mask; they
+    are recovered when either
+
+      a) the centroid falls inside the dilated band, or
+      b) at least ``_CORONA_OVERLAP_MIN`` (15 %) of the globule's own segmented area
+         overlaps that band.
+
+    From these globules the function derives surface coverage, packing density, rim
+    coverage and an apparent contact angle theta for every adsorbed globule:
 
         theta = arcsin(L_c / d_ref)  [degrees]
 
@@ -2193,6 +2209,9 @@ def compute_interfacial_adsorption_metrics(
         pixel_to_um_ratio: Spatial calibration in micrometers per pixel (um/px).
         d_ref_um: Optional reference globule diameter in um. When None/<=0 it is derived
             from the mean diameter of free matrix fat globules.
+        corona_margin_px: Bubble-rim capture band in pixels (already converted from the
+            ``👑 Corona Rim Capture Distance (µm)`` slider). 0 disables the band and
+            restores the strict centroid-only behaviour.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -2324,6 +2343,26 @@ def compute_interfacial_adsorption_metrics(
     perimeters_um: list[float] = []
     processed_ids: set = set()
 
+    # Per-label pixel areas of the segmented fat mask, computed once: the corona
+    # overlap test needs "how much of THIS globule sits in the rim band", and a
+    # dense LUT keeps that a gather instead of a per-particle mask walk.
+    fat_source = None
+    fat_area_lut = None
+    if isinstance(fat_masks, np.ndarray) and fat_masks.ndim >= 2 and fat_masks.size:
+        fat_2d = fat_masks.squeeze() if fat_masks.ndim == 3 else fat_masks
+        if fat_2d.shape[:2] == shape:
+            fat_int = (
+                fat_2d
+                if np.issubdtype(fat_2d.dtype, np.integer)
+                else fat_2d.astype(np.int32)
+            )
+            max_label = int(fat_int.max())
+            if max_label > 0:
+                fat_source = fat_int
+                fat_area_lut = np.bincount(fat_int.ravel(), minlength=max_label + 1)
+
+    corona_px = max(0, int(corona_margin_px))
+
     for raw_id in selected_bubble_ids or []:
         try:
             b_id = int(raw_id)
@@ -2351,19 +2390,60 @@ def compute_interfacial_adsorption_metrics(
             if row_diam is not None and row_diam > 0:
                 bubble_diam_um = float(row_diam)
 
-        # 3) Globules whose centroid falls inside this bubble
+        # 3) Globules whose centroid falls inside this bubble — or inside its dilated
+        #    corona rim band. A Pickering corona globule straddles the interface, so
+        #    the segmented bubble contour runs along its inner edge and the centroid
+        #    can land a few pixels OUTSIDE the mask. Such globules are recovered from
+        #    the dilated band + the 15 % pixel-overlap test below.
         ys_all, xs_all = np.nonzero(b_mask)
         bx0, bx1 = int(xs_all.min()), int(xs_all.max())
         by0, by1 = int(ys_all.min()), int(ys_all.max())
+
+        b_mask_bool = b_mask > 0
+        if corona_px > 0:
+            corona_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * corona_px + 1, 2 * corona_px + 1)
+            )
+            corona_bool = cv2.dilate(b_mask_bool.astype(np.uint8), corona_kernel) > 0
+        else:
+            corona_bool = b_mask_bool
+
+        # One bincount pass per bubble gives every globule's in-band pixel count, so
+        # the 15 % overlap rule stays O(N) instead of O(particles x area).
+        band_overlap_lut = None
+        if corona_px > 0 and fat_source is not None and fat_area_lut is not None:
+            band_mask = corona_bool & (fat_source > 0)
+            band_overlap_lut = np.bincount(
+                fat_source[band_mask], minlength=int(fat_area_lut.size)
+            )
+        band_max_label = int(fat_area_lut.size) - 1 if fat_area_lut is not None else 0
+
         inside: list[dict] = []
         for particle in particles:
             if particle["id"] == b_id:
                 continue
             ix = int(round(particle["cx"]))
             iy = int(round(particle["cy"]))
-            if ix < bx0 or ix > bx1 or iy < by0 or iy > by1:
+            if (
+                ix < bx0 - corona_px
+                or ix > bx1 + corona_px
+                or iy < by0 - corona_px
+                or iy > by1 + corona_px
+            ):
                 continue
-            if 0 <= iy < shape[0] and 0 <= ix < shape[1] and b_mask[iy, ix] > 0:
+
+            is_corona = False
+            if 0 <= iy < shape[0] and 0 <= ix < shape[1] and corona_bool[iy, ix]:
+                is_corona = True
+            elif band_overlap_lut is not None:
+                p_id = int(particle["id"])
+                if 0 < p_id <= band_max_label:
+                    p_area = int(fat_area_lut[p_id])
+                    if p_area > 0:
+                        is_corona = (
+                            float(band_overlap_lut[p_id]) / float(p_area)
+                        ) >= _CORONA_OVERLAP_MIN
+            if is_corona:
                 inside.append(particle)
 
         # 4) Union of adsorbed particle masks clipped by the bubble mask
