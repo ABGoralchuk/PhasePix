@@ -3230,6 +3230,266 @@ def _corona_rim_flags(
     return flags
 
 
+def _canvas_click_points(canvas_result, scale_ratio: float = 1.0) -> list[tuple[float, float]]:
+    """
+    Extract the clicked centres (in native image pixels) from a ``st_canvas`` result.
+
+    ``point`` drawing mode stores every click as a fabric ``circle`` object whose
+    ``left``/``top`` are expressed relative to its ``originX``/``originY`` anchor.
+    The anchor is normalised here so the returned coordinates are the true circle
+    centres, mapped back to native image pixels with ``scale_ratio``.
+
+    Args:
+        canvas_result: Result object returned by ``st_canvas`` (may be None).
+        scale_ratio: Canvas-to-image scale factor (1.0 for the 1:1 manual canvas).
+
+    Returns:
+        list[tuple[float, float]]: ``(x, y)`` click centres in image pixels.
+    """
+    if canvas_result is None:
+        return []
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return []
+
+    eff_scale = max(float(scale_ratio or 1.0), 1e-6)
+    origin_offsets = {"left": 0.0, "center": 0.5, "right": 1.0}
+    points: list[tuple[float, float]] = []
+    for obj in json_data.get("objects", []) or []:
+        if not isinstance(obj, dict) or str(obj.get("type", "")).lower() != "circle":
+            continue
+        try:
+            left = float(obj.get("left", 0.0))
+            top = float(obj.get("top", 0.0))
+            width = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
+            height = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
+        except (TypeError, ValueError):
+            continue
+        off_x = 0.5 - origin_offsets.get(str(obj.get("originX", "left")).lower(), 0.0)
+        off_y = 0.5 - origin_offsets.get(str(obj.get("originY", "top")).lower(), 0.0)
+        points.append(
+            ((left + width * off_x) / eff_scale, (top + height * off_y) / eff_scale)
+        )
+    return points
+
+
+def _resolve_clicked_particles(
+    click_points: list,
+    masks: Optional[np.ndarray],
+    classified_df: pd.DataFrame,
+    manual_polygons: Optional[list] = None,
+    pixel_to_um_ratio: float = 1.0,
+    neighborhood_px: int = 1,
+) -> Tuple[set, list]:
+    """
+    Map canvas click coordinates onto segmented particle IDs.
+
+    Resolution order for every click (the first hit wins):
+
+      1. ``masks[py, px]`` — the label under the cursor, plus a small
+         ``(2 * neighborhood_px + 1)^2`` window so near-edge clicks still land on
+         the intended particle (the exact pixel label is preferred);
+      2. a saved manual polygon (id >= 10000) containing the point
+         (``cv2.pointPolygonTest``);
+      3. the closest ``classified_df`` centroid within ``0.6 * diameter_px``.
+
+    Args:
+        click_points: ``(x, y)`` click centres in native image pixels.
+        masks: Labeled segmentation mask (0 = background); may be None.
+        classified_df: Classified metrics table with 'id', 'centroid_x',
+            'centroid_y' and 'diameter_um'.
+        manual_polygons: Manual contour dicts ({'id': int, 'points': (N, 2)}).
+        pixel_to_um_ratio: Calibration used to convert diameters to pixels.
+        neighborhood_px: Half-size of the search window around each click.
+
+    Returns:
+        Tuple[set, list]: matched particle IDs and the clicks that hit nothing.
+    """
+    matched: set = set()
+    unmatched: list = []
+    if not click_points:
+        return matched, unmatched
+
+    mask_2d = None
+    if isinstance(masks, np.ndarray) and masks.size:
+        candidate = masks.squeeze() if masks.ndim == 3 else masks
+        if candidate.ndim == 2:
+            mask_2d = candidate
+    mask_h, mask_w = mask_2d.shape[:2] if mask_2d is not None else (0, 0)
+
+    polygon_entries: list[tuple[int, np.ndarray]] = []
+    for polygon in manual_polygons or []:
+        if not isinstance(polygon, dict):
+            continue
+        try:
+            poly_id = int(polygon.get("id"))
+        except (TypeError, ValueError):
+            continue
+        pts = polygon.get("points")
+        if pts is None:
+            continue
+        try:
+            pts_arr = np.asarray(pts, dtype=np.float32)
+        except (TypeError, ValueError):
+            continue
+        if pts_arr.ndim == 2 and pts_arr.shape[0] >= 3 and pts_arr.shape[1] >= 2:
+            polygon_entries.append((poly_id, pts_arr[:, :2]))
+
+    ids_arr = np.empty(0, dtype=float)
+    cx_arr = np.empty(0, dtype=float)
+    cy_arr = np.empty(0, dtype=float)
+    radius_arr = np.empty(0, dtype=float)
+    if isinstance(classified_df, pd.DataFrame) and not classified_df.empty:
+        if {"id", "centroid_x", "centroid_y"}.issubset(classified_df.columns):
+            ids_arr = pd.to_numeric(
+                classified_df["id"], errors="coerce"
+            ).to_numpy(dtype=float)
+            cx_arr = pd.to_numeric(
+                classified_df["centroid_x"], errors="coerce"
+            ).to_numpy(dtype=float)
+            cy_arr = pd.to_numeric(
+                classified_df["centroid_y"], errors="coerce"
+            ).to_numpy(dtype=float)
+            if "diameter_um" in classified_df.columns:
+                diam_um = pd.to_numeric(
+                    classified_df["diameter_um"], errors="coerce"
+                ).to_numpy(dtype=float)
+            else:
+                diam_um = np.zeros_like(ids_arr)
+            ratio = float(pixel_to_um_ratio) if float(pixel_to_um_ratio or 0) > 0 else 1.0
+            radius_arr = 0.6 * np.nan_to_num(diam_um, nan=0.0) / ratio
+
+    for raw_x, raw_y in click_points:
+        try:
+            px_f, py_f = float(raw_x), float(raw_y)
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(px_f) and np.isfinite(py_f)):
+            continue
+        px, py = int(round(px_f)), int(round(py_f))
+
+        hit_id = None
+        if mask_2d is not None and 0 <= py < mask_h and 0 <= px < mask_w:
+            exact = int(mask_2d[py, px])
+            if 0 < exact < 10000:
+                hit_id = exact
+            else:
+                pad = int(max(0, neighborhood_px))
+                y0, y1 = max(0, py - pad), min(mask_h, py + pad + 1)
+                x0, x1 = max(0, px - pad), min(mask_w, px + pad + 1)
+                labels = mask_2d[y0:y1, x0:x1]
+                labels = labels[labels > 0]
+                if labels.size:
+                    values, counts = np.unique(labels, return_counts=True)
+                    hit_id = int(values[int(np.argmax(counts))])
+
+        if hit_id is None:
+            for poly_id, pts_arr in polygon_entries:
+                if cv2.pointPolygonTest(pts_arr, (px_f, py_f), False) >= 0:
+                    hit_id = int(poly_id)
+                    break
+
+        if hit_id is None and ids_arr.size:
+            finite = np.isfinite(ids_arr) & np.isfinite(cx_arr) & np.isfinite(cy_arr)
+            if np.any(finite):
+                dist = np.hypot(cx_arr[finite] - px_f, cy_arr[finite] - py_f)
+                nearest = int(np.argmin(dist))
+                limit = float(radius_arr[finite][nearest])
+                if limit > 0 and float(dist[nearest]) <= limit:
+                    hit_id = int(ids_arr[finite][nearest])
+
+        if hit_id is None:
+            unmatched.append((px_f, py_f))
+        else:
+            matched.add(int(hit_id))
+
+    return matched, unmatched
+
+
+def _respect_manual_adsorbed_overrides(
+    classified_df: pd.DataFrame,
+    overrides: dict,
+    min_fat_size: float,
+    max_fat_size: float,
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    Apply manual phase overrides, treating an explicit ``adsorbed_fat`` as final.
+
+    The automatic "adsorbed fat may only exist inside a bubble" rule (Rule 4) used
+    to delete the researcher's override whenever the particle centroid happened to
+    fall outside ``combined_bubble_mask`` — which is exactly what happens for corona
+    globules on a rim, or when the parent bubble was never segmented as an air
+    bubble. A manual ``adsorbed_fat`` assignment is a human decision and therefore
+    authoritative:
+
+      * the particle keeps ``phase_class = "adsorbed_fat"``,
+      * it is forced to ``in_bubble = True`` / ``is_partial_in_bubble = True`` so it
+        is rendered gold and included in the interfacial metrics,
+      * the automatic demotion rule is skipped for every manually overridden id.
+
+    Overrides pointing at objects that no longer exist are pruned.
+
+    Args:
+        classified_df: Classified metrics table (modified in place and returned).
+        overrides: ``manual_phase_overrides`` mapping ``{obj_id: phase}``.
+        min_fat_size: Lower fat-size bound (µm) used by the demotion rule.
+        max_fat_size: Upper fat-size bound (µm) used by the demotion rule.
+
+    Returns:
+        Tuple[pd.DataFrame, dict]: the updated table and the pruned override dict.
+    """
+    if classified_df is None or classified_df.empty or not overrides:
+        return classified_df, dict(overrides or {})
+
+    kept_overrides = dict(overrides)
+    for raw_id, override_phase in list(kept_overrides.items()):
+        try:
+            obj_id = int(raw_id)
+        except (TypeError, ValueError):
+            kept_overrides.pop(raw_id, None)
+            continue
+        norm_ov = (
+            "adsorbed_fat"
+            if str(override_phase).lower() in ("adsorbed_fat", "partial_fat")
+            else override_phase
+        )
+        match = classified_df["id"] == obj_id
+        if not bool(match.any()):
+            if norm_ov == "adsorbed_fat":
+                # The object disappeared from the analysis -> drop the stale override.
+                kept_overrides.pop(raw_id, None)
+            continue
+        if norm_ov == "adsorbed_fat":
+            classified_df.loc[match, "in_bubble"] = True
+        classified_df.loc[match, "phase_class"] = norm_ov
+
+    if "in_bubble" in classified_df.columns:
+        manual_ids = set()
+        for raw_id in kept_overrides:
+            try:
+                manual_ids.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+        outside_ads = (
+            (~classified_df["in_bubble"].fillna(False).astype(bool))
+            & classified_df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])
+            & (~classified_df["id"].isin(manual_ids))
+        )
+        if outside_ads.any():
+            in_fat = (
+                (classified_df["diameter_um"] >= float(min_fat_size))
+                & (classified_df["diameter_um"] <= float(max_fat_size))
+            )
+            classified_df.loc[outside_ads, "phase_class"] = np.where(
+                in_fat[outside_ads], "fat_particles", "Unclassified"
+            )
+
+    classified_df["is_partial_in_bubble"] = (
+        classified_df["phase_class"].astype(str).str.lower().eq("adsorbed_fat")
+    )
+    return classified_df, kept_overrides
+
+
 def _remove_nested_matryoshka_masks(
     df_in: pd.DataFrame,
     mask_arr: Optional[np.ndarray],
@@ -3491,7 +3751,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.11.02 (v1.7.4 - Corona Rim & Scale-Bar Fix)**")
+    st.caption("📦 **Build: 2026.11.02 (v1.7.5 - Fast ROI SAM & Click-to-Reclassify)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
@@ -5435,9 +5695,18 @@ else:
         if auto_bubble_fat.any():
             classified_df.loc[auto_bubble_fat, "phase_class"] = "adsorbed_fat"
 
-        # Rule 4: Outside bubble field, status 'adsorbed_fat' is strictly FORBIDDEN!
-        # Objects outside bubble field cannot have adsorbed_fat status
-        outside_partial = (~classified_df["in_bubble"].fillna(False).astype(bool)) & classified_df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])
+        # Rule 4: Outside bubble field, status 'adsorbed_fat' is strictly FORBIDDEN —
+        # but ONLY for automatic classifications. A particle the researcher explicitly
+        # assigned to 'adsorbed_fat' (table, bulk buttons or the Click-to-Reclassify
+        # tool) is never demoted here; those rows carry in_bubble = True already.
+        _manual_override_ids = set(
+            (st.session_state.get("manual_phase_overrides") or {}).keys()
+        )
+        outside_partial = (
+            (~classified_df["in_bubble"].fillna(False).astype(bool))
+            & classified_df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])
+            & (~classified_df["id"].isin(_manual_override_ids))
+        )
         if outside_partial.any():
             classified_df.loc[outside_partial, "phase_class"] = np.where(
                 is_in_fat_size[outside_partial], "fat_particles", "Unclassified"
@@ -5453,34 +5722,16 @@ else:
         st.session_state["manual_phase_overrides"] = {}
 
     if st.session_state.get("manual_phase_overrides") and not classified_df.empty:
-        for obj_id, override_phase in list(st.session_state["manual_phase_overrides"].items()):
-            norm_ov = "adsorbed_fat" if str(override_phase).lower() in ("adsorbed_fat", "partial_fat") else override_phase
-            match_row = classified_df[classified_df["id"] == obj_id]
-            if not match_row.empty:
-                row_in_b = bool(match_row["in_bubble"].values[0]) if "in_bubble" in match_row.columns else False
-                if norm_ov == "adsorbed_fat" and not row_in_b:
-                    # Dynamically clean override when outside bubble: object can NEVER have adsorbed_fat status outside bubble!
-                    del st.session_state["manual_phase_overrides"][obj_id]
-                    diam = float(match_row["diameter_um"].values[0]) if "diameter_um" in match_row.columns else 0.0
-                    in_fat_sz = (float(min_fat_size) <= diam <= float(max_fat_size))
-                    norm_ov = "fat_particles" if in_fat_sz else "Unclassified"
-                classified_df.loc[classified_df["id"] == obj_id, "phase_class"] = norm_ov
-            else:
-                if norm_ov == "adsorbed_fat":
-                    del st.session_state["manual_phase_overrides"][obj_id]
-
-        # Enforce outside bubble rule again after manual overrides
-        outside_ads = (~classified_df["in_bubble"].fillna(False).astype(bool)) & classified_df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])
-        if outside_ads.any():
-            is_in_fat = (
-                (classified_df["diameter_um"] >= float(min_fat_size))
-                & (classified_df["diameter_um"] <= float(max_fat_size))
-            )
-            classified_df.loc[outside_ads, "phase_class"] = np.where(
-                is_in_fat[outside_ads], "fat_particles", "Unclassified"
-            )
-
-        classified_df["is_partial_in_bubble"] = classified_df["phase_class"].astype(str).str.lower().eq("adsorbed_fat")
+        # A manual phase assignment (table, bulk buttons, Click-to-Reclassify) is
+        # authoritative: an explicit 'adsorbed_fat' is never demoted, and such rows
+        # are forced to in_bubble/in_partial so they render gold and reach metrics.
+        classified_df, _kept_overrides = _respect_manual_adsorbed_overrides(
+            classified_df,
+            st.session_state["manual_phase_overrides"],
+            float(min_fat_size),
+            float(max_fat_size),
+        )
+        st.session_state["manual_phase_overrides"] = _kept_overrides
 
     # Final air-bubble deduplication: drop smaller air bubbles that sit inside bigger ones
     # (auto Pass 1, Pass 2 leftovers and manual bubbles; overlap >= 45% of filled area).
@@ -6588,6 +6839,12 @@ else:
             st.session_state[manual_items_key] = []
         saved_items = st.session_state[manual_items_key]
 
+        # Flash message for actions that are followed by st.rerun() (e.g. the
+        # Click-to-Reclassify batch), so the user actually sees what happened.
+        _manual_flash = st.session_state.pop("_manual_flash", None)
+        if _manual_flash:
+            st.success(_manual_flash, icon="✅")
+
         # Inject modern sticky CSS for toolbar
         st.markdown(
             """
@@ -6633,13 +6890,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     "📦 AI Smart Box (Draw Rectangle around bubble/particle — SAM AI fit)",
                     "📐 Exact Smooth Curve by Points (Click points — 100% exact pass-through)",
                     "🪄 1-Click Dark Pore Center (Click center — auto-detect dark pore)",
+                    "🎨 Click to Reclassify Existing Particles (Group Click Mode)",
                 ],
                 index=0,
                 horizontal=True,
                 help=(
                     "📦 AI Smart Box: Draw a rectangle around a bubble/particle — SAM AI (with a Scale-Normalized Cellpose fallback) fits the true SEM boundary and converts it into a smooth contour.\n"
                     "📐 Exact Smooth Curve: Click points around the object — a periodic spline passes exactly through your clicks (no AI shift, no Fourier distortion).\n"
-                    "🪄 1-Click Dark Pore Center: Click in the dark core of a pore — PhasePix auto-detects the crater boundary."
+                    "🪄 1-Click Dark Pore Center: Click in the dark core of a pore — PhasePix auto-detects the crater boundary.\n"
+                    "🎨 Click to Reclassify: Every segmented particle is painted on the canvas; pick a target phase and click particles one by one to reassign them in bulk."
                 ),
             )
 
@@ -6665,9 +6924,38 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 active_sam_type = sam_model_choice.split(" ")[0].strip()
 
             # Row 2: Target Phase Assignment (Col 1) and Action Buttons (Col 2)
+            click_target_phase = ""
             t_row2_col1, t_row2_col2 = st.columns([1.6, 1.2])
             with t_row2_col1:
-                if is_emulsion_ui:
+                if assist_mode.startswith("🎨"):
+                    # Group Click Mode: pick what the clicked EXISTING particles become.
+                    click_phase_options = (
+                        ["fat_particles", "Unclassified", "🗑️ Delete (Exclude)"]
+                        if is_emulsion_ui
+                        else [
+                            "adsorbed_fat",
+                            "fat_particles",
+                            "air_bubbles",
+                            "Unclassified",
+                            "🗑️ Delete (Exclude)",
+                        ]
+                    )
+                    click_target_phase = st.radio(
+                        "Assign Clicked Particles As",
+                        options=click_phase_options,
+                        index=0,
+                        horizontal=True,
+                        help=(
+                            "Choose the target phase, then click directly on as many existing "
+                            "particles as you want (one click each). Green particles are the AI's "
+                            "Unclassified detections, orange are matrix fat, gold adsorbed fat and "
+                            "blue air bubbles. Every dot is drawn in the target colour; press "
+                            "'✅ Apply Phase to Clicked Particles' to commit. "
+                            "'🗑️ Delete (Exclude)' removes the clicked particles from the analysis."
+                        ),
+                    )
+                    default_manual_phase = "fat_particles" if is_emulsion_ui else "air_bubbles"
+                elif is_emulsion_ui:
                     default_manual_phase = st.radio(
                         "Assign New Manual Objects As",
                         options=["fat_particles", "Auto (by Min/Max Size)"],
@@ -6690,7 +6978,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         ),
                     )
             with t_row2_col2:
-                if assist_mode.startswith("📦 AI Smart Box"):
+                if assist_mode.startswith("🎨"):
+                    btn_add_label = "✅ Apply Phase to Clicked Particles"
+                elif assist_mode.startswith("📦 AI Smart Box"):
                     btn_add_label = "➕ Detect & Add from Box(es)"
                 elif assist_mode.startswith("🪄 1-Click"):
                     btn_add_label = "➕ Add Droplet" if is_emulsion_ui else "➕ Add Bubble"
@@ -6793,7 +7083,47 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     cv2.putText(canvas_bg_np, lbl, (cx_canv - 12, cy_canv + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 2, lineType=cv2.LINE_AA)
                     cv2.putText(canvas_bg_np, lbl, (cx_canv - 12, cy_canv + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
-        canvas_bg = Image.fromarray(canvas_bg_np)
+        # 3. 🎨 Group Click Mode: paint EVERY segmented particle on the canvas so the
+        #    user can see (and click) all of them — green Unclassified detections are
+        #    emphasised because they are the usual reclassification targets.
+        if assist_mode.startswith("🎨") and not classified_df.empty:
+            _phase_palette = {
+                "air_bubbles": (0, 191, 255),
+                "fat_particles": (255, 165, 0),
+                "adsorbed_fat": (255, 215, 0),
+                "unclassified": (50, 205, 50),
+            }
+            _phase_norm = classified_df["phase_class"].astype(str).str.lower()
+            for _phase_key, _color in _phase_palette.items():
+                _phase_ids = classified_df.loc[
+                    (_phase_norm == _phase_key) & (classified_df["id"] < 10000), "id"
+                ].tolist()
+                if not _phase_ids:
+                    continue
+                if isinstance(filtered_masks, np.ndarray) and filtered_masks.size:
+                    _phase_mask = (
+                        _lut_label_filter(filtered_masks, _phase_ids, keep=True) > 0
+                    )
+                else:
+                    _phase_mask = np.zeros(canvas_bg_np.shape[:2], dtype=bool)
+                if _phase_mask.shape[:2] != canvas_bg_np.shape[:2]:
+                    continue
+                if np.any(_phase_mask):
+                    _alpha = 0.55 if _phase_key == "unclassified" else 0.32
+                    canvas_bg_np[_phase_mask] = (
+                        canvas_bg_np[_phase_mask].astype(np.float32) * (1.0 - _alpha)
+                        + np.array(_color, dtype=np.float32) * _alpha
+                    ).clip(0, 255).astype(np.uint8)
+                    _edges = cv2.morphologyEx(
+                        _phase_mask.astype(np.uint8),
+                        cv2.MORPH_GRADIENT,
+                        np.ones((3, 3), np.uint8),
+                    ) > 0
+                    canvas_bg_np[_edges] = _color
+
+        # Clean RGB PIL image: st_canvas encodes it through Streamlit's media file
+        # manager, so an exact 3-channel bitmap is required for a reliable URL.
+        canvas_bg = Image.fromarray(np.asarray(canvas_bg_np)).convert("RGB")
 
         # Informative captions and full-size tips
         if is_emulsion_ui:
@@ -6809,7 +7139,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 "💡 **Pro-Tip:** Collapse the left sidebar (**<<** at top-left) to view the micrograph in full native 100% resolution. The floating toolbar stays pinned to the top as you scroll!"
             )
 
-        if assist_mode.startswith("📦 AI Smart Box"):
+        if assist_mode.startswith("🎨"):
+            st.caption(
+                "💡 **Tip:** Every segmented particle is painted on the canvas — **green = Unclassified**, "
+                "orange = matrix fat, gold = adsorbed fat, sky-blue = air bubbles. Pick a target on the "
+                "toolbar, click each particle you want to change, then press "
+                "**✅ Apply Phase to Clicked Particles**. The dots take the target colour, and "
+                "**🗑️ Delete (Exclude)** removes the clicked particles from the analysis."
+            )
+        elif assist_mode.startswith("📦 AI Smart Box"):
             st.caption("💡 **Tip:** Drag one or more rectangles around bubbles/particles, then click **Detect & Add from Box(es)**. SAM AI (or the Scale-Normalized Cellpose fallback) fits the real SEM boundary.")
         elif assist_mode.startswith("🪄 1-Click"):
             st.caption(
@@ -6820,7 +7158,24 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             st.caption("💡 **Tip:** Click points around the particle. PhasePix will smoothly interpolate exactly through your points (0.0 px shift).")
 
         # Full-width Canvas
-        if default_manual_phase == "fat_particles":
+        if assist_mode.startswith("🎨"):
+            # Group Click Mode: the click dots take the colour of the target phase.
+            if click_target_phase == "adsorbed_fat":
+                canvas_fill_color = "rgba(255, 215, 0, 0.45)"
+                canvas_stroke_color = "#FFD700"
+            elif click_target_phase == "fat_particles":
+                canvas_fill_color = "rgba(255, 165, 0, 0.45)"
+                canvas_stroke_color = "#FFA500"
+            elif click_target_phase == "air_bubbles":
+                canvas_fill_color = "rgba(0, 191, 255, 0.45)"
+                canvas_stroke_color = "#00BFFF"
+            elif "Delete" in str(click_target_phase):
+                canvas_fill_color = "rgba(255, 75, 75, 0.55)"
+                canvas_stroke_color = "#FF4B4B"
+            else:
+                canvas_fill_color = "rgba(50, 205, 50, 0.45)"
+                canvas_stroke_color = "#32CD32"
+        elif default_manual_phase == "fat_particles":
             canvas_fill_color = "rgba(255, 165, 0, 0.4)"
             canvas_stroke_color = "#FFA500"
         elif default_manual_phase == "adsorbed_fat":
@@ -6836,7 +7191,18 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         # Drawing mode: rectangles for Smart Box (SAM), clicks for point-based modes
         canvas_drawing_mode = "rect" if assist_mode.startswith("📦 AI Smart Box") else "point"
 
-        curr_ver = st.session_state.get("manual_canvas_ver", 0)
+        curr_ver = int(st.session_state.get("manual_canvas_ver", 0))
+        # STABLE component key: the drawable canvas is never remounted, so the
+        # micrograph background bitmap stays mounted on the page and cannot flash
+        # white after st.rerun() (adding / undoing / clearing manual objects used to
+        # bump a version suffix into the key, which forced a brand-new component).
+        # Resets are requested through `initial_drawing` instead: the payload carries
+        # the revision number, so fabric reloads an EMPTY canvas exactly once per
+        # click while the background image is preserved.
+        canvas_widget_key = f"manual_correction_canvas_{image_name}"
+        canvas_initial_drawing = {"version": "4.4.0", "objects": []}
+        if curr_ver:
+            canvas_initial_drawing["pp_reset_rev"] = int(curr_ver)
         canvas_result = safe_st_canvas(
             fill_color=canvas_fill_color,
             stroke_width=2,
@@ -6848,7 +7214,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             drawing_mode=canvas_drawing_mode,
             point_display_radius=4,
             display_toolbar=False,
-            key=f"manual_correction_canvas_{image_name}_{curr_ver}",
+            initial_drawing=canvas_initial_drawing,
+            key=canvas_widget_key,
         )
 
         if clear_canvas_btn:
@@ -6870,107 +7237,172 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 st.rerun()
 
         if add_drawn_btn:
-            has_raster = (
-                canvas_result is not None
-                and canvas_result.image_data is not None
-                and (
-                    np.any(canvas_result.image_data[:, :, 3] > 0)
-                    if canvas_result.image_data.ndim == 3 and canvas_result.image_data.shape[2] >= 4
-                    else np.any(canvas_result.image_data > 0)
+            if assist_mode.startswith("🎨"):
+                # ── 🎨 Group Click Mode: reclassify/exclude the clicked particles ──
+                clicked_points = _canvas_click_points(
+                    canvas_result, scale_ratio=canvas_scale_ratio
                 )
-            )
-            has_json = (
-                canvas_result is not None
-                and canvas_result.json_data is not None
-                and bool(canvas_result.json_data.get("objects"))
-            )
-
-            if has_raster or has_json:
-                existing_ids = [item["id"] for item in saved_items]
-                start_new_id = max(existing_ids, default=10000) + 1
-
-                cp_model = None
-                if assist_mode.startswith("📦 AI Smart Box") or assist_mode.startswith("🪄 1-Click"):
-                    try:
-                        cp_model = get_cellpose_model(
-                            model_type=model_type,
-                            custom_model_path=custom_model_path,
+                if not clicked_points:
+                    st.info(
+                        "Click directly on the particles you want to reclassify, then press "
+                        "'✅ Apply Phase to Clicked Particles'.",
+                        icon="💡",
+                    )
+                else:
+                    clicked_ids, unmatched_points = _resolve_clicked_particles(
+                        click_points=clicked_points,
+                        masks=filtered_masks,
+                        classified_df=classified_df,
+                        manual_polygons=st.session_state.get("manual_polygons_list", []),
+                        pixel_to_um_ratio=float(pixel_to_um_ratio),
+                    )
+                    if not clicked_ids:
+                        st.warning(
+                            f"Clicked {len(clicked_points)} point(s) but no segmented particle "
+                            "was found there. Click directly on a coloured particle.",
+                            icon="⚠️",
                         )
-                    except Exception as e:
-                        st.warning(f"Could not load Cellpose model for AI assistance: {e}")
-                        cp_model = None
-
-                parsed_metrics, parsed_polys = parse_canvas_manual_objects(
-                    canvas_json=canvas_result.json_data if has_json else None,
-                    scale_ratio=canvas_scale_ratio,
-                    original_image=analysis_img,
-                    pixel_to_um_ratio=pixel_to_um_ratio,
-                    start_id=start_new_id,
-                    image_data=canvas_result.image_data if has_raster else None,
-                    # Exact Smooth Curve mode -> clean periodic spline through the clicks
-                    assist_mode=(
-                        "exact_manual"
-                        if assist_mode.startswith("📐 Exact Smooth")
-                        else assist_mode
-                    ),
-                    cellpose_model=cp_model,
-                    max_air_size_um=max_air_size,
-                    target_phase=default_manual_phase,
-                    invert_brightfield=(
-                        invert_brightfield if 'invert_brightfield' in locals() else False
-                    ),
-                    sam_model_type=active_sam_type,
-                )
-
-                if parsed_metrics:
-                    for m, p in zip(parsed_metrics, parsed_polys):
-                        if "area_px" not in m:
-                            m["area_px"] = (
-                                m["area_um2"] / (pixel_to_um_ratio ** 2)
-                                if pixel_to_um_ratio > 0
-                                else 0.0
+                    else:
+                        _is_delete = "Delete" in str(click_target_phase)
+                        if _is_delete:
+                            if "interactive_excluded_ids" not in st.session_state:
+                                st.session_state["interactive_excluded_ids"] = set()
+                            st.session_state["interactive_excluded_ids"].update(
+                                int(value) for value in clicked_ids
                             )
-                        st.session_state[manual_items_key].append({
-                            "id": m["id"],
-                            "metrics": m,
-                            "polygon": p,
-                            "assigned_class": (
-                                default_manual_phase
-                                if default_manual_phase != "Auto (by Min/Max Size)"
-                                else "air_bubbles"
-                            ),
-                        })
-
-                        if default_manual_phase != "Auto (by Min/Max Size)":
+                            for _pid in clicked_ids:
+                                st.session_state.get("manual_phase_overrides", {}).pop(
+                                    int(_pid), None
+                                )
+                            _flash = (
+                                f"🗑️ Excluded {len(clicked_ids)} clicked particle(s): "
+                                f"`{sorted(clicked_ids)}`"
+                            )
+                        else:
                             if "manual_phase_overrides" not in st.session_state:
                                 st.session_state["manual_phase_overrides"] = {}
-                            st.session_state["manual_phase_overrides"][m["id"]] = default_manual_phase
+                            for _pid in clicked_ids:
+                                st.session_state["manual_phase_overrides"][int(_pid)] = str(
+                                    click_target_phase
+                                )
+                            _flash = (
+                                f"✅ Assigned {len(clicked_ids)} clicked particle(s) → "
+                                f"**{click_target_phase}**: `{sorted(clicked_ids)}`"
+                            )
+                        if unmatched_points:
+                            _flash += f" · {len(unmatched_points)} click(s) hit no particle"
+                        # Refresh the Phase Classifications table + the canvas overlay.
+                        for _stale_editor in [
+                            k
+                            for k in list(st.session_state.keys())
+                            if str(k).startswith("particle_data_editor")
+                        ]:
+                            del st.session_state[_stale_editor]
+                        st.session_state["_manual_flash"] = _flash
+                        st.session_state["manual_canvas_ver"] = curr_ver + 1
+                        st.rerun()
+            else:
+                has_raster = (
+                    canvas_result is not None
+                    and canvas_result.image_data is not None
+                    and (
+                        np.any(canvas_result.image_data[:, :, 3] > 0)
+                        if canvas_result.image_data.ndim == 3 and canvas_result.image_data.shape[2] >= 4
+                        else np.any(canvas_result.image_data > 0)
+                    )
+                )
+                has_json = (
+                    canvas_result is not None
+                    and canvas_result.json_data is not None
+                    and bool(canvas_result.json_data.get("objects"))
+                )
 
-                    st.session_state["manual_canvas_ver"] = curr_ver + 1
-                    st.success(f"Added {len(parsed_metrics)} object(s) to dataset!", icon="✅")
-                    st.rerun()
+                if has_raster or has_json:
+                    existing_ids = [item["id"] for item in saved_items]
+                    start_new_id = max(existing_ids, default=10000) + 1
+
+                    cp_model = None
+                    if assist_mode.startswith("📦 AI Smart Box") or assist_mode.startswith("🪄 1-Click"):
+                        try:
+                            cp_model = get_cellpose_model(
+                                model_type=model_type,
+                                custom_model_path=custom_model_path,
+                            )
+                        except Exception as e:
+                            st.warning(f"Could not load Cellpose model for AI assistance: {e}")
+                            cp_model = None
+
+                    parsed_metrics, parsed_polys = parse_canvas_manual_objects(
+                        canvas_json=canvas_result.json_data if has_json else None,
+                        scale_ratio=canvas_scale_ratio,
+                        original_image=analysis_img,
+                        pixel_to_um_ratio=pixel_to_um_ratio,
+                        start_id=start_new_id,
+                        image_data=canvas_result.image_data if has_raster else None,
+                        # Exact Smooth Curve mode -> clean periodic spline through the clicks
+                        assist_mode=(
+                            "exact_manual"
+                            if assist_mode.startswith("📐 Exact Smooth")
+                            else assist_mode
+                        ),
+                        cellpose_model=cp_model,
+                        max_air_size_um=max_air_size,
+                        target_phase=default_manual_phase,
+                        invert_brightfield=(
+                            invert_brightfield if 'invert_brightfield' in locals() else False
+                        ),
+                        sam_model_type=active_sam_type,
+                    )
+
+                    if parsed_metrics:
+                        for m, p in zip(parsed_metrics, parsed_polys):
+                            if "area_px" not in m:
+                                m["area_px"] = (
+                                    m["area_um2"] / (pixel_to_um_ratio ** 2)
+                                    if pixel_to_um_ratio > 0
+                                    else 0.0
+                                )
+                            st.session_state[manual_items_key].append({
+                                "id": m["id"],
+                                "metrics": m,
+                                "polygon": p,
+                                "assigned_class": (
+                                    default_manual_phase
+                                    if default_manual_phase != "Auto (by Min/Max Size)"
+                                    else "air_bubbles"
+                                ),
+                            })
+
+                            if default_manual_phase != "Auto (by Min/Max Size)":
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                st.session_state["manual_phase_overrides"][m["id"]] = default_manual_phase
+
+                        st.session_state["manual_canvas_ver"] = curr_ver + 1
+                        st.success(f"Added {len(parsed_metrics)} object(s) to dataset!", icon="✅")
+                        st.rerun()
+                    else:
+                        if assist_mode.startswith("📦 AI Smart Box"):
+                            st.warning("Could not extract an object from the drawn box(es). Draw a larger rectangle around a single bubble/particle and try again.", icon="⚠️")
+                        elif assist_mode.startswith("🪄 1-Click"):
+                            st.warning("Could not detect bubble boundaries from the clicked center(s). Try clicking closer to the center of the dark pore.", icon="⚠️")
+                        else:
+                            st.warning("Please click at least 2 points to form a closed manual shape.", icon="⚠️")
                 else:
                     if assist_mode.startswith("📦 AI Smart Box"):
-                        st.warning("Could not extract an object from the drawn box(es). Draw a larger rectangle around a single bubble/particle and try again.", icon="⚠️")
+                        st.info("Canvas is empty. Draw a rectangle around a bubble/particle, then click '➕ Detect & Add from Box(es)'.", icon="💡")
                     elif assist_mode.startswith("🪄 1-Click"):
-                        st.warning("Could not detect bubble boundaries from the clicked center(s). Try clicking closer to the center of the dark pore.", icon="⚠️")
+                        st.info(
+                            f"Canvas is empty. Click in the center of one or more {'droplets' if is_emulsion_ui else 'dark bubbles'}, "
+                            f"then click '➕ {'Add Droplet' if is_emulsion_ui else 'Add Bubble'}'.",
+                            icon="💡",
+                        )
                     else:
-                        st.warning("Please click at least 2 points to form a closed manual shape.", icon="⚠️")
-            else:
-                if assist_mode.startswith("📦 AI Smart Box"):
-                    st.info("Canvas is empty. Draw a rectangle around a bubble/particle, then click '➕ Detect & Add from Box(es)'.", icon="💡")
-                elif assist_mode.startswith("🪄 1-Click"):
-                    st.info(
-                        f"Canvas is empty. Click in the center of one or more {'droplets' if is_emulsion_ui else 'dark bubbles'}, "
-                        f"then click '➕ {'Add Droplet' if is_emulsion_ui else 'Add Bubble'}'.",
-                        icon="💡",
-                    )
-                else:
-                    st.info(
-                        f"Canvas is empty. Click points on the image, then click "
-                        f"'➕ {'Add Manual Droplet' if is_emulsion_ui else 'Add Manual Bubble'}'.",
-                        icon="💡",
-                    )
+                        st.info(
+                            f"Canvas is empty. Click points on the image, then click "
+                            f"'➕ {'Add Manual Droplet' if is_emulsion_ui else 'Add Manual Bubble'}'.",
+                            icon="💡",
+                        )
 
         # Two-column layout beneath the full-width canvas
         st.markdown("---")

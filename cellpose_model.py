@@ -114,6 +114,18 @@ SAM_MODEL_CONFIGS = {
     },
 }
 
+# ---------------- LOCALIZED (ROI) SMART-BOX INFERENCE ----------------------
+# SAM resizes its input to 1024 px on the long side, so feeding it the full
+# high-resolution micrograph wastes preprocessing time and memory. Every drawn
+# box is therefore served from a padded crop (box + 40 % on each side, never
+# smaller than 256x256 px) and the predicted mask is shifted back into full-image
+# coordinates. Neighbouring boxes reuse the already-computed embedding.
+SAM_ROI_PAD_FRACTION = 0.40
+SAM_ROI_MIN_SIDE = 256
+# A set of boxes may share one union embedding when the union ROI is at most this
+# many times larger than the largest single-box ROI (i.e. the boxes are close).
+SAM_ROI_UNION_BUDGET = 2.5
+
 
 def _normalize_sam_model_type(sam_model_type: Optional[str]) -> str:
     """Return a valid SAM backbone key, defaulting safely to ``vit_b``."""
@@ -414,20 +426,53 @@ def get_sam_device() -> torch.device:
     """
     Return the device used by Segment Anything (SAM) predictors.
 
-    SAM mirrors the Cellpose policy for NVIDIA CUDA, but stays on CPU on Apple
-    Silicon: the SAM mask decoder mixes ``float64`` coordinates with ``float32``
-    tensors, which raises on the Metal (MPS) backend, so interactive Smart Box
-    segmentation would silently stop working. CPU keeps SAM reliable there.
+    SAM follows the Cellpose policy: NVIDIA CUDA when present, **Apple Silicon
+    MPS** otherwise (the ViT image encoder runs ~2x faster on Metal than on CPU),
+    and CPU as the final fallback. SAM's prompt/decoder tensors are all created as
+    ``float32``, so the historical ``float64`` Metal crash does not occur with the
+    current ``segment_anything`` release; if an unsupported op ever surfaces, the
+    caller moves the model back to CPU transparently (see
+    :func:`get_cached_sam_predictor_for_roi`).
 
     Returns:
-        torch.device: ``cuda`` when an NVIDIA GPU is present, otherwise ``cpu``.
+        torch.device: ``cuda`` / ``mps`` when available, otherwise ``cpu``.
     """
     device, is_gpu = get_device()
     if is_gpu and device.type == "cuda":
         return device
     if device.type == "mps":
-        logger.info("SAM stays on CPU on Apple Silicon (MPS float64 decoder limitation).")
+        logger.info("SAM image encoder runs on Apple Silicon MPS (metal).")
+        return device
     return torch.device("cpu")
+
+
+def _sam_move_to_cpu(predictor) -> bool:
+    """
+    Move a SAM predictor back to CPU after an MPS-op failure (best effort).
+
+    The Metal backend supports every op used by the ViT-B/L/H encoders and the
+    mask decoder in the pinned ``segment_anything`` release, but a future/odd
+    build could still raise on an individual kernel. Falling back to CPU keeps
+    interactive Smart Box segmentation working instead of returning an empty mask.
+
+    Args:
+        predictor: A ``SamPredictor`` instance.
+
+    Returns:
+        bool: True when the predictor now lives on CPU and its cache was cleared.
+    """
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return False
+    try:
+        model.to(device=torch.device("cpu"))
+        predictor.reset_image()
+        predictor._pp_force_cpu = True
+        logger.warning("SAM fell back to CPU (unsupported Metal op on this build).")
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("SAM CPU fallback failed: %s", exc)
+        return False
 
 
 def _instantiate_cellpose_model(
@@ -1148,8 +1193,9 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
     The checkpoint is stored under ``get_models_cache_dir()/{filename}``; missing
     or truncated files are downloaded in 8 MB chunks into a ``.part`` file and
     atomically moved into place (see :func:`ensure_sam_checkpoint`). The device
-    follows :func:`get_sam_device`: CUDA when an NVIDIA GPU is present, CPU
-    otherwise (avoids the float64/MPS decoder issues on Apple Silicon).
+    follows :func:`get_sam_device`: CUDA when an NVIDIA GPU is present, Apple
+    Silicon MPS when available, CPU otherwise. A failed MPS load degrades to CPU
+    instead of disabling Smart Box.
 
     Args:
         sam_model_type: One of ``"vit_b"``, ``"vit_l"``, ``"vit_h"``.
@@ -1170,13 +1216,25 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
         if ckpt_path is None:
             return None
 
-        # CUDA is selected automatically when an NVIDIA GPU is present.
-        # Apple Silicon stays on CPU: the SAM mask decoder raises float64 /
-        # float32 dtype errors on the Metal (MPS) backend.
         sam_device = get_sam_device()
         sam = sam_model_registry[sam_type](checkpoint=str(ckpt_path))
-        sam.to(device=sam_device)
+        try:
+            sam.to(device=sam_device)
+        except Exception as exc:
+            if sam_device.type == "cpu":
+                raise
+            logger.warning(
+                "SAM could not move to %s (%s); falling back to CPU.",
+                sam_device.type,
+                exc,
+            )
+            sam_device = torch.device("cpu")
+            sam.to(device=sam_device)
         predictor = SamPredictor(sam)
+        # Book-keeping used by the ROI embedding cache / CPU fallback.
+        predictor._pp_force_cpu = sam_device.type == "cpu"
+        predictor._pp_cached_hash = None
+        predictor._pp_cached_region = None
         logger.info("SAM SamPredictor (%s) initialized on %s.", sam_type, sam_device.type)
         return predictor
     except Exception as exc:
@@ -1184,17 +1242,157 @@ def get_sam_predictor(sam_model_type: str = "vit_b"):
         return None
 
 
+def get_cached_sam_predictor_for_roi(
+    image_2d: np.ndarray,
+    roi_xyxy: Optional[Tuple[float, float, float, float]] = None,
+    sam_model_type: str = "vit_b",
+):
+    """
+    Return a SAM predictor whose image embeddings cover ``roi_xyxy`` only.
+
+    SAM's encoder always resizes its input to 1024 px, so encoding the full
+    micrograph costs the same as encoding a crop while forcing every drawn box to
+    pay that price again. This helper:
+
+      * encodes only the padded ROI requested by the caller,
+      * reuses the cached embedding whenever the requested ROI lies inside the
+        region that is already encoded (neighbouring boxes / a pre-warmed union),
+      * falls back to CPU transparently when an MPS kernel raises, then retries once.
+
+    Args:
+        image_2d: 2D grayscale image array.
+        roi_xyxy: Box that must be covered by the embedding; None encodes the whole image.
+        sam_model_type: SAM backbone key (``"vit_b"``, ``"vit_l"``, ``"vit_h"``).
+
+    Returns:
+        Tuple[SamPredictor, Tuple[int, int, int, int]] | None: the predictor and the
+        encoded region ``(x0, y0, x1, y1)`` in full-image pixels, or None.
+    """
+    predictor = get_sam_predictor(sam_model_type=sam_model_type)
+    if predictor is None:
+        return None
+
+    if image_2d.ndim == 3:
+        image_2d = image_2d[:, :, 0]
+    full_h, full_w = image_2d.shape[:2]
+    if full_h <= 0 or full_w <= 0:
+        return None
+
+    region = _sam_roi_bounds(roi_xyxy, (full_h, full_w))
+    try:
+        img_hash = hash(image_2d.tobytes())
+    except Exception:  # pragma: no cover - defensive
+        img_hash = None
+
+    cached_region = getattr(predictor, "_pp_cached_region", None)
+    if (
+        img_hash is not None
+        and getattr(predictor, "_pp_cached_hash", None) == img_hash
+        and cached_region is not None
+    ):
+        cx0, cy0, cx1, cy1 = cached_region
+        if region[0] >= cx0 and region[1] >= cy0 and region[2] <= cx1 and region[3] <= cy1:
+            return predictor, cached_region
+
+    x0, y0, x1, y1 = region
+    crop = image_2d[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+
+    try:
+        clahe = apply_clahe(crop)
+        rgb = cv2.cvtColor(clahe, cv2.COLOR_GRAY2RGB)
+        try:
+            predictor.set_image(rgb)
+        except Exception as exc:
+            # Metal op unsupported on this build -> move the whole model to CPU once.
+            if predictor.device.type == "cpu":
+                raise
+            logger.warning(
+                "SAM ROI encoding failed on %s (%s); retrying on CPU.",
+                predictor.device,
+                exc,
+            )
+            if not _sam_move_to_cpu(predictor):
+                raise
+            predictor.set_image(rgb)
+
+        predictor._pp_cached_hash = img_hash
+        predictor._pp_cached_region = region
+        return predictor, region
+    except Exception as exc:
+        logger.warning("Failed to compute SAM image embeddings: %s", exc)
+        return None
+
+
+def _sam_roi_bounds(
+    roi_xyxy: Optional[Tuple[float, float, float, float]],
+    shape: Tuple[int, int],
+    pad_fraction: float = SAM_ROI_PAD_FRACTION,
+    min_side: int = SAM_ROI_MIN_SIDE,
+) -> Tuple[int, int, int, int]:
+    """
+    Return the padded, image-clamped ROI that SAM should encode for one box.
+
+    The box is expanded by ``pad_fraction`` of its own size on every side (40 % by
+    default, so the surrounding matrix context stays visible), grown to at least
+    ``min_side`` x ``min_side`` px around its centre, and finally clamped to the
+    image bounds.
+
+    Args:
+        roi_xyxy: Box as ``(x1, y1, x2, y2)`` in image pixels, or None for the whole image.
+        shape: Image shape ``(height, width)``.
+        pad_fraction: Fraction of the box size added on each side.
+        min_side: Minimum ROI side length in pixels.
+
+    Returns:
+        Tuple[int, int, int, int]: ``(x0, y0, x1, y1)`` integer ROI bounds.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    if roi_xyxy is None:
+        return 0, 0, width, height
+    try:
+        x1, y1, x2, y2 = (float(value) for value in roi_xyxy)
+    except (TypeError, ValueError):
+        return 0, 0, width, height
+    if not all(np.isfinite([x1, y1, x2, y2])) or x2 <= x1 or y2 <= y1:
+        return 0, 0, width, height
+
+    pad_x = (x2 - x1) * float(pad_fraction)
+    pad_y = (y2 - y1) * float(pad_fraction)
+    fx0, fx1 = x1 - pad_x, x2 + pad_x
+    fy0, fy1 = y1 - pad_y, y2 + pad_y
+
+    if (fx1 - fx0) < float(min_side):
+        grow = (float(min_side) - (fx1 - fx0)) / 2.0
+        fx0 -= grow
+        fx1 += grow
+    if (fy1 - fy0) < float(min_side):
+        grow = (float(min_side) - (fy1 - fy0)) / 2.0
+        fy0 -= grow
+        fy1 += grow
+
+    x0 = int(max(0, math.floor(fx0)))
+    y0 = int(max(0, math.floor(fy0)))
+    x1i = int(min(width, math.ceil(fx1)))
+    y1i = int(min(height, math.ceil(fy1)))
+    if x1i <= x0:
+        x1i = min(width, x0 + 1)
+    if y1i <= y0:
+        y1i = min(height, y0 + 1)
+    return x0, y0, x1i, y1i
+
+
 def get_cached_sam_predictor_for_image(
     image_2d: np.ndarray,
     sam_model_type: str = "vit_b",
 ):
     """
-    Return a SAM predictor whose image embeddings are computed for ``image_2d``.
+    Return a SAM predictor with embeddings for the whole ``image_2d``.
 
-    Image embeddings are expensive to compute, so they are cached on the predictor
-    instance via the ``_cached_img_hash`` attribute. Each backbone has its own cached
-    predictor instance, therefore switching ``vit_b`` <-> ``vit_h`` never reuses
-    embeddings computed by a different architecture.
+    Thin wrapper around :func:`get_cached_sam_predictor_for_roi` kept for callers
+    that genuinely need a full-field embedding; the interactive Smart Box path
+    always requests a local ROI instead.
 
     Args:
         image_2d: 2D grayscale image array.
@@ -1203,26 +1401,79 @@ def get_cached_sam_predictor_for_image(
     Returns:
         SamPredictor | None: Predictor with embeddings set for the image, or None.
     """
-    predictor = get_sam_predictor(sam_model_type=sam_model_type)
-    if predictor is None:
-        return None
+    state = get_cached_sam_predictor_for_roi(image_2d, None, sam_model_type)
+    return state[0] if state is not None else None
 
+
+def prefetch_sam_roi(
+    image_2d: np.ndarray,
+    roi_xyxy: Optional[Tuple[float, float, float, float]] = None,
+    sam_model_type: str = "vit_b",
+) -> bool:
+    """
+    Warm the SAM embedding cache for one ROI (best effort, never raises).
+
+    Args:
+        image_2d: 2D grayscale image array.
+        roi_xyxy: Region that must be covered, or None for the whole image.
+        sam_model_type: SAM backbone key.
+
+    Returns:
+        bool: True when an embedding covering ``roi_xyxy`` is available.
+    """
     try:
-        if image_2d.ndim == 3:
-            image_2d = image_2d[:, :, 0]
-        img_hash = hash(image_2d.tobytes())
+        return get_cached_sam_predictor_for_roi(image_2d, roi_xyxy, sam_model_type) is not None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("SAM ROI prefetch failed: %s", exc)
+        return False
 
-        if getattr(predictor, "_cached_img_hash", None) == img_hash:
-            return predictor
 
-        clahe = apply_clahe(image_2d)
-        rgb = cv2.cvtColor(clahe, cv2.COLOR_GRAY2RGB)
-        predictor.set_image(rgb)
-        predictor._cached_img_hash = img_hash
-        return predictor
-    except Exception as exc:
-        logger.warning("Failed to compute SAM image embeddings: %s", exc)
-        return None
+def prefetch_sam_roi_union(
+    image_2d: np.ndarray,
+    boxes: list,
+    sam_model_type: str = "vit_b",
+    budget_factor: float = SAM_ROI_UNION_BUDGET,
+) -> bool:
+    """
+    Encode ONE union embedding for several *close* boxes (Smart Box batch).
+
+    When several rectangles are drawn around neighbouring objects their padded
+    ROIs overlap heavily. Encoding the tight union once and serving every box from
+    that embedding turns N encoder passes into one — only the mask decoder then
+    runs per box (~0.02 s instead of ~0.4 s).
+
+    Scattered boxes (whose union is far larger than a single ROI) are left alone so
+    no box is ever served from a needlessly downscaled embedding.
+
+    Args:
+        image_2d: 2D grayscale image array.
+        boxes: Iterable of ``(x1, y1, x2, y2)`` boxes in image pixels.
+        sam_model_type: SAM backbone key.
+        budget_factor: Maximum allowed ``union_area / largest_box_roi_area``.
+
+    Returns:
+        bool: True when a single union embedding was computed (or already cached).
+    """
+    if image_2d is None or getattr(image_2d, "size", 0) == 0:
+        return False
+    img_2d = image_2d[:, :, 0] if image_2d.ndim == 3 else image_2d
+    shape = img_2d.shape[:2]
+
+    rois = [_sam_roi_bounds(box, shape) for box in (boxes or [])]
+    rois = [roi for roi in rois if roi[2] > roi[0] and roi[3] > roi[1]]
+    if len(rois) < 2:
+        return False
+
+    ux0 = min(roi[0] for roi in rois)
+    uy0 = min(roi[1] for roi in rois)
+    ux1 = max(roi[2] for roi in rois)
+    uy1 = max(roi[3] for roi in rois)
+    union_area = float(max(1, ux1 - ux0) * max(1, uy1 - uy0))
+    largest_area = max(float((roi[2] - roi[0]) * (roi[3] - roi[1])) for roi in rois)
+    if largest_area <= 0 or union_area > float(budget_factor) * largest_area:
+        return False
+
+    return prefetch_sam_roi(img_2d, (ux0, uy0, ux1, uy1), sam_model_type)
 
 
 def _box_prompt_corners(
@@ -1475,13 +1726,17 @@ def predict_interactive_box_mask(
     """
     Instant interactive segmentation of an object drawn with a bounding box.
 
-    Step A (SAM, combined Box + 5-Point prompt):
+    Step A (SAM on a local ROI, combined Box + 5-Point prompt):
         The user's rectangle tightly frames one object, so its center is foreground
         while its 4 inset corners are guaranteed background. SAM receives all 5 points
-        plus the box at once. Of the 3 candidate masks only the one that covers the
-        center, fills 30-88% of the box and does NOT touch all 4 corners (i.e. is not
-        the rectangle itself) is accepted. Accepted masks are hole-filled and opened
-        with a 5x5 ellipse to cut thin necks to neighbouring particles.
+        plus the box at once — but only for the **padded ROI crop** around that box
+        (box + 40 % per side, min 256x256 px), never the full-resolution micrograph.
+        The predicted mask is shifted back into full-image coordinates, so nothing
+        downstream changes. Neighbouring boxes reuse the already-computed embedding.
+        Of the 3 candidate masks only the one that covers the center, fills 30-88 % of
+        the box and does NOT touch all 4 corners (i.e. is not the rectangle itself) is
+        accepted. Accepted masks are hole-filled and opened with a 5x5 ellipse to cut
+        thin necks to neighbouring particles.
 
     Step B (fallback: Cellpose in the box + Elliptical Rim Snapper):
         - A padded crop of the box is segmented with Cellpose (direct + inverted CLAHE;
@@ -1547,29 +1802,60 @@ def predict_interactive_box_mask(
 
     hint_layer = np.zeros((h, w), dtype=np.uint8)
 
-    # ── Step A: SAM — box + 1 positive centre point + 4 negative corner points ──
-    predictor = get_cached_sam_predictor_for_image(
-        image_2d, sam_model_type=sam_model_type
+    # ── Step A: SAM on the LOCAL ROI — box + 1 positive centre point + 4 negative corners
+    #    Only the padded crop around the drawn box is encoded (40 % per side, min 256 px),
+    #    so the full-resolution micrograph is never pushed through the ViT encoder.
+    sam_state = get_cached_sam_predictor_for_roi(
+        image_2d, (x1, y1, x2, y2), sam_model_type=sam_model_type
     )
-    if predictor is not None:
+    if sam_state is not None:
+        predictor, (reg_x0, reg_y0, reg_x1, reg_y1) = sam_state
+        reg_h = int(reg_y1 - reg_y0)
+        reg_w = int(reg_x1 - reg_x0)
         try:
+            # Prompt geometry in ROI-local coordinates.
+            local_box = np.array(
+                [
+                    x1 - reg_x0,
+                    y1 - reg_y0,
+                    x2 - reg_x0,
+                    y2 - reg_y0,
+                ],
+                dtype=np.float32,
+            )
+            local_corners = _box_prompt_corners(
+                float(local_box[0]),
+                float(local_box[1]),
+                float(local_box[2]),
+                float(local_box[3]),
+                dx,
+                dy,
+            )
             pt_coords = np.vstack(
-                [np.array([[cx_box, cy_box]], dtype=np.float32), corners]
+                [
+                    np.array(
+                        [[cx_box - reg_x0, cy_box - reg_y0]], dtype=np.float32
+                    ),
+                    local_corners,
+                ]
             )
             pt_labels = np.array([1, 0, 0, 0, 0], dtype=np.int32)
             masks, scores, _ = predictor.predict(
                 point_coords=pt_coords,
                 point_labels=pt_labels,
-                box=np.array([x1, y1, x2, y2], dtype=np.float32),
+                box=local_box,
                 multimask_output=True,
             )
 
             best_mask = None
             best_score = -1.0
             for i in range(len(masks)):
-                cand = np.asarray(masks[i]).astype(bool)
-                if cand.shape[:2] != (h, w):
+                local = np.asarray(masks[i]).astype(bool)
+                if local.shape[:2] != (reg_h, reg_w):
                     continue
+                # Shift the ROI-local prediction back into full-image coordinates.
+                cand = np.zeros((h, w), dtype=bool)
+                cand[reg_y0:reg_y1, reg_x0:reg_x1] = local
                 ratio = float(np.count_nonzero(cand)) / box_area
                 if ratio < 0.30 or ratio > 0.88:
                     continue

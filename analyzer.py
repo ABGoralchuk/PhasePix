@@ -1500,6 +1500,45 @@ def parse_canvas_manual_objects(
     objects = canvas_json.get("objects", []) if isinstance(canvas_json, dict) else []
     has_valid_json_objects = False
 
+    # ── Smart Box pre-warm: one SAM embedding for a tight cluster of boxes ─────
+    # Every rectangle is served from a padded local ROI anyway (never the full
+    # micrograph). When several boxes sit close together their ROIs overlap, so a
+    # single union embedding is encoded up-front and reused by all of them, turning
+    # N ViT encoder passes into one.
+    if objects and str(assist_mode or "").startswith("📦"):
+        _rect_boxes = []
+        for _obj in objects:
+            if not isinstance(_obj, dict) or str(_obj.get("type", "")).lower() != "rect":
+                continue
+            try:
+                _left = float(_obj.get("left", 0.0)) / eff_scale
+                _top = float(_obj.get("top", 0.0)) / eff_scale
+                _bw = float(_obj.get("width", 0.0)) * float(_obj.get("scaleX", 1.0)) / eff_scale
+                _bh = float(_obj.get("height", 0.0)) * float(_obj.get("scaleY", 1.0)) / eff_scale
+            except (TypeError, ValueError):
+                continue
+            if _bw < 5.0 or _bh < 5.0:
+                continue
+            _rect_boxes.append(
+                (
+                    max(0.0, _left),
+                    max(0.0, _top),
+                    min(float(target_w - 1), _left + _bw),
+                    min(float(target_h - 1), _top + _bh),
+                )
+            )
+        if len(_rect_boxes) > 1:
+            try:
+                from cellpose_model import prefetch_sam_roi_union
+
+                prefetch_sam_roi_union(
+                    img_2d, _rect_boxes, sam_model_type=sam_model_type
+                )
+            except Exception:
+                # Pre-warming is a pure optimisation - never block the manual workflow.
+                pass
+
+
     def _commit_contour(pts_arr: np.ndarray, shape_type: str) -> bool:
         nonlocal curr_id, has_valid_json_objects
         if pts_arr is None or len(pts_arr) < 3:
