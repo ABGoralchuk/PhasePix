@@ -216,6 +216,21 @@ SEM_FOCUS_TWO_PASS = "🫧+🟠 Both Air Bubbles & Fat Particles (Two-Pass)"
 LIGHT_PROFILE_LIQUID = "💧 Liquid Fat (Smooth Globules)"
 LIGHT_PROFILE_CRYSTALLIZED = "❄️ Crystallized Fat (Textured / Internal Crystals)"
 
+# ---------------- MANUAL CORRECTION: selection methods (v1.7.6) ----------------
+# Short labels keep all four options on one row; every downstream branch keys off
+# the leading emoji/prefix, so shortening them is behaviour-preserving.
+MANUAL_MODE_SMART_BOX = "📦 AI Smart Box (SAM)"
+MANUAL_MODE_RECLASSIFY = "🎨 Click to Reclassify (Group Click)"
+MANUAL_MODE_EXACT = "📐 Exact Smooth Curve (Points)"
+MANUAL_MODE_ONE_CLICK = "🪄 1-Click Dark Pore"
+MANUAL_SELECTION_METHODS = [
+    MANUAL_MODE_SMART_BOX,
+    MANUAL_MODE_RECLASSIFY,
+    MANUAL_MODE_EXACT,
+    MANUAL_MODE_ONE_CLICK,
+]
+MANUAL_MODE_WIDGET_KEY = "manual_assist_mode"
+
 # Pickering corona capture: a globule counts as corona-adsorbed when at least this
 # fraction of its own segmented area overlaps the dilated bubble-rim band. Matches
 # ``analyzer._CORONA_OVERLAP_MIN`` so classification and interfacial metrics agree.
@@ -3490,6 +3505,55 @@ def _respect_manual_adsorbed_overrides(
     return classified_df, kept_overrides
 
 
+def _canvas_phase_visibility(
+    reclassify_mode: bool,
+    show_unclassified: bool,
+    show_fat: bool,
+    show_adsorbed: bool,
+    show_air: bool,
+    isolate_unclassified: bool = False,
+) -> dict:
+    """
+    Decide which phases are painted onto the Manual-Correction canvas.
+
+    Outside ``🎨 Click to Reclassify`` mode every phase keeps its historical
+    behaviour (all painted). In Group Click mode the Sidebar Section 6 visibility
+    state is honoured, and ``isolate_unclassified`` hides every already-classified
+    phase so only the green Unclassified particles remain on the raw micrograph.
+
+    Args:
+        reclassify_mode: True when the 🎨 Group Click selection method is active.
+        show_unclassified: Paint green Unclassified particles.
+        show_fat: Paint orange matrix-fat particles.
+        show_adsorbed: Paint gold adsorbed-fat globules.
+        show_air: Paint sky-blue air bubbles.
+        isolate_unclassified: Hide fat / adsorbed fat / air entirely.
+
+    Returns:
+        dict: ``{phase_key: bool}`` for ``air_bubbles``, ``fat_particles``,
+        ``adsorbed_fat`` and ``unclassified``.
+    """
+    if not reclassify_mode:
+        return {
+            "air_bubbles": True,
+            "fat_particles": True,
+            "adsorbed_fat": True,
+            "unclassified": True,
+        }
+
+    visible = {
+        "air_bubbles": bool(show_air),
+        "fat_particles": bool(show_fat),
+        "adsorbed_fat": bool(show_adsorbed),
+        "unclassified": bool(show_unclassified),
+    }
+    if isolate_unclassified:
+        visible["air_bubbles"] = False
+        visible["fat_particles"] = False
+        visible["adsorbed_fat"] = False
+    return visible
+
+
 def _remove_nested_matryoshka_masks(
     df_in: pd.DataFrame,
     mask_arr: Optional[np.ndarray],
@@ -3751,7 +3815,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.11.02 (v1.7.5 - Fast ROI SAM & Click-to-Reclassify)**")
+    st.caption("📦 **Build: 2026.11.02 (v1.7.6 - Inline Base64 Canvas & Unclassified Isolation)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
@@ -4916,6 +4980,12 @@ with st.sidebar:
         show_air = st.checkbox("Show Air Bubbles", value=True)
         show_fat = False
         show_adsorbed = False
+        show_unclassified = st.checkbox(
+            "Show Unclassified (Green)",
+            value=True,
+            key="show_unclassified_toggle",
+            help="Toggles the green Unclassified underlay in the overlay and the 🎨 canvas.",
+        )
         adsorbed_opacity = 0.0
         air_opacity = st.slider(
             "Air Bubbles Opacity",
@@ -4932,6 +5002,12 @@ with st.sidebar:
         show_air = False
         show_fat = st.checkbox("Show Fat Particles", value=True)
         show_adsorbed = False
+        show_unclassified = st.checkbox(
+            "Show Unclassified (Green)",
+            value=True,
+            key="show_unclassified_toggle",
+            help="Toggles the green Unclassified underlay in the overlay and the 🎨 canvas.",
+        )
         adsorbed_opacity = 0.0
         air_opacity = 0.0
         fat_opacity = st.slider(
@@ -4945,13 +5021,23 @@ with st.sidebar:
         z_order = "Fat over Air"
 
     else:
-        col_vis1, col_vis2, col_vis3 = st.columns(3)
+        col_vis1, col_vis2, col_vis3, col_vis4 = st.columns(4)
         with col_vis1:
             show_air = st.checkbox("Show Air Bubbles", value=True)
         with col_vis2:
             show_fat = st.checkbox("Show Fat Particles", value=True)
         with col_vis3:
             show_adsorbed = st.checkbox("Show Adsorbed Fat (in Bubbles)", value=True)
+        with col_vis4:
+            show_unclassified = st.checkbox(
+                "Show Unclassified (Green)",
+                value=True,
+                key="show_unclassified_toggle",
+                help=(
+                    "Toggles the green Unclassified underlay in the dashboard overlay and "
+                    "in the 🎨 Click-to-Reclassify canvas."
+                ),
+            )
 
         air_opacity = st.slider(
             "Air Bubbles Opacity",
@@ -5912,6 +5998,7 @@ else:
             show_air=bool(show_air),
             show_fat=bool(show_fat),
             show_adsorbed=bool(show_adsorbed),
+            show_unclassified=bool(show_unclassified),
             adsorbed_opacity=float(adsorbed_opacity),
             z_order=str(z_order),
             manual_polygons=active_manual_polygons,
@@ -5932,6 +6019,7 @@ else:
             show_air=bool(show_air),
             show_fat=bool(show_fat),
             show_adsorbed=bool(show_adsorbed),
+            show_unclassified=bool(show_unclassified),
             adsorbed_opacity=float(adsorbed_opacity),
             z_order=str(z_order),
             manual_polygons=active_manual_polygons,
@@ -6158,15 +6246,36 @@ else:
     # is a horizontal radio group - same look, same "always one tab active"
     # semantics, supported by every Streamlit release from 1.10 onwards.
     _default_tab = "📊 Interactive Dashboard"
+    # Deferred UI navigation requests (e.g. the dashboard
+    # "🎨 Click-to-Reclassify on Image" shortcut). Applied BEFORE the widgets are
+    # created, otherwise Streamlit rejects the session-state assignment.
+    _pending_nav = st.session_state.pop("_pending_navigation_tab", None)
+    if _pending_nav and _pending_nav in tab_options:
+        st.session_state["navigation_tab"] = _pending_nav
+    _pending_manual_mode = st.session_state.pop("_pending_manual_mode", None)
+    if _pending_manual_mode in MANUAL_SELECTION_METHODS:
+        st.session_state[MANUAL_MODE_WIDGET_KEY] = _pending_manual_mode
+
     active_tab = st.radio(
         "Navigation",
         options=tab_options,
         index=tab_options.index(_default_tab) if _default_tab in tab_options else 0,
         horizontal=True,
         label_visibility="collapsed",
+        key="navigation_tab",
     )
     if not active_tab:
         active_tab = _default_tab
+
+    # Tab-transition tracking: entering 🖌️ Manual Correction bumps the canvas reset
+    # counter so the drawable canvas re-renders its (inline) background immediately
+    # instead of waiting for an asynchronous media load.
+    if st.session_state.get("_last_active_tab") != active_tab:
+        st.session_state["_last_active_tab"] = active_tab
+        if active_tab == "🖌️ Manual Correction":
+            st.session_state["manual_canvas_ver"] = (
+                int(st.session_state.get("manual_canvas_ver", 0)) + 1
+            )
 
     # Active Smart Box SAM backbone (persisted across tabs for the session manifest).
     _sam_backbone_state = str(st.session_state.get("sam_backbone_select", "vit_b"))
@@ -6470,6 +6579,18 @@ else:
                     n_unclass_out_bub = len(unclass_out_bub)
 
                     st.markdown(f"**⚡ Smart Group Bulk Actions for {unclass_count} Unclassified Particles:**")
+                    if st.button(
+                        "🎨 Click-to-Reclassify on Image",
+                        use_container_width=True,
+                        help=(
+                            "Opens 🖌️ Manual Correction with the 🎨 Click to Reclassify "
+                            "(Group Click) mode pre-selected, so individual Unclassified "
+                            "particles can be clicked straight on the micrograph."
+                        ),
+                    ):
+                        st.session_state["_pending_manual_mode"] = MANUAL_MODE_RECLASSIFY
+                        st.session_state["_pending_navigation_tab"] = "🖌️ Manual Correction"
+                        st.rerun()
                     if is_emulsion_ui:
                         # Single-phase Emulsion: no air/adsorbed phases exist
                         e_col1, e_col2 = st.columns(2)
@@ -6883,22 +7004,22 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         with st.container():
             st.markdown('<div class="sticky-toolbar-marker"></div>', unsafe_allow_html=True)
 
-            # Row 1: Selection Method
+            # Row 1: Selection Method (short labels -> all four fit on one row)
             assist_mode = st.radio(
                 "Selection Method",
-                [
-                    "📦 AI Smart Box (Draw Rectangle around bubble/particle — SAM AI fit)",
-                    "📐 Exact Smooth Curve by Points (Click points — 100% exact pass-through)",
-                    "🪄 1-Click Dark Pore Center (Click center — auto-detect dark pore)",
-                    "🎨 Click to Reclassify Existing Particles (Group Click Mode)",
-                ],
+                MANUAL_SELECTION_METHODS,
                 index=0,
                 horizontal=True,
+                key=MANUAL_MODE_WIDGET_KEY,
                 help=(
-                    "📦 AI Smart Box: Draw a rectangle around a bubble/particle — SAM AI (with a Scale-Normalized Cellpose fallback) fits the true SEM boundary and converts it into a smooth contour.\n"
-                    "📐 Exact Smooth Curve: Click points around the object — a periodic spline passes exactly through your clicks (no AI shift, no Fourier distortion).\n"
-                    "🪄 1-Click Dark Pore Center: Click in the dark core of a pore — PhasePix auto-detects the crater boundary.\n"
-                    "🎨 Click to Reclassify: Every segmented particle is painted on the canvas; pick a target phase and click particles one by one to reassign them in bulk."
+                    "📦 AI Smart Box (SAM): Draw a rectangle around a bubble/particle — SAM AI "
+                    "(with a Scale-Normalized Cellpose fallback) fits the true SEM boundary.\n"
+                    "🎨 Click to Reclassify (Group Click): Every segmented particle is painted on the "
+                    "canvas; pick a target phase and click particles one by one to reassign them in bulk.\n"
+                    "📐 Exact Smooth Curve (Points): Click points around the object — a periodic spline "
+                    "passes exactly through your clicks (no AI shift, no Fourier distortion).\n"
+                    "🪄 1-Click Dark Pore: Click in the dark core of a pore — PhasePix auto-detects the "
+                    "crater boundary."
                 ),
             )
 
@@ -7001,6 +7122,55 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 with col_btn3:
                     clear_canvas_btn = st.button("🔄 Clear Unsaved Drawing", type="secondary", use_container_width=True)
 
+            # Row 3: Canvas Phase Visibility — 🎨 Group Click Mode only.
+            # Lets the user declutter the canvas (e.g. isolate the green Unclassified
+            # detections that still need a phase) without touching the other modes.
+            canvas_show_unclassified = bool(show_unclassified)
+            canvas_show_fat = bool(show_fat)
+            canvas_show_adsorbed = bool(show_adsorbed)
+            canvas_show_air = bool(show_air)
+            isolate_unclassified_only = False
+            if assist_mode.startswith("🎨"):
+                vis_col1, vis_col2, vis_col3, vis_col4 = st.columns(4)
+                with vis_col1:
+                    canvas_show_unclassified = st.checkbox(
+                        "🟢 Show Unclassified",
+                        value=bool(show_unclassified),
+                        key="canvas_show_unclassified",
+                        help="Paint the green Unclassified particles onto the canvas.",
+                    )
+                with vis_col2:
+                    canvas_show_fat = st.checkbox(
+                        "🟧 Show Matrix Fat",
+                        value=bool(show_fat),
+                        key="canvas_show_fat",
+                        help="Paint the orange matrix-fat particles (synced with Sidebar → Section 6).",
+                    )
+                with vis_col3:
+                    canvas_show_adsorbed = st.checkbox(
+                        "🟨 Show Adsorbed Fat",
+                        value=bool(show_adsorbed),
+                        key="canvas_show_adsorbed",
+                        help="Paint the gold adsorbed-fat globules (synced with Sidebar → Section 6).",
+                    )
+                with vis_col4:
+                    canvas_show_air = st.checkbox(
+                        "🟦 Show Air Bubbles",
+                        value=bool(show_air),
+                        key="canvas_show_air",
+                        help="Paint the sky-blue air bubbles (synced with Sidebar → Section 6).",
+                    )
+                isolate_unclassified_only = st.checkbox(
+                    "🎯 Isolate Unclassified Only (Hide Fat & Air on Canvas)",
+                    value=False,
+                    key="canvas_isolate_unclassified",
+                    help=(
+                        "Hides every already-classified phase (orange fat, gold adsorbed fat, blue "
+                        "air bubbles) so only the green Unclassified particles remain on the clean "
+                        "raw micrograph — the fastest way to click through them."
+                    ),
+                )
+
         # Fixed 100% Native 1:1 Canvas Size to prevent coordinate shifting on clicks
         canvas_scale_ratio = 1.0
         target_w = m_img_w
@@ -7009,6 +7179,18 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
 
         # Pre-render existing saved manual objects and automated air bubbles onto canvas background
         canvas_bg_np = np.array(base_canvas_img)
+
+        # Phase visibility map for the canvas (🎨 Group Click Mode only). Outside that
+        # mode every phase is painted exactly as before, so the other Selection Methods
+        # keep their clean look.
+        _canvas_phase_visible = _canvas_phase_visibility(
+            reclassify_mode=assist_mode.startswith("🎨"),
+            show_unclassified=bool(canvas_show_unclassified),
+            show_fat=bool(canvas_show_fat),
+            show_adsorbed=bool(canvas_show_adsorbed),
+            show_air=bool(canvas_show_air),
+            isolate_unclassified=bool(isolate_unclassified_only),
+        )
 
         # 1. Thin teal outline around already detected automated air bubbles
         auto_air_binary = np.zeros(analysis_img.shape[:2], dtype=np.uint8)
@@ -7024,7 +7206,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     _lut_label_filter(filtered_masks, air_ids, keep=True) > 0
                 ).astype(np.uint8)
 
-        if np.any(auto_air_binary > 0):
+        if np.any(auto_air_binary > 0) and _canvas_phase_visible["air_bubbles"]:
             auto_cnts, _ = cv2.findContours(auto_air_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             for acnt in auto_cnts:
                 if len(acnt) >= 8:
@@ -7069,6 +7251,10 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         obj_color = (0, 191, 255)
 
                     pts_scaled = (np.asarray(pts, dtype=np.float32) * canvas_scale_ratio).round().astype(np.int32)
+                    _item_phase_key = str(item_phase).lower()
+                    if not _canvas_phase_visible.get(_item_phase_key, True):
+                        # 🎨 mode: this manual object's phase is hidden -> skip it entirely
+                        continue
                     tint_layer = canvas_bg_np.copy()
                     cv2.fillPoly(tint_layer, [pts_scaled], obj_color)
                     cv2.addWeighted(tint_layer, 0.35, canvas_bg_np, 0.65, 0, dst=canvas_bg_np)
@@ -7095,6 +7281,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             }
             _phase_norm = classified_df["phase_class"].astype(str).str.lower()
             for _phase_key, _color in _phase_palette.items():
+                if not _canvas_phase_visible.get(_phase_key, True):
+                    # Phase hidden by the Canvas Phase Visibility toggles / isolation.
+                    continue
                 _phase_ids = classified_df.loc[
                     (_phase_norm == _phase_key) & (classified_df["id"] < 10000), "id"
                 ].tolist()
@@ -7121,9 +7310,35 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     ) > 0
                     canvas_bg_np[_edges] = _color
 
-        # Clean RGB PIL image: st_canvas encodes it through Streamlit's media file
-        # manager, so an exact 3-channel bitmap is required for a reliable URL.
+        # Clean RGB PIL image (kept as the media-URL fallback path).
         canvas_bg = Image.fromarray(np.asarray(canvas_bg_np)).convert("RGB")
+
+        # ── Self-contained (inline) canvas background ─────────────────────────
+        # st_canvas normally publishes the bitmap to Streamlit's MediaFileManager
+        # ("/media/<hash>.png"). Those transient references can be evicted, or lose
+        # the asynchronous <img> load race after switching tabs — which renders a
+        # blank white box. The micrograph is therefore ALSO embedded as a
+        # `data:image/jpeg;base64,...` URI inside the component props (fabric
+        # `backgroundImage`): it is decoded from memory (no network round-trip) and
+        # can never expire.
+        _bg_digest = hashlib.md5(
+            np.ascontiguousarray(canvas_bg_np).tobytes()
+        ).hexdigest()
+        _bg_cache = st.session_state.get("_manual_canvas_bg_data_url")
+        if (
+            isinstance(_bg_cache, tuple)
+            and len(_bg_cache) == 2
+            and _bg_cache[0] == _bg_digest
+        ):
+            canvas_bg_data_url = _bg_cache[1]
+        else:
+            canvas_bg_data_url, _, _ = encode_image_data_url(
+                canvas_bg_np, max_width=0, quality=93
+            )
+            st.session_state["_manual_canvas_bg_data_url"] = (
+                _bg_digest,
+                canvas_bg_data_url,
+            )
 
         # Informative captions and full-size tips
         if is_emulsion_ui:
@@ -7193,14 +7408,22 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
 
         curr_ver = int(st.session_state.get("manual_canvas_ver", 0))
         # STABLE component key: the drawable canvas is never remounted, so the
-        # micrograph background bitmap stays mounted on the page and cannot flash
-        # white after st.rerun() (adding / undoing / clearing manual objects used to
-        # bump a version suffix into the key, which forced a brand-new component).
-        # Resets are requested through `initial_drawing` instead: the payload carries
-        # the revision number, so fabric reloads an EMPTY canvas exactly once per
-        # click while the background image is preserved.
+        # micrograph background stays mounted and cannot flash white after
+        # st.rerun() (v1.7.4 used to bump a version suffix into the key, which
+        # forced a brand-new component on every Add / Undo / Clear).
         canvas_widget_key = f"manual_correction_canvas_{image_name}"
-        canvas_initial_drawing = {"version": "4.4.0", "objects": []}
+        # The inline data URL is what the component actually paints: fabric loads
+        # `backgroundImage` while parsing initial_drawing, i.e. from memory and
+        # without touching the media file manager.
+        canvas_initial_drawing = {
+            "version": "4.4.0",
+            "objects": [],
+            "backgroundImage": {
+                "type": "image",
+                "src": canvas_bg_data_url,
+                "crossOrigin": None,
+            },
+        }
         if curr_ver:
             canvas_initial_drawing["pp_reset_rev"] = int(curr_ver)
         canvas_result = safe_st_canvas(
@@ -7302,15 +7525,12 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         st.session_state["manual_canvas_ver"] = curr_ver + 1
                         st.rerun()
             else:
-                has_raster = (
-                    canvas_result is not None
-                    and canvas_result.image_data is not None
-                    and (
-                        np.any(canvas_result.image_data[:, :, 3] > 0)
-                        if canvas_result.image_data.ndim == 3 and canvas_result.image_data.shape[2] >= 4
-                        else np.any(canvas_result.image_data > 0)
-                    )
-                )
+                # The micrograph is embedded inside the fabric canvas, so the
+                # raster snapshot always contains the background. Drawn objects are
+                # always serialised in json_data (rect / point / polygon / path), so
+                # the legacy raster fallback would only ever re-detect the
+                # background itself — it is disabled on purpose.
+                has_raster = False
                 has_json = (
                     canvas_result is not None
                     and canvas_result.json_data is not None

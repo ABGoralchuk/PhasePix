@@ -597,6 +597,7 @@ def create_mask_overlay(
     show_air: bool = True,
     show_fat: bool = True,
     show_adsorbed: bool = True,
+    show_unclassified: bool = True,
     adsorbed_opacity: float = 0.45,
     z_order: str = "Fat over Air",
     mask: Optional[np.ndarray] = None,
@@ -631,6 +632,10 @@ def create_mask_overlay(
         fat_opacity: Opacity for fat particles overlay layer (0.0 to 1.0, defaults to 0.3).
         show_air: Whether to render and number air bubbles (defaults to True).
         show_fat: Whether to render and number fat particles (defaults to True).
+        show_adsorbed: Whether to render and number adsorbed fat globules (defaults to True).
+        show_unclassified: Whether to render and number green Unclassified particles
+            (defaults to True). Turning it off keeps the overlay focused on the
+            explicitly classified phases.
         z_order: Layer rendering sequence ('Fat over Air' or 'Air over Fat'). Defaults to 'Fat over Air'.
         mask: Optional alias for masks (for backward compatibility).
         manual_polygons: Optional list of manual contour dicts ({'id': int, 'points': np.ndarray}).
@@ -759,7 +764,7 @@ def create_mask_overlay(
 
     # 1. Render unclassified (auto + manual) first as base underlay
     unclass_mask_series = df["phase_class"].astype(str).str.lower() == "unclassified"
-    unclass_ids = df.loc[unclass_mask_series, "id"].tolist()
+    unclass_ids = df.loc[unclass_mask_series, "id"].tolist() if show_unclassified else []
     if unclass_ids:
         unclass_mask = np.isin(mask_2d, unclass_ids)
         if air_masks is not None:
