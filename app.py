@@ -3554,6 +3554,36 @@ def _canvas_phase_visibility(
     return visible
 
 
+def _sem_phase_tool_visibility(sample_type: str) -> dict:
+    """
+    Return which SEM phase-specific Section 5 controls should be displayed.
+
+    The sidebar must only offer tools that can actually act on the selected
+    Phase Classification mode, otherwise the panel is cluttered with sliders whose
+    phases do not exist in the current analysis:
+
+      * ``Emulsion`` — single-phase fat: only the Matrix Fat circularity is relevant
+        (air-bubble, adsorbed-fat and deep-scan controls are hidden);
+      * ``Foam`` — single-phase air: only the Air Bubble circularity is relevant
+        (matrix-fat, adsorbed-fat and deep-scan controls are hidden);
+      * ``Whipped Emulsion`` — multi-phase: every control is shown.
+
+    Args:
+        sample_type: Active ``Sample Type`` radio value.
+
+    Returns:
+        dict: ``{"air": bool, "fat": bool, "adsorbed": bool}``.
+    """
+    mode = str(sample_type or "Whipped Emulsion").strip()
+    if mode not in ("Emulsion", "Foam", "Whipped Emulsion"):
+        mode = "Whipped Emulsion"
+    return {
+        "air": mode in ("Foam", "Whipped Emulsion"),
+        "fat": mode in ("Emulsion", "Whipped Emulsion"),
+        "adsorbed": mode == "Whipped Emulsion",
+    }
+
+
 def _remove_nested_matryoshka_masks(
     df_in: pd.DataFrame,
     mask_arr: Optional[np.ndarray],
@@ -3815,7 +3845,7 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.11.02 (v1.7.6 - Inline Base64 Canvas & Unclassified Isolation)**")
+    st.caption("📦 **Build: 2026.11.02 (v1.7.7 - Phase-Aware Sidebar Tools)**")
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
@@ -4644,24 +4674,61 @@ with st.sidebar:
             )
         st.caption("ℹ️ Light Microscopy: only fat-droplet circularity/convexity filtering is applied.")
     else:
-        air_min_circularity = st.slider(
-            "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05,
-            key="sem_air_circ_slider",
-        )
-        fat_min_circularity = st.slider(
-            "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.01,
-            key="shared_fat_circ_slider",
-        )
-        ads_min_circularity = st.slider(
-            "🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05,
-            key="sem_ads_circ_slider",
-        )
-        enable_deepscan = st.checkbox(
-            "🔬 Deep-Scan Adsorbed Fat inside Bubbles",
-            value=False,
-            help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
-            key="sem_deepscan_checkbox",
-        )
+        # ── SEM: show ONLY the controls that belong to the active Sample Type ──
+        # Emulsion (single-phase fat) -> fat tools, Foam (single-phase air) -> air
+        # tools, Whipped Emulsion -> the full multi-phase set. Hidden controls keep
+        # working through their stored / canonical values, so classification is
+        # unaffected by the reduced panel.
+        _phase_tools = _sem_phase_tool_visibility(sample_type)
+        _sem_defaults = PARAMETER_WIDGET_DEFAULTS["SEM"]
+
+        if _phase_tools["air"]:
+            air_min_circularity = st.slider(
+                "🫧 Air Bubbles Min Circularity", 0.0, 1.0, 0.50, 0.05,
+                key="sem_air_circ_slider",
+            )
+        else:
+            # Emulsion has no air phase: reuse the stored / canonical value.
+            air_min_circularity = float(
+                st.session_state.get(
+                    "sem_air_circ_slider", _sem_defaults["sem_air_circ_slider"]
+                )
+            )
+
+        if _phase_tools["fat"]:
+            fat_min_circularity = st.slider(
+                "🟧 Matrix Fat Min Circularity", 0.0, 1.0, 0.60, 0.01,
+                key="shared_fat_circ_slider",
+            )
+        else:
+            # Foam has no fat phase: reuse the stored / canonical value.
+            fat_min_circularity = float(
+                st.session_state.get(
+                    "shared_fat_circ_slider", _sem_defaults["shared_fat_circ_slider"]
+                )
+            )
+
+        if _phase_tools["adsorbed"]:
+            ads_min_circularity = st.slider(
+                "🟨 Adsorbed Fat Min Circularity (in Bubbles)", 0.0, 1.0, 0.30, 0.05,
+                key="sem_ads_circ_slider",
+            )
+            enable_deepscan = st.checkbox(
+                "🔬 Deep-Scan Adsorbed Fat inside Bubbles",
+                value=False,
+                help="Runs localized shadow-recovery Cellpose inside confirmed air bubbles. Keep unchecked for fast preview.",
+                key="sem_deepscan_checkbox",
+            )
+        else:
+            # No air–fat interface in this mode: the adsorbed-fat filter and the
+            # in-bubble deep scan cannot act on anything, so they stay hidden.
+            ads_min_circularity = float(
+                st.session_state.get(
+                    "sem_ads_circ_slider", _sem_defaults["sem_ads_circ_slider"]
+                )
+            )
+            enable_deepscan = False
+
         # ── 👑 Pickering corona capture ───────────────────────────────────────
         # Corona globules sit ON the interface, so their centroid can fall a few
         # pixels outside the segmented air-bubble contour. This band captures them
@@ -4693,7 +4760,23 @@ with st.sidebar:
             corona_capture_um = float(
                 st.session_state.get("sem_corona_Capture_um", CORONA_CAPTURE_UM_DEFAULT)
             )
-        st.caption("ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat.")
+
+        if sample_type == "Emulsion":
+            st.caption(
+                "ℹ️ **Single-phase Emulsion** — only Matrix Fat tools are shown; "
+                "air-bubble, adsorbed-fat and deep-scan controls are hidden and keep "
+                "their stored values."
+            )
+        elif sample_type == "Foam":
+            st.caption(
+                "ℹ️ **Foam** — only Air Bubble tools are shown; matrix-fat, "
+                "adsorbed-fat and deep-scan controls are hidden and keep their stored "
+                "values."
+            )
+        else:
+            st.caption(
+                "ℹ️ Colloid Chemistry: Fat within bubble regions is classified as adsorbed_fat."
+            )
 
     min_circularity = fat_min_circularity  # Fallback alias for backward compatibility
 
