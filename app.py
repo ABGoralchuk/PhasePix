@@ -2731,6 +2731,15 @@ st.set_page_config(
 )
 
 
+# ---------------- BUILD IDENTITY (v1.7.8) ----------------
+# One source of truth for the sidebar build badge *and* the exported session manifest,
+# so a manuscript can always be traced back to the exact PhasePix build that produced
+# its numbers (together with the source-image SHA-256 recorded in Tab 4).
+PHASEPIX_BUILD_VERSION = "v1.7.8"
+PHASEPIX_BUILD_DATE = "2026.11.03"
+PHASEPIX_BUILD_TITLE = "Vectorized Loops, Runtime Profiler & QC Filter"
+
+
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
 def cached_segmentation(
     image: np.ndarray,
@@ -3082,6 +3091,134 @@ def _parse_particle_id_filter(raw_text: str) -> Optional[set]:
             ids.add(int(token))
 
     return ids or None
+
+
+# ---------------- ⚠️ QC BORDERLINE FILTER (v1.7.8) ----------------
+# A dedicated quality-control view of the Phase Classifications table: instead of
+# scanning hundreds of rows, the microscopist sees only the objects whose automatic
+# classification is unresolved (``Unclassified``) or sits on a decision boundary —
+# circularity just above the phase's minimum, or a diameter within 10 % of the active
+# Min/Max size limits. Those are exactly the particles that flip phase after a small
+# re-measurement, so they are the ones that deserve a human look.
+QC_BORDERLINE_CIRC_MARGIN = 0.05      # absolute circularity band above the threshold
+QC_BORDERLINE_SIZE_FRACTION = 0.10    # relative band around the Min/Max size limits
+
+
+def _qc_borderline_mask(
+    df_in: pd.DataFrame,
+    min_circ_by_phase: dict,
+    size_bounds_by_phase: Optional[dict] = None,
+    circ_margin: float = QC_BORDERLINE_CIRC_MARGIN,
+    size_fraction: float = QC_BORDERLINE_SIZE_FRACTION,
+) -> pd.Series:
+    """Boolean mask of particles that need human quality-control inspection.
+
+    A particle is flagged when **any** of the following holds:
+      * ``phase_class`` is ``Unclassified`` (the classifier could not place it);
+      * ``circularity`` lies inside ``[min_circ, min_circ + circ_margin]`` of its own
+        phase's minimum circularity threshold (borderline shape);
+      * ``diameter_um`` lies within ``size_fraction`` (relative) of that phase's active
+        Min or Max size boundary (borderline size).
+
+    Args:
+        df_in: Classified metrics table (needs ``phase_class``; ``circularity`` and
+            ``diameter_um`` are used when present).
+        min_circ_by_phase: Per-phase minimum circularity, e.g.
+            ``{"air_bubbles": 0.55, "fat_particles": 0.70, "adsorbed_fat": 0.30}``.
+        size_bounds_by_phase: Per-phase ``(min_um, max_um)`` limit pair. Phases missing
+            from this mapping are only shape-tested.
+        circ_margin: Absolute circularity band above the phase threshold (default 0.05).
+        size_fraction: Relative band around each size limit (default 0.10 = 10 %).
+
+    Returns:
+        pd.Series: Boolean mask aligned with ``df_in.index``.
+    """
+    if df_in is None or len(df_in) == 0:
+        return pd.Series(dtype=bool)
+
+    index = df_in.index
+    needs_qc = pd.Series(False, index=index)
+    if "phase_class" not in df_in.columns:
+        return needs_qc
+
+    phases = df_in["phase_class"].astype(str).str.strip().str.lower()
+    needs_qc |= phases.eq("unclassified")
+
+    nan_column = pd.Series(np.nan, index=index, dtype=float)
+    circularity = (
+        pd.to_numeric(df_in["circularity"], errors="coerce")
+        if "circularity" in df_in.columns
+        else nan_column
+    )
+    diameter = (
+        pd.to_numeric(df_in["diameter_um"], errors="coerce")
+        if "diameter_um" in df_in.columns
+        else nan_column
+    )
+
+    size_bounds_by_phase = size_bounds_by_phase or {}
+    band = max(float(size_fraction), 0.0)
+    margin = max(float(circ_margin), 0.0)
+
+    for phase_key, min_circ in dict(min_circ_by_phase or {}).items():
+        in_phase = phases.eq(str(phase_key).strip().lower())
+        if not bool(in_phase.any()):
+            continue
+
+        borderline = pd.Series(False, index=index)
+        if min_circ is not None:
+            circ_min = float(min_circ)
+            borderline |= (circularity >= circ_min) & (circularity <= circ_min + margin)
+
+        bounds = size_bounds_by_phase.get(phase_key)
+        if bounds is not None and len(bounds) == 2:
+            lo_bound, hi_bound = float(bounds[0]), float(bounds[1])
+            if lo_bound > 0:
+                borderline |= (diameter >= lo_bound * (1.0 - band)) & (
+                    diameter <= lo_bound * (1.0 + band)
+                )
+            if hi_bound > 0:
+                borderline |= (diameter >= hi_bound * (1.0 - band)) & (
+                    diameter <= hi_bound * (1.0 + band)
+                )
+
+        needs_qc |= in_phase & borderline
+
+    return needs_qc.fillna(False).astype(bool)
+
+
+def _filter_qc_borderline_particles(
+    df_in: pd.DataFrame,
+    min_circ_by_phase: dict,
+    size_bounds_by_phase: Optional[dict] = None,
+    circ_margin: float = QC_BORDERLINE_CIRC_MARGIN,
+    size_fraction: float = QC_BORDERLINE_SIZE_FRACTION,
+) -> pd.DataFrame:
+    """Return only the borderline / unclassified rows of ``df_in`` (column order kept).
+
+    Args:
+        df_in: Classified metrics table (or the already ID-filtered view).
+        min_circ_by_phase: Per-phase minimum circularity thresholds.
+        size_bounds_by_phase: Per-phase ``(min_um, max_um)`` limits.
+        circ_margin: Absolute circularity band above each threshold.
+        size_fraction: Relative band around each size limit.
+
+    Returns:
+        pd.DataFrame: Filtered copy with a fresh ``RangeIndex``.
+    """
+    if df_in is None:
+        return pd.DataFrame()
+    if len(df_in) == 0:
+        return df_in
+
+    mask = _qc_borderline_mask(
+        df_in,
+        min_circ_by_phase=min_circ_by_phase,
+        size_bounds_by_phase=size_bounds_by_phase,
+        circ_margin=circ_margin,
+        size_fraction=size_fraction,
+    )
+    return df_in.loc[mask].reset_index(drop=True)
 
 
 def _apply_particle_editor_changes(
@@ -3804,6 +3941,72 @@ def cached_prune_nested_auto_objects(
     return df_out, mask_out
 
 
+# ---------------- PIPELINE RUNTIME PROFILER (v1.7.8) ----------------
+# Every analysis run is split into four wall-clock stages, each measured with
+# ``time.perf_counter()`` around the real work. Because the sidebar is rendered
+# *before* the pipeline executes, the badge is written into a placeholder created next
+# to the hardware badge and filled once the numbers exist — the sidebar and the
+# exported session manifest therefore always report the very same run.
+PIPELINE_STAGE_LABELS = {
+    "decode": "Decode & Crop",
+    "ai": "AI Segmentation",
+    "metrics": "Metrics & Classification",
+    "overlay": "Overlay Render",
+}
+
+
+def pipeline_timing_template() -> dict:
+    """Return a zeroed timing dict for the four core pipeline stages."""
+    return {stage: 0.0 for stage in PIPELINE_STAGE_LABELS}
+
+
+def pipeline_timing_total(timing: dict) -> float:
+    """Total wall-clock seconds of the four measured stages."""
+    return float(sum(float(timing.get(stage, 0.0)) for stage in PIPELINE_STAGE_LABELS))
+
+
+def format_pipeline_runtime(timing: dict) -> str:
+    """One-line badge: total plus the AI / metrics / render breakdown."""
+    return (
+        f"⚡ Total: {pipeline_timing_total(timing):.2f} s "
+        f"(AI: {float(timing.get('ai', 0.0)):.2f} s · "
+        f"Metrics: {float(timing.get('metrics', 0.0)):.2f} s · "
+        f"Render: {float(timing.get('overlay', 0.0)):.2f} s)"
+    )
+
+
+def pipeline_timing_breakdown(timing: dict) -> dict:
+    """Rounded per-stage seconds + total, ready for the session manifest / JSON."""
+    breakdown = {
+        PIPELINE_STAGE_LABELS[stage]: round(float(timing.get(stage, 0.0)), 3)
+        for stage in PIPELINE_STAGE_LABELS
+    }
+    breakdown["Total"] = round(pipeline_timing_total(timing), 3)
+    return breakdown
+
+
+def render_pipeline_runtime(placeholder, timing: dict) -> None:
+    """Fill the sidebar ⏱️ Pipeline Runtime block created above the pipeline."""
+    if placeholder is None:
+        return
+    with placeholder.container():
+        st.caption(format_pipeline_runtime(timing))
+        with st.expander("⏱️ Pipeline Runtime", expanded=False):
+            rows = "\n".join(
+                f"| {PIPELINE_STAGE_LABELS[stage]} | {float(timing.get(stage, 0.0)):.3f} |"
+                for stage in PIPELINE_STAGE_LABELS
+            )
+            st.markdown(
+                f"| Stage | Time (s) |\n|---|---:|\n{rows}\n"
+                f"| **Total** | **{pipeline_timing_total(timing):.3f}** |"
+            )
+            st.caption(
+                "Wall-clock time of the last analysis run (`time.perf_counter()`). "
+                "The first pass of an image also warms the Cellpose / metrics caches, "
+                "so repeated slider or tab changes are usually much faster."
+            )
+
+
 # ---------------- SIDEBAR CONFIGURATION ----------------
 with st.sidebar:
     # ── Pre-widget session-state synchronisation ─────────────────────────────
@@ -3845,7 +4048,9 @@ with st.sidebar:
 
     st.title("🔬 PhasePix Controls")
     st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
-    st.caption("📦 **Build: 2026.11.02 (v1.7.7 - Phase-Aware Sidebar Tools)**")
+    st.caption(
+        f"📦 **Build: {PHASEPIX_BUILD_DATE} ({PHASEPIX_BUILD_VERSION} - {PHASEPIX_BUILD_TITLE})**"
+    )
 
     # Hardware Acceleration Status — the fastest backend is picked automatically at
     # startup by get_device(): NVIDIA CUDA -> Apple Metal (MPS) -> CPU.
@@ -3869,6 +4074,13 @@ with st.sidebar:
                 "work identically, though neural network segmentation takes slightly longer per "
                 "image.\n"
             )
+
+    # ⏱️ Pipeline Runtime (v1.7.8) — the placeholder sits directly under the hardware
+    # badge and is filled at the END of this run, once the four stages (decode → AI →
+    # metrics → render) have actually executed. Streamlit keeps placeholders at their
+    # original position, so the numbers appear in the sidebar above the settings even
+    # though they are produced much later in the script.
+    pipeline_runtime_placeholder = st.empty()
 
     st.divider()
 
@@ -5198,6 +5410,10 @@ else:
     # adsorbed-fat UI controls, since those phases cannot exist in this mode.
     is_emulsion_ui = (sample_type == "Emulsion") or is_light_mode
 
+    # ⏱️ Runtime profiler (v1.7.8): stage 1/4 — image decoding & cropping.
+    pipeline_timing = pipeline_timing_template()
+    _stage_started = time.perf_counter()
+
     # 1. Decode original full micrograph
     original_img = decode_image_bytes(image_bytes)
     img_h, img_w = original_img.shape[:2]
@@ -5216,6 +5432,9 @@ else:
         if effective_footer > 0
         else original_img
     )
+    pipeline_timing["decode"] = time.perf_counter() - _stage_started
+    # ⏱️ Stage 2/4 — AI segmentation (Cellpose single/two-pass + bubble deep-scan).
+    _stage_started = time.perf_counter()
 
     # 2. Run / Retrieve cached Cellpose segmentation on cropped analysis_img
     #    Mode selection controls which detector(s) fire:
@@ -5476,6 +5695,9 @@ else:
 
     # Ensure manual air bubbles are included for all modes
     combined_bubble_mask = compute_cumulative_bubble_mask(air_masks)
+    pipeline_timing["ai"] = time.perf_counter() - _stage_started
+    # ⏱️ Stage 3/4 — metrics extraction, matryoshka pruning & phase classification.
+    _stage_started = time.perf_counter()
 
     # 3. Extract morphological and photometric metrics on analysis_img
     raw_df = cached_extract_metrics(
@@ -6070,6 +6292,10 @@ else:
             # Keep the dashboard renderable even if contact-angle estimation fails
             ads_particles_df_global = pd.DataFrame()
 
+    pipeline_timing["metrics"] = time.perf_counter() - _stage_started
+    # ⏱️ Stage 4/4 — overlay & visualization rendering.
+    _stage_started = time.perf_counter()
+
     try:
         overlay = create_mask_overlay(
             image=base_display_img,
@@ -6141,6 +6367,10 @@ else:
             )
         except Exception as e:
             st.warning(f"Could not draw scale bar: {e}")
+
+    pipeline_timing["overlay"] = time.perf_counter() - _stage_started
+    # Publish the completed profile to the sidebar placeholder created above.
+    render_pipeline_runtime(pipeline_runtime_placeholder, pipeline_timing)
 
     # Summary KPI Metric cards
     def _phase_mean_diameter(phase_key: str) -> float:
@@ -6559,29 +6789,61 @@ else:
                 else:
                     phase_class_options = ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
 
-                # ── 🔍 Search / Filter by Particle ID ────────────────────────
-                # Hundreds of rows make marking a single artifact slow; the filter
-                # narrows the *editable view* only, so "Apply Changes" still writes
+                # ── 🔍 Search / Filter by Particle ID + ⚠️ QC filter ──────────
+                # Hundreds of rows make marking a single artifact slow; the filters
+                # narrow the *editable view* only, so "Apply Changes" still writes
                 # exclusively the rows the user actually sees and touches.
-                id_filter_raw = st.text_input(
-                    "🔍 Search / Filter by Particle ID",
-                    value="",
-                    placeholder="e.g. 142 · 12, 45, 142 · 100-120",
-                    key=f"particle_id_filter_{clean_stem}",
-                    help=(
-                        "Shows only the matching particles in the table below. Accepts a "
-                        "single ID (142), a comma/semicolon/space separated list "
-                        "(12, 45, 142) or an inclusive range (100-120). Clear the field "
-                        "to bring every particle back - applied exclusions and phase "
-                        "changes are never lost."
-                    ),
-                )
+                _col_id_filter, _col_qc_filter = st.columns([1.2, 1.0])
+                with _col_id_filter:
+                    id_filter_raw = st.text_input(
+                        "🔍 Search / Filter by Particle ID",
+                        value="",
+                        placeholder="e.g. 142 · 12, 45, 142 · 100-120",
+                        key=f"particle_id_filter_{clean_stem}",
+                        help=(
+                            "Shows only the matching particles in the table below. Accepts a "
+                            "single ID (142), a comma/semicolon/space separated list "
+                            "(12, 45, 142) or an inclusive range (100-120). Clear the field "
+                            "to bring every particle back - applied exclusions and phase "
+                            "changes are never lost."
+                        ),
+                    )
+                with _col_qc_filter:
+                    qc_borderline_only = st.checkbox(
+                        "⚠️ QC Filter: Show Only Borderline / Unclassified Particles",
+                        value=False,
+                        key=f"qc_borderline_filter_{clean_stem}",
+                        help=(
+                            "Narrows the table to the particles that need a human quality "
+                            "check: **Unclassified** objects, objects whose circularity sits "
+                            f"within {QC_BORDERLINE_CIRC_MARGIN:.2f} of their phase's minimum, "
+                            "and objects whose diameter sits within 10 % of the active "
+                            "Min/Max size limits. Hidden rows keep their exclusions and "
+                            "phase overrides."
+                        ),
+                    )
                 filtered_ids = _parse_particle_id_filter(id_filter_raw)
                 editor_view = editor_df
                 if filtered_ids is not None:
                     editor_view = editor_df[
                         editor_df["id"].isin(filtered_ids)
                     ].reset_index(drop=True)
+
+                # ⚠️ QC filter (v1.7.8): keep only the particles a human must inspect.
+                if qc_borderline_only:
+                    editor_view = _filter_qc_borderline_particles(
+                        editor_view,
+                        min_circ_by_phase={
+                            "air_bubbles": float(air_min_circularity),
+                            "fat_particles": float(fat_min_circularity),
+                            "adsorbed_fat": float(ads_min_circularity),
+                        },
+                        size_bounds_by_phase={
+                            "air_bubbles": (float(min_air_size), float(max_air_size)),
+                            "fat_particles": (float(min_fat_size), float(max_fat_size)),
+                            "adsorbed_fat": (float(min_fat_size), float(max_fat_size)),
+                        },
+                    )
 
                 if filtered_ids is None:
                     filter_signature = "all"
@@ -6601,6 +6863,18 @@ else:
                         f"`{str(id_filter_raw).strip()}`)."
                     )
 
+                if qc_borderline_only:
+                    # The QC view is a different row subset, so it must not share the
+                    # editor widget state of the unfiltered table.
+                    filter_signature = f"{filter_signature}-qc"
+                    st.caption(
+                        f"⚠️ QC filter active — showing **{len(editor_view):,}** of "
+                        f"**{len(editor_df):,}** particles that need human inspection "
+                        f"(unclassified, circularity within "
+                        f"{QC_BORDERLINE_CIRC_MARGIN:.2f} of the phase minimum, or diameter "
+                        f"within {QC_BORDERLINE_SIZE_FRACTION:.0%} of a Min/Max size limit)."
+                    )
+
                 # The editor key carries the filter signature so switching filters
                 # never re-applies positional edits from a different row subset.
                 editor_key = f"particle_data_editor_{editor_rev}_{filter_signature}"
@@ -6614,8 +6888,11 @@ else:
                 editor_view_empty = editor_view.empty
                 if editor_view_empty:
                     st.info(
-                        "No particles match the current ID filter. Clear the "
-                        "`🔍 Search / Filter by Particle ID` field to see all particles again."
+                        "No particles match the active table filter (ID filter"
+                        + (" and/or ⚠️ QC filter" if qc_borderline_only else "")
+                        + "). Clear the `🔍 Search / Filter by Particle ID` field"
+                        + (" and uncheck `⚠️ QC Filter`" if qc_borderline_only else "")
+                        + " to see all particles again."
                     )
                     edited_table = editor_view
                 else:
@@ -8600,9 +8877,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Every analysis session parameters can be inspected and exported to ensure rigorous scientific reproducibility."
         )
 
+        # v1.7.8 — provenance pinning: the SHA-256 of the *exact* bytes that were
+        # analysed plus the build identity make the manifest a verifiable record.
+        sha256_hex = hashlib.sha256(image_bytes).hexdigest()
+
         session_meta = {
             "Analysis Timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "Source Image": image_name,
+            "Source Image SHA-256": sha256_hex,
+            "PhasePix Build Version": PHASEPIX_BUILD_VERSION,
             "Imaging Modality": imaging_mode,
             "Objective Preset": selected_objective if is_light_mode else "N/A (SEM Scale Bar)",
             "Full Micrograph Dimensions (px)": f"{img_w}x{img_h}",
@@ -8652,6 +8935,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 bool(invert_brightfield) if is_light_mode else "N/A (SEM Mode)"
             ),
             "Hardware Accelerator": f"{device} ({accelerator_name}, GPU: {is_gpu})",
+            # v1.7.8 ⏱️ Runtime Profiler — identical numbers to the sidebar badge.
+            "Pipeline Runtime (s)": round(pipeline_timing_total(pipeline_timing), 3),
+            "Pipeline Stage Breakdown (s)": pipeline_timing_breakdown(pipeline_timing),
             "Total Segmented Objects (Raw)": len(raw_df),
             "Retained Objects (After Filters)": total_objects,
             "Air Bubbles Count": air_count,
@@ -8689,6 +8975,20 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 mime="text/plain",
                 use_container_width=True,
                 help="Download session parameters as a formatted text file.",
+            )
+            # v1.7.8 — machine-readable twin of the .txt manifest (SHA-256 pinned image,
+            # build version and the ⚡ runtime profile), ready for a LIMS / notebook.
+            st.download_button(
+                label="📥 Download Manifest (.json)",
+                data=json.dumps(session_meta, indent=2, ensure_ascii=False, default=str),
+                file_name=f"phasepix_session_manifest_{clean_stem}.json",
+                mime="application/json",
+                use_container_width=True,
+                help=(
+                    "Download the same session manifest as structured JSON — includes the "
+                    "source-image SHA-256, the PhasePix build version and the pipeline "
+                    "runtime breakdown."
+                ),
             )
             if not classified_df.empty:
                 csv_bytes = classified_df.to_csv(index=False).encode("utf-8")

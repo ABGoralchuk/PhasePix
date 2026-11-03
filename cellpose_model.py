@@ -810,23 +810,41 @@ def segment_air_bubbles_auto(
         )
 
     # Merge: start with direct-pass masks; add non-overlapping inverted-pass masks
+    # v1.7.8: every inverted candidate is evaluated strictly inside its tight bounding
+    # box (``ndi.find_objects``). A full-frame ``masks_inv == label`` boolean is 1 byte
+    # per pixel (≈2 MB on a 1440×1440 micrograph) *per candidate* -- L candidates meant
+    # L full-image allocations plus L full-image scans. The bounding-box slice keeps a
+    # single candidate's work at O(bbox) memory and O(bbox) time, so the merge cost now
+    # scales with the summed object area instead of ``L × image area``.
     combined = masks_direct.copy()
-    next_label = int(combined.max()) + 1
+    n_direct = int(masks_direct.max())
+    next_label = n_direct + 1
+    n_inv_added = 0
 
-    for inv_label in np.unique(masks_inv):
-        if inv_label == 0:
+    for inv_idx, inv_slice in enumerate(ndi.find_objects(masks_inv), start=1):
+        if inv_slice is None:
             continue
-        inv_region = masks_inv == inv_label
+
+        inv_sub = masks_inv[inv_slice]
+        inv_region = inv_sub == inv_idx            # bbox-sized, never full-frame
+        area_inv = float(np.count_nonzero(inv_region))
+        if area_inv <= 0.0:
+            continue
+
         # Intensity gate: candidate must be darker than image median
-        if float(np.median(image[inv_region])) >= img_median:
+        if float(np.median(image[inv_slice][inv_region])) >= img_median:
             continue
+
         # IoU gate: skip if > 40 % overlap with any already-accepted mask
-        overlap = np.sum(inv_region & (combined > 0))
-        iou = overlap / max(float(np.sum(inv_region)), 1.0)
+        combined_sub = combined[inv_slice]
+        overlap = float(np.count_nonzero(combined_sub[inv_region]))
+        iou = overlap / max(area_inv, 1.0)
         if iou > 0.40:
             continue
-        combined[inv_region] = next_label
+
+        combined_sub[inv_region] = next_label       # view -> writes into ``combined``
         next_label += 1
+        n_inv_added += 1
 
     # ── Step B: Dark Pore Fallback ─────────────────────────────────────────
     blur = cv2.GaussianBlur(image, (9, 9), 0)
@@ -838,22 +856,44 @@ def segment_air_bubbles_auto(
     dark_binary = cv2.morphologyEx(dark_binary, cv2.MORPH_OPEN,  kernel, iterations=1)
     dark_binary = cv2.morphologyEx(dark_binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # Label connected components
-    num_cc, cc_labels = cv2.connectedComponents(dark_binary, connectivity=8)
+    # Label connected components. v1.7.8: ``connectedComponentsWithStats`` returns the
+    # area and bounding box of every component in the same C pass, so the diameter gate
+    # below rejects candidates without ever touching their pixels (previously every
+    # component -- including the thousands outside the size window -- triggered a
+    # full-frame ``cc_labels == cc_id`` boolean mask).
+    num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(
+        dark_binary, connectivity=8
+    )
 
     lo_px = min_diam_px * 0.85
     hi_px = max_diam_px * 1.15
 
+    # Components of ``dark_binary`` are pixel-disjoint, so one static coverage mask stays
+    # exact while accepted fallback labels are appended to ``combined`` (a fresh dark
+    # component can never contain a pixel that another dark component just claimed).
+    covered = combined > 0
+    n_fallback_added = 0
+
     for cc_id in range(1, num_cc):
-        cc_mask = cc_labels == cc_id
-        area_px = float(np.sum(cc_mask))
+        # O(1) area lookup -> cheap early rejection before any pixel work
+        area_px = float(cc_stats[cc_id, cv2.CC_STAT_AREA])
         eq_diam = math.sqrt(4.0 * area_px / math.pi)
         if not (lo_px <= eq_diam <= hi_px):
             continue
 
+        bx = int(cc_stats[cc_id, cv2.CC_STAT_LEFT])
+        by = int(cc_stats[cc_id, cv2.CC_STAT_TOP])
+        bw = int(cc_stats[cc_id, cv2.CC_STAT_WIDTH])
+        bh = int(cc_stats[cc_id, cv2.CC_STAT_HEIGHT])
+        cc_slice = (slice(by, by + bh), slice(bx, bx + bw))
+
+        # bbox-sized candidate mask (boundary pixels are kept 1:1, so contours and the
+        # circularity/perimeter measurement are identical to the full-frame version)
+        cc_region = cc_labels[cc_slice] == cc_id
+
         # Circularity filter
         contours, _ = cv2.findContours(
-            cc_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            cc_region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         if not contours:
             continue
@@ -865,20 +905,27 @@ def segment_air_bubbles_auto(
             continue
 
         # Skip if already covered by Cellpose (IoU > 40 %)
-        overlap = float(np.sum(cc_mask & (combined > 0)))
+        covered_sub = covered[cc_slice]
+        overlap = float(np.count_nonzero(covered_sub[cc_region]))
         iou = overlap / max(area_px, 1.0)
         if iou > 0.40:
             continue
 
-        combined[cc_mask] = next_label
+        combined_sub = combined[cc_slice]
+        combined_sub[cc_region] = next_label          # view -> writes into ``combined``
         next_label += 1
+        n_fallback_added += 1
 
+    # v1.7.8 logging fix: ``next_label`` keeps incrementing through Step B, so deriving
+    # the counts from it at the end reported ``fallback = next_label - combined.max() - 1
+    # == 0`` and inflated ``inv_added`` by every fallback bubble. The explicit counters
+    # tracked in Step A / Step B now report the exact per-pass numbers.
     logger.info(
         "segment_air_bubbles_auto: %d bubbles found (direct=%d, inv_added=%d, fallback=%d)",
-        int(combined.max()),
-        int(masks_direct.max()),
-        next_label - int(masks_direct.max()) - 1,
-        next_label - int(combined.max()) - 1,
+        n_direct + n_inv_added + n_fallback_added,
+        n_direct,
+        n_inv_added,
+        n_fallback_added,
     )
     return combined.astype(np.int32)
 
@@ -1049,29 +1096,57 @@ def segment_fat_in_bubbles_deepscan(
             continue
 
         roi_existing = result_masks[y1:y2, x1:x2]
-        for lbl in np.unique(m_roi_2d):
-            if lbl == 0:
-                continue
 
-            # Strictly clip candidate mask to the bubble interior
-            cand_region = (m_roi_2d == lbl) & (roi_bub > 0)
-            cand_area = float(np.sum(cand_region))
-            if cand_area < 4.0:
-                continue
+        # v1.7.8: one vectorised pass per bubble ROI instead of a full-ROI boolean mask
+        # per candidate label. ``np.bincount`` over the labels that actually fall inside
+        # the bubble yields the clipped area *and* the overlap with already-accepted fat
+        # globules for every label simultaneously, and ``find_objects`` gives the tight
+        # bounding box used to write each accepted label back without a full-ROI mask.
+        roi_bubble_bool = roi_bub > 0
+        if not np.any(roi_bubble_bool):
+            continue
 
-            # Equivalent diameter check >= min_fat_px * 0.7
-            eq_diam = math.sqrt(4.0 * cand_area / math.pi)
-            if eq_diam < min_accept_diam:
-                continue
+        labels_in_bubble = m_roi_2d[roi_bubble_bool]
+        if labels_in_bubble.size == 0:
+            continue
+        if int(labels_in_bubble.min()) < 0:
+            labels_in_bubble = np.clip(labels_in_bubble, 0, None)
+        n_labels = int(labels_in_bubble.max()) + 1
+        if n_labels <= 1:
+            continue
 
-            # Overlap gate: skip if >= 30% overlaps existing fat particles in ROI
-            overlap = float(np.sum(cand_region & (roi_existing > 0)))
-            if overlap / max(cand_area, 1.0) >= 0.30:
-                continue
+        area_per_label = np.bincount(labels_in_bubble, minlength=n_labels).astype(np.float64)
+        area_per_label[0] = 0.0        # background is never a candidate
+        occupied = roi_existing[roi_bubble_bool] > 0
+        overlap_per_label = np.bincount(labels_in_bubble[occupied], minlength=n_labels)
 
-            # Accept candidate with new unique next_id
-            roi_existing[cand_region] = next_id
-            next_id += 1
+        # Vectorised gates: area >= 4 px, eq. diameter >= min_fat_px * 0.7,
+        # overlap with existing fat particles < 30 % (identical thresholds to v1.7.7).
+        eq_diam_per_label = np.sqrt(4.0 * area_per_label / math.pi)
+        overlap_ratio = overlap_per_label.astype(np.float64) / np.maximum(area_per_label, 1.0)
+        candidates = np.flatnonzero(
+            (area_per_label >= 4.0)
+            & (eq_diam_per_label >= min_accept_diam)
+            & (overlap_ratio < 0.30)
+        )
+
+        if candidates.size:
+            label_slices = ndi.find_objects(m_roi_2d)
+            for lbl in candidates:
+                lbl_index = int(lbl) - 1
+                lbl_slice = label_slices[lbl_index] if lbl_index < len(label_slices) else None
+                if lbl_slice is None:
+                    continue
+
+                # Strictly clip candidate mask to the bubble interior (bbox-sized)
+                cand_region = (m_roi_2d[lbl_slice] == lbl) & (roi_bub[lbl_slice] > 0)
+                if not cand_region.any():
+                    continue
+
+                # Accept candidate with new unique next_id
+                existing_sub = roi_existing[lbl_slice]     # view -> writes into the ROI
+                existing_sub[cand_region] = next_id
+                next_id += 1
 
         result_masks[y1:y2, x1:x2] = roi_existing
 
