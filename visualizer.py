@@ -644,6 +644,7 @@ def create_mask_overlay(
         ads_particles_df: Optional table with 'id' and 'contact_angle_deg' (output of
             compute_interfacial_adsorption_metrics). When supplied, adsorbed fat globules are
             labelled with their apparent contact angle f"{theta:.0f}°" instead of their ID.
+            Rows flagged ``excluded_from_theta`` keep the plain ID label.
 
     Returns:
         np.ndarray: 3D uint8 RGB composite image with tinted particles and ID labels.
@@ -894,6 +895,11 @@ def create_mask_overlay(
                         theta_id = int(theta_row["id"])
                     except (TypeError, ValueError):
                         continue
+                    excluded_value = theta_row.get("excluded_from_theta", False)
+                    if bool(excluded_value) if pd.notna(excluded_value) else False:
+                        # Excluded from theta by the researcher (or an interior crater
+                        # globule): keep the plain ID label instead of a fake angle.
+                        continue
                     theta_value = pd.to_numeric(
                         theta_row.get("contact_angle_deg"), errors="coerce"
                     )
@@ -1023,6 +1029,7 @@ def render_selected_bubbles_inspection_overlay(
     show_contact_angles: bool = True,
     show_labels: bool = True,
     corona_margin_px: int = 0,
+    show_particle_ids: bool = False,
 ) -> np.ndarray:
     """
     Build a QA inspection overlay for the user-selected bubbles and their adsorbed fat.
@@ -1052,6 +1059,12 @@ def render_selected_bubbles_inspection_overlay(
             adsorbed-fat layer is allowed to extend that far beyond the bubble
             contour, so Pickering globules straddling the interface are drawn in
             full instead of being clipped at the rim (0 keeps the strict clipping).
+        show_particle_ids: Annotate each globule as ``#<id>: <theta>`` instead of the
+            bare ``<theta>`` so the label on the crop can be matched to a row of the
+            ``Exclude from θ`` data editor. Globules flagged
+            ``excluded_from_theta`` in ``ads_particles_df`` (freeze-fracture artefacts
+            the researcher removed, or interior crater globules without a valid theta)
+            keep their label but it is drawn in dim grey.
 
     Returns:
         np.ndarray: RGB uint8 inspection overlay.
@@ -1229,7 +1242,21 @@ def render_selected_bubbles_inspection_overlay(
                 theta = float(theta_val)
             except (TypeError, ValueError):
                 theta = float("nan")
-            text = f"{theta:.0f}°" if np.isfinite(theta) else str(particle_id)
+            excluded_val = row.get("excluded_from_theta", False)
+            excluded = bool(excluded_val) if pd.notna(excluded_val) else False
+
+            if np.isfinite(theta):
+                text = (
+                    f"#{particle_id}: {theta:.0f}°"
+                    if show_particle_ids
+                    else f"{theta:.0f}°"
+                )
+                # Excluded-from-theta globules keep their label for traceability but
+                # are drawn in dim grey so they cannot be mistaken for a valid theta.
+                text_color = (150, 150, 150) if excluded else (255, 255, 255)
+            else:
+                text = str(particle_id)
+                text_color = (255, 255, 255)
 
             (tw, th), _ = cv2.getTextSize(text, font, font_scale, font_thickness)
             tx = int(np.clip(round(cx - tw / 2.0), 1, max(1, shape[1] - tw - 2)))
@@ -1239,7 +1266,7 @@ def render_selected_bubbles_inspection_overlay(
                 thickness=outline_thickness, lineType=cv2.LINE_AA,
             )
             cv2.putText(
-                rgb, text, (tx, ty), font, font_scale, (255, 255, 255),
+                rgb, text, (tx, ty), font, font_scale, text_color,
                 thickness=font_thickness, lineType=cv2.LINE_AA,
             )
 

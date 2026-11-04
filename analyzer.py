@@ -3,7 +3,7 @@ Module for quantitative morphological and photometric feature extraction from SE
 Calculates area, equivalent diameter, and mean intensity from labeled segmentation masks.
 """
 
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Iterable, Optional, Tuple, Union
 import io
 import math
 import zipfile
@@ -21,6 +21,29 @@ import tifffile
 # that merely touches the bubble still has its inner cap inside the band, while a
 # free matrix globule that happens to sit in the neighbourhood does not.
 _CORONA_OVERLAP_MIN = 0.15
+
+# ---------------------------------------------------------------------------
+# Three-phase contact angle (theta) geometry
+# ---------------------------------------------------------------------------
+# ``compute_interfacial_adsorption_metrics`` supports two theta recipes:
+#
+#   CONTACT_ANGLE_MODE_INDIVIDUAL  (default, v1.7.9)
+#       theta_i = arcsin(L_c,i / D_i) computed ONLY for corona rim globules, where
+#       D_i is the globule's own measured diameter and L_c,i is the interfacial
+#       contact chord measured on its own mask at the bubble boundary.
+#   CONTACT_ANGLE_MODE_REFERENCE   (legacy)
+#       theta = arcsin(L_c / D_ref) for every adsorbed globule, with one global
+#       reference diameter D_ref taken from the free matrix fat fraction.
+CONTACT_ANGLE_MODE_INDIVIDUAL = "individual_corona"
+CONTACT_ANGLE_MODE_REFERENCE = "d_ref"
+CONTACT_ANGLE_MODES = (CONTACT_ANGLE_MODE_INDIVIDUAL, CONTACT_ANGLE_MODE_REFERENCE)
+
+# Half-width (px) of the interface strip used to measure the chord, capped so the
+# chord of a strongly curved rim cannot be inflated by a wide band.
+_CONTACT_STRIP_MAX_PX = 3
+# Widest segmentation gap (px) between a globule mask and the bubble contour that
+# still counts as interfacial contact. Absorbs the anti-aliased contour edge only.
+_CONTACT_REACH_MAX_PX = 3
 
 
 def extract_metrics(
@@ -2201,6 +2224,167 @@ def _masks_within_dilation(crop_a: dict, crop_b: dict, dilation_px: int) -> bool
     return bool(np.any((canvas_a > 0) & (canvas_b > 0)))
 
 
+def _globule_local_mask(
+    particle_id: int,
+    shape: Tuple[int, int],
+    fat_source: Optional[np.ndarray],
+    fat_slices: Optional[list],
+    manual_polygons: Optional[list],
+    fat_masks: Optional[np.ndarray],
+    air_masks: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], int, int]:
+    """Rasterize one globule's own mask into its tight local crop.
+
+    Corona contact-angle geometry needs the *individual* globule outline (not the
+    union of all adsorbed masks), so every adsorbed globule is cropped out of the
+    labeled fat stack with ``scipy.ndimage.find_objects`` slices — one O(area of the
+    globule) gather instead of a full-image ``fat_source == id`` comparison.
+
+    Args:
+        particle_id: Object id of the globule (>= 10000 for manual contours).
+        shape: Analysis image shape as (height, width).
+        fat_source: Optional 2D integer fat/particle label stack.
+        fat_slices: Optional ``find_objects(fat_source)`` slice table. scipy >= 1.18
+            indexes it by ``label - 1`` while older releases index by the label, so both
+            offsets are probed and the bbox that really contains the label wins.
+        manual_polygons: Optional manual contour dicts ({'id': int, 'points': (N, 2)}).
+        fat_masks: Optional labeled fat mask (fallback rasterization source).
+        air_masks: Optional labeled air mask (fallback rasterization source).
+
+    Returns:
+        Tuple[Optional[np.ndarray], int, int]: (local uint8 mask, x0, y0). The mask is
+        ``None`` when the globule cannot be rasterized from any supplied source.
+    """
+    particle_id = int(particle_id)
+
+    def _crop_from_full(full_mask: np.ndarray) -> Tuple[Optional[np.ndarray], int, int]:
+        ys, xs = np.nonzero(full_mask)
+        if xs.size == 0:
+            return None, 0, 0
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        return full_mask[y0:y1, x0:x1].astype(np.uint8), x0, y0
+
+    if particle_id < 10000 and fat_source is not None and fat_slices is not None:
+        # scipy >= 1.18 indexes ``find_objects`` by (label - 1) while older releases
+        # index by the label itself, so both offsets are probed and the bbox that
+        # actually contains this label wins.
+        for index in (particle_id - 1, particle_id):
+            if 0 <= index < len(fat_slices):
+                window = fat_slices[index]
+                if window is None:
+                    continue
+                local = (fat_source[window] == particle_id).astype(np.uint8)
+                if np.any(local):
+                    return local, int(window[1].start), int(window[0].start)
+    full = _object_binary_mask(
+        particle_id, shape, manual_polygons, fat_masks, air_masks
+    )
+    return _crop_from_full(full)
+
+
+def _interface_strip(boundary: np.ndarray, half_width_px: int) -> np.ndarray:
+    """Return a boolean band of ``half_width_px`` around a 1-px boundary raster."""
+    half_width = max(int(half_width_px), 1)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * half_width + 1, 2 * half_width + 1)
+    )
+    return cv2.dilate(boundary.astype(np.uint8), kernel) > 0
+
+
+def _chord_at_interface(
+    local_mask: Optional[np.ndarray],
+    x0: int,
+    y0: int,
+    contour_xy: np.ndarray,
+    centroid: Tuple[float, float],
+    half_band_px: float = 0.75,
+) -> float:
+    """Width (px) of a globule mask where it is cut by the bubble boundary.
+
+    The interface is locally approximated by the tangent line through the contour
+    point closest to the globule centroid, so the returned span is the mask's own
+    chord at the interface (the 2D projection of the three-phase contact circle)
+    rather than the extent of a wide rim band, which would inflate it.
+
+    Args:
+        local_mask: Cropped boolean/uint8 mask of the single globule.
+        x0: Column offset of ``local_mask`` in the analysis image.
+        y0: Row offset of ``local_mask`` in the analysis image.
+        contour_xy: (N, 2) bubble contour points in (x, y) pixel coordinates.
+        centroid: (x, y) globule centroid in analysis-image coordinates.
+        half_band_px: Half-width of the sampling band around the tangent line.
+
+    Returns:
+        float: Chord length in pixels (0.0 when the mask does not reach the interface).
+    """
+    if (
+        local_mask is None
+        or local_mask.size == 0
+        or not np.any(local_mask)
+        or contour_xy is None
+        or contour_xy.size < 3
+    ):
+        return 0.0
+
+    rel_contour = contour_xy - np.asarray(centroid, dtype=np.float32)
+    distances = np.hypot(rel_contour[:, 0], rel_contour[:, 1])
+    nearest = int(np.argmin(distances))
+
+    n_points = int(contour_xy.shape[0])
+    tangent = contour_xy[(nearest + 2) % n_points] - contour_xy[(nearest - 2) % n_points]
+    tangent_norm = float(np.hypot(tangent[0], tangent[1]))
+    if tangent_norm <= 1e-6:
+        return 0.0
+    tangent = (tangent / tangent_norm).astype(np.float32)
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+    anchor = contour_xy[nearest]
+
+    ys, xs = np.nonzero(local_mask)
+    points = np.column_stack(
+        [xs.astype(np.float32) + float(x0), ys.astype(np.float32) + float(y0)]
+    )
+    rel = points - anchor
+    normal_offset = rel @ normal
+
+    band = np.abs(normal_offset) <= half_band_px
+    if not np.any(band):
+        # The segmented mask may stop half a pixel short of the contour: widen once.
+        band = np.abs(normal_offset) <= 2.0 * half_band_px
+    if not np.any(band):
+        return 0.0
+    projections = rel[band] @ tangent
+    return float(projections.max() - projections.min())
+
+
+def _contact_angle_from_chord(chord_um: float, diam_um: float) -> float:
+    """Apparent contact angle theta = arcsin(clip(L_c / D, 0, 1)) in degrees."""
+    if not np.isfinite(chord_um) or not np.isfinite(diam_um) or diam_um <= 0:
+        return float("nan")
+    return float(
+        np.degrees(np.arcsin(np.clip(chord_um / diam_um, 0.0, 1.0)))
+    )
+
+
+def _contact_angle_from_protrusion(
+    centre_to_rim_px: float, radius_px: float
+) -> Tuple[float, float]:
+    """Radial-protrusion contact angle: cos(theta_i) = d_i / R_i -> [0, 90] degrees.
+
+    ``d_i`` is the distance from the globule centre to the bubble boundary (the
+    interface plane) and ``R_i`` its own radius, so theta = 90 deg means the centre
+    sits exactly on the interface (hemisphere) and theta -> 0 a globule that just
+    touches it.
+
+    Returns:
+        Tuple[float, float]: (contact angle in degrees, d_i / R_i ratio).
+    """
+    if not np.isfinite(centre_to_rim_px) or not np.isfinite(radius_px) or radius_px <= 0:
+        return float("nan"), float("nan")
+    ratio = float(np.clip(centre_to_rim_px / radius_px, 0.0, 1.0))
+    return float(np.degrees(np.arccos(ratio))), ratio
+
+
 def compute_interfacial_adsorption_metrics(
     df: pd.DataFrame,
     selected_bubble_ids: list[int],
@@ -2211,6 +2395,8 @@ def compute_interfacial_adsorption_metrics(
     pixel_to_um_ratio: float,
     d_ref_um: Optional[float] = None,
     corona_margin_px: int = 0,
+    contact_angle_mode: str = CONTACT_ANGLE_MODE_INDIVIDUAL,
+    excluded_theta_particle_ids: Optional[Iterable[int]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Quantify Pickering-type interfacial adsorption of fat globules on selected air bubbles.
@@ -2227,13 +2413,45 @@ def compute_interfacial_adsorption_metrics(
       b) at least ``_CORONA_OVERLAP_MIN`` (15 %) of the globule's own segmented area
          overlaps that band.
 
-    From these globules the function derives surface coverage, packing density, rim
-    coverage and an apparent contact angle theta for every adsorbed globule:
+    Every adsorbed globule is then split into one of two geometric roles:
 
-        theta = arcsin(L_c / d_ref)  [degrees]
+      * **Corona rim globule** (``is_corona_globule = True``) — straddles, touches or
+        overlaps the bubble perimeter boundary. In the SEM projection these globules are
+        seen in cross-section along the perimeter, so both their true individual diameter
+        D_i and their interfacial contact chord L_c,i are directly visible.
+      * **Interior adsorbed globule** (``is_corona_globule = False``) — lies completely
+        inside the eroded bubble crater, away from the perimeter. Only a 2D cap projection
+        is visible there, so its true sphere diameter cannot be recovered and it must not
+        enter the contact-angle statistics.
 
-    where L_c is the visible chord (major_axis_um, falling back to diameter_um) and d_ref is
-    the mean diameter of free matrix fat globules (auto-derived when not supplied).
+    Surface coverage, rim coverage, packing density and the adsorbed count always include
+    **all** adsorbed globules (interior + corona).
+
+    Contact angle:
+        ``CONTACT_ANGLE_MODE_INDIVIDUAL`` (default, v1.7.9) evaluates theta **only** for
+        corona rim globules and uses each globule's own measured size::
+
+            D_i   = max(major_axis_um, diameter_um)          # true individual diameter
+            L_c,i = chord of the globule mask cut by the bubble boundary contour (um)
+            theta_i = arcsin(clip(L_c,i / D_i, 0, 1)) * 180 / pi   # in [0, 90] degrees
+
+        L_c,i is measured on the globule's own mask inside a narrow strip centred on the
+        bubble contour (half-width grows with the segmentation gap, capped at
+        ``_CONTACT_STRIP_MAX_PX`` px). When the mask does not reach that strip, the exact
+        circle/plane cross-section ``L_c = 2 * sqrt(R_i^2 - d_i^2)`` is used, where
+        ``d_i`` is the measured centre-to-boundary distance. Both estimators satisfy
+        ``L_c <= D_i``, so theta stays physically consistent in [0, 90] degrees. The
+        independent radial-protrusion estimator
+        ``theta_i = arccos(clip(d_i / R_i, 0, 1))`` is reported alongside as
+        ``contact_angle_protrusion_deg`` for cross-checking.
+
+        Interior globules receive ``contact_angle_deg = NaN`` so they never bias the mean.
+
+        ``CONTACT_ANGLE_MODE_REFERENCE`` reproduces the legacy v1.7.8 behaviour
+        ``theta = arcsin(L_c / d_ref)`` for **every** adsorbed globule, with ``L_c`` the
+        visible major axis and one global reference diameter ``d_ref`` (mean free matrix
+        fat diameter by default) — kept for reproducing historical numbers.
+
     Adsorbed area is measured as the union of the globule masks clipped by the bubble mask
     (falling back to the summed row areas when no masks are available), which prevents
     double counting of overlapping globules.
@@ -2247,39 +2465,79 @@ def compute_interfacial_adsorption_metrics(
         image_shape: Spatial shape of the analysis image as (height, width).
         pixel_to_um_ratio: Spatial calibration in micrometers per pixel (um/px).
         d_ref_um: Optional reference globule diameter in um. When None/<=0 it is derived
-            from the mean diameter of free matrix fat globules.
+            from the mean diameter of free matrix fat globules. Only used by
+            ``CONTACT_ANGLE_MODE_REFERENCE``.
         corona_margin_px: Bubble-rim capture band in pixels (already converted from the
             ``👑 Corona Rim Capture Distance (µm)`` slider). 0 disables the band and
             restores the strict centroid-only behaviour.
+        contact_angle_mode: ``CONTACT_ANGLE_MODE_INDIVIDUAL`` (default; corona rim
+            globules only, each with its own D_i) or ``CONTACT_ANGLE_MODE_REFERENCE``
+            (legacy global D_ref for every adsorbed globule). Unknown values fall back to
+            the individual-corona default.
+        excluded_theta_particle_ids: Object ids the researcher excluded from the theta
+            statistics in the ``🔍 Single Bubble Crop Inspector`` (freeze-fracture
+            artefacts — globules cleaved off-centre or partially occluded, whose visible
+            cross-section is not their true diameter). Such globules stay ``adsorbed_fat``
+            (surface coverage, packed density, adsorbed count) but their theta is dropped
+            from the mean / median / SD and they are flagged in the
+            ``excluded_from_theta`` column so the UI can hide their theta label.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, dict]:
             1) per-bubble table (one row per bubble that produced a non-empty mask),
-            2) table of every adsorbed globule with its parent bubble and contact angle,
-            3) summary dictionary of overall Pickering metrics and the used d_ref_um.
+            2) table of every adsorbed globule with its parent bubble, its corona/interior
+               role, ``corona_chord_um``, ``globule_diam_um``, ``contact_angle_deg`` and the
+               ``excluded_from_theta`` flag (True for interior crater globules in the
+               individual-corona mode and for ids passed in
+               ``excluded_theta_particle_ids``),
+            3) summary dictionary of overall Pickering metrics, the used d_ref_um and the
+               contact-angle mode/statistics (theta statistics always skip excluded ids).
     """
     per_bubble_columns = [
         "Bubble ID",
         "Bubble Diam (µm)",
         "Bubble Area (µm²)",
         "Adsorbed Count",
+        "Corona Count",
+        "Corona Valid for θ",
+        "Interior Count",
+        "Excluded from θ",
         "Adsorbed Area (µm²)",
         "Surface Coverage (%)",
         "Rim Coverage (%)",
         "Packing Density (glob/µm²)",
         "Mean Contact Angle θ (°)",
+        "Mean Corona Chord (µm)",
         "Mean Ads Globule Diam (µm)",
     ]
     ads_columns = [
         "id",
         "parent_bubble_id",
+        "is_corona_globule",
         "diameter_um",
         "major_axis_um",
+        "globule_diam_um",
+        "corona_chord_um",
         "area_um2",
         "circularity",
         "contact_angle_deg",
+        "excluded_from_theta",
         "protrusion_ratio",
+        "protrusion_distance_um",
+        "contact_angle_protrusion_deg",
     ]
+
+    angle_mode = str(contact_angle_mode or CONTACT_ANGLE_MODE_INDIVIDUAL).strip().lower()
+    if angle_mode not in CONTACT_ANGLE_MODES:
+        angle_mode = CONTACT_ANGLE_MODE_INDIVIDUAL
+    individual_angle_mode = angle_mode == CONTACT_ANGLE_MODE_INDIVIDUAL
+
+    excluded_theta_ids: set = set()
+    for raw_excluded in excluded_theta_particle_ids or ():
+        try:
+            excluded_theta_ids.add(int(raw_excluded))
+        except (TypeError, ValueError):
+            continue
 
     shape = (
         (int(image_shape[0]), int(image_shape[1]))
@@ -2301,7 +2559,17 @@ def compute_interfacial_adsorption_metrics(
         "Overall Surface Coverage (%)": 0.0,
         "Mean Packing Density (glob/µm²)": 0.0,
         "Mean Contact Angle θ (°)": 0.0,
+        "Median Contact Angle θ (°)": 0.0,
+        "Contact Angle SD (°)": 0.0,
+        "Contact Angle Mode": angle_mode,
         "Total Adsorbed Globules": 0,
+        "Corona Globules": 0,
+        "Corona Globules (Valid for θ)": 0,
+        "Excluded from θ Globules": 0,
+        "Interior Adsorbed Globules": 0,
+        "Corona Globule Fraction (%)": 0.0,
+        "Mean Corona Chord (µm)": 0.0,
+        "Mean Corona Globule Diam (µm)": 0.0,
         "Mean Bubble Perimeter (µm)": 0.0,
         "d_ref_um": float(d_ref) if d_ref is not None else 0.0,
     }
@@ -2385,8 +2653,11 @@ def compute_interfacial_adsorption_metrics(
     # Per-label pixel areas of the segmented fat mask, computed once: the corona
     # overlap test needs "how much of THIS globule sits in the rim band", and a
     # dense LUT keeps that a gather instead of a per-particle mask walk.
+    # ``find_objects`` supplies one bounding-box slice per label so the per-globule
+    # contact geometry (chord, own-mask sliver) never allocates a full-image mask.
     fat_source = None
     fat_area_lut = None
+    fat_slices = None
     if isinstance(fat_masks, np.ndarray) and fat_masks.ndim >= 2 and fat_masks.size:
         fat_2d = fat_masks.squeeze() if fat_masks.ndim == 3 else fat_masks
         if fat_2d.shape[:2] == shape:
@@ -2399,6 +2670,10 @@ def compute_interfacial_adsorption_metrics(
             if max_label > 0:
                 fat_source = fat_int
                 fat_area_lut = np.bincount(fat_int.ravel(), minlength=max_label + 1)
+                try:
+                    fat_slices = find_objects(fat_int)
+                except Exception:
+                    fat_slices = None
 
     corona_px = max(0, int(corona_margin_px))
 
@@ -2419,7 +2694,7 @@ def compute_interfacial_adsorption_metrics(
         bubble_area_um2 = bubble_area_px * pixel_area_um2
 
         # 2) Perimeter and equivalent diameter in physical units
-        bubble_perimeter_px, _ = _mask_contour_metrics(b_mask)
+        bubble_perimeter_px, bubble_contour = _mask_contour_metrics(b_mask)
         bubble_perimeter_um = bubble_perimeter_px * ratio
         perimeters_um.append(bubble_perimeter_um)
         bubble_diam_um = math.sqrt(4.0 * bubble_area_um2 / math.pi)
@@ -2428,6 +2703,14 @@ def compute_interfacial_adsorption_metrics(
             row_diam = _finite_or_none(b_rows.iloc[0].get("diameter_um"))
             if row_diam is not None and row_diam > 0:
                 bubble_diam_um = float(row_diam)
+
+        # Contour points in (x, y) order: the reference for every centre-to-interface
+        # distance used by the individual corona contact-angle geometry.
+        bubble_contour_xy = (
+            np.asarray(bubble_contour, dtype=np.float32).reshape(-1, 2)
+            if np.size(bubble_contour)
+            else np.empty((0, 2), dtype=np.float32)
+        )
 
         # 3) Globules whose centroid falls inside this bubble — or inside its dilated
         #    corona rim band. A Pickering corona globule straddles the interface, so
@@ -2471,26 +2754,53 @@ def compute_interfacial_adsorption_metrics(
             ):
                 continue
 
-            is_corona = False
+            captured = False
             if 0 <= iy < shape[0] and 0 <= ix < shape[1] and corona_bool[iy, ix]:
-                is_corona = True
+                captured = True
             elif band_overlap_lut is not None:
                 p_id = int(particle["id"])
                 if 0 < p_id <= band_max_label:
                     p_area = int(fat_area_lut[p_id])
                     if p_area > 0:
-                        is_corona = (
+                        captured = (
                             float(band_overlap_lut[p_id]) / float(p_area)
                         ) >= _CORONA_OVERLAP_MIN
-            if is_corona:
+            if captured:
                 inside.append(particle)
 
-        # 4) Union of adsorbed particle masks clipped by the bubble mask
+        # 1-px inner boundary of the bubble mask: the interface on which the
+        # individual corona chords are measured. Interface strips of increasing
+        # half-width are built lazily and reused by every globule of this bubble.
+        b_binary = b_mask_bool.astype(np.uint8)
+        boundary = (
+            b_binary
+            & (1 - cv2.erode(b_binary, np.ones((3, 3), np.uint8)))
+        ).astype(bool)
+        if not np.any(boundary):
+            boundary = b_binary.astype(bool)
+        strip_cache: dict[int, np.ndarray] = {}
+
+        def _strip_for(half_width: int) -> np.ndarray:
+            width = int(np.clip(half_width, 1, _CONTACT_STRIP_MAX_PX))
+            if width not in strip_cache:
+                strip_cache[width] = _interface_strip(boundary, width)
+            return strip_cache[width]
+
+        # Segmentation gap still accepted as interfacial contact (px).
+        contact_reach_px = max(1, min(corona_px, _CONTACT_REACH_MAX_PX))
+
+        # 4) Union of adsorbed particle masks clipped by the bubble mask, plus the
+        #    per-globule contact geometry used by the three-phase contact angle.
         ads_union_mask = np.zeros(shape, dtype=np.uint8)
         row_area_sum_um2 = 0.0
         angles: list[float] = []
         auto_ids: list[int] = []
         manual_ids: list[int] = []
+        corona_count = 0
+        corona_valid_for_theta = 0
+        excluded_from_theta_count = 0
+        corona_chords_um: list[float] = []
+        corona_diams_um: list[float] = []
         for particle in inside:
             p_id = int(particle["id"])
             if p_id >= 10000:
@@ -2499,23 +2809,147 @@ def compute_interfacial_adsorption_metrics(
                 auto_ids.append(p_id)
             row_area_sum_um2 += float(particle["area_um2"])
 
-            l_c = particle["major_axis_um"]
-            if l_c is None or l_c <= 0:
-                l_c = float(particle["diameter_um"])
-            protrusion_ratio = float(l_c) / d_ref
-            theta_deg = float(
-                np.degrees(np.arcsin(np.clip(protrusion_ratio, 0.0, 1.0)))
+            # --- Individual (own-mask) globule geometry ------------------------
+            # A corona globule is cut by the interface, so its own major axis IS its
+            # true diameter D_i (no dependence on a global reference globule).
+            major_axis_um = particle["major_axis_um"]
+            major_axis_val = float(major_axis_um) if major_axis_um is not None else 0.0
+            diameter_val = float(particle["diameter_um"])
+            globule_diam_um = max(major_axis_val, diameter_val)
+            radius_px = globule_diam_um / (2.0 * ratio) if globule_diam_um > 0 else 0.0
+
+            if bubble_contour_xy.size:
+                centre_to_rim_px = float(
+                    np.min(
+                        np.hypot(
+                            bubble_contour_xy[:, 0] - particle["cx"],
+                            bubble_contour_xy[:, 1] - particle["cy"],
+                        )
+                    )
+                )
+            else:
+                centre_to_rim_px = float("nan")
+
+            gap_px = (
+                max(centre_to_rim_px - radius_px, 0.0)
+                if np.isfinite(centre_to_rim_px)
+                else 0.0
             )
-            angles.append(theta_deg)
+            local_mask, local_x0, local_y0 = _globule_local_mask(
+                p_id, shape, fat_source, fat_slices,
+                manual_polygons, fat_masks, air_masks,
+            )
+            strip_fraction = 0.0
+            if local_mask is not None:
+                strip_half = int(
+                    np.clip(np.ceil(gap_px) + 1.0, 1, _CONTACT_STRIP_MAX_PX)
+                )
+                strip_full = _strip_for(strip_half)
+                strip_crop = strip_full[
+                    local_y0:local_y0 + local_mask.shape[0],
+                    local_x0:local_x0 + local_mask.shape[1],
+                ]
+                own_px = float(np.count_nonzero(local_mask))
+                strip_fraction = (
+                    float(np.count_nonzero((local_mask > 0) & strip_crop)) / own_px
+                    if own_px > 0
+                    else 0.0
+                )
+            chord_px = _chord_at_interface(
+                local_mask,
+                local_x0,
+                local_y0,
+                bubble_contour_xy,
+                (particle["cx"], particle["cy"]),
+            )
+
+            if chord_px <= 0.0 and np.isfinite(centre_to_rim_px):
+                # The mask stops short of the interface strip (segmentation gap), so
+                # use the exact circle/plane cross-section of this very globule.
+                chord_px = 2.0 * math.sqrt(
+                    max(radius_px ** 2 - centre_to_rim_px ** 2, 0.0)
+                )
+            chord_um = (
+                float(min(chord_px * ratio, globule_diam_um))
+                if globule_diam_um > 0
+                else 0.0
+            )
+
+            # Corona rim globule: straddles / touches / overlaps the perimeter, i.e.
+            # its centre lies within one own radius of the interface (plus the
+            # segmentation tolerance) or >= 15 % of its own area sits in the strip.
+            is_corona = bool(
+                strip_fraction >= _CORONA_OVERLAP_MIN
+                or (
+                    np.isfinite(centre_to_rim_px)
+                    and centre_to_rim_px <= radius_px + contact_reach_px
+                )
+            )
+            if is_corona:
+                corona_count += 1
+                corona_chords_um.append(chord_um)
+                corona_diams_um.append(globule_diam_um)
+
+            protrusion_angle, _ = _contact_angle_from_protrusion(
+                centre_to_rim_px, radius_px
+            )
+
+            if individual_angle_mode:
+                if is_corona:
+                    theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
+                    protrusion_ratio = (
+                        float(min(chord_um / globule_diam_um, 1.0))
+                        if globule_diam_um > 0
+                        else float("nan")
+                    )
+                    reported_chord_um = chord_um
+                    protrusion_angle_out = protrusion_angle
+                    excluded_from_theta = p_id in excluded_theta_ids
+                else:
+                    # Interior crater globule: only a 2D cap projection is visible,
+                    # so neither a true diameter nor a contact angle exists.
+                    theta_deg = float("nan")
+                    protrusion_ratio = float("nan")
+                    reported_chord_um = float("nan")
+                    protrusion_angle_out = float("nan")
+                    # Interior globules are never valid for theta by construction.
+                    excluded_from_theta = True
+            else:
+                # Legacy v1.7.8 recipe: one global D_ref for every adsorbed globule.
+                l_c = major_axis_val if major_axis_val > 0 else diameter_val
+                protrusion_ratio = float(l_c) / d_ref
+                theta_deg = float(
+                    np.degrees(np.arcsin(np.clip(protrusion_ratio, 0.0, 1.0)))
+                )
+                reported_chord_um = chord_um
+                protrusion_angle_out = protrusion_angle if is_corona else float("nan")
+                excluded_from_theta = p_id in excluded_theta_ids
+
+            if np.isfinite(theta_deg) and not excluded_from_theta:
+                angles.append(float(theta_deg))
+                corona_valid_for_theta += 1
+            elif np.isfinite(theta_deg) and excluded_from_theta:
+                # A real angle that the researcher removed from the statistics.
+                excluded_from_theta_count += 1
             ads_rows.append({
                 "id": p_id,
                 "parent_bubble_id": b_id,
-                "diameter_um": float(particle["diameter_um"]),
-                "major_axis_um": float(l_c),
+                "is_corona_globule": is_corona,
+                "diameter_um": diameter_val,
+                "major_axis_um": major_axis_val if major_axis_val > 0 else float("nan"),
+                "globule_diam_um": globule_diam_um,
+                "corona_chord_um": reported_chord_um,
                 "area_um2": float(particle["area_um2"]),
                 "circularity": float(particle["circularity"]),
-                "contact_angle_deg": theta_deg,
-                "protrusion_ratio": protrusion_ratio,
+                "contact_angle_deg": float(theta_deg),
+                "excluded_from_theta": bool(excluded_from_theta),
+                "protrusion_ratio": float(protrusion_ratio),
+                "protrusion_distance_um": (
+                    float(centre_to_rim_px * ratio)
+                    if np.isfinite(centre_to_rim_px)
+                    else float("nan")
+                ),
+                "contact_angle_protrusion_deg": float(protrusion_angle_out),
             })
 
         # Automatic globules: vectorized label union restricted to the bubble bbox
@@ -2572,7 +3006,10 @@ def compute_interfacial_adsorption_metrics(
             * 100.0,
         )
 
-        mean_theta = float(np.mean(angles)) if angles else 0.0
+        mean_theta = float(np.mean(angles)) if angles else float("nan")
+        mean_corona_chord = (
+            float(np.mean(corona_chords_um)) if corona_chords_um else float("nan")
+        )
         mean_globule_diam = (
             float(np.mean([p["diameter_um"] for p in inside])) if inside else 0.0
         )
@@ -2582,11 +3019,16 @@ def compute_interfacial_adsorption_metrics(
             "Bubble Diam (µm)": bubble_diam_um,
             "Bubble Area (µm²)": bubble_area_um2,
             "Adsorbed Count": len(inside),
+            "Corona Count": corona_count,
+            "Corona Valid for θ": corona_valid_for_theta,
+            "Interior Count": len(inside) - corona_count,
+            "Excluded from θ": excluded_from_theta_count,
             "Adsorbed Area (µm²)": adsorbed_area_um2,
             "Surface Coverage (%)": surface_coverage_pct,
             "Rim Coverage (%)": rim_coverage_pct,
             "Packing Density (glob/µm²)": packing_density,
             "Mean Contact Angle θ (°)": mean_theta,
+            "Mean Corona Chord (µm)": mean_corona_chord,
             "Mean Ads Globule Diam (µm)": mean_globule_diam,
         })
 
@@ -2596,6 +3038,47 @@ def compute_interfacial_adsorption_metrics(
     total_bubble_area = float(per_bubble_df["Bubble Area (µm²)"].sum())
     total_ads_area = float(per_bubble_df["Adsorbed Area (µm²)"].sum())
     total_ads_count = int(per_bubble_df["Adsorbed Count"].sum())
+
+    # Contact-angle statistics. Interior crater globules carry contact_angle_deg = NaN
+    # in the individual-corona mode, and globules the researcher excluded in the crop
+    # inspector are flagged in excluded_from_theta, so both stay out of every statistic.
+    theta_all = pd.to_numeric(
+        ads_particles_df.get("contact_angle_deg", pd.Series(dtype=float)),
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    excluded_flags = (
+        ads_particles_df.get("excluded_from_theta", pd.Series(dtype=bool))
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+        if not ads_particles_df.empty
+        else np.zeros(0, dtype=bool)
+    )
+    theta_values = theta_all[np.isfinite(theta_all) & ~excluded_flags]
+    excluded_theta_total = int(
+        np.count_nonzero(np.isfinite(theta_all) & excluded_flags)
+    )
+    corona_flags = (
+        ads_particles_df.get("is_corona_globule", pd.Series(dtype=bool))
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+        if not ads_particles_df.empty
+        else np.zeros(0, dtype=bool)
+    )
+    corona_count_total = int(np.count_nonzero(corona_flags))
+    corona_chord_values = np.zeros(0, dtype=float)
+    corona_diam_values = np.zeros(0, dtype=float)
+    if corona_count_total:
+        corona_chord_values = pd.to_numeric(
+            ads_particles_df.loc[corona_flags, "corona_chord_um"], errors="coerce"
+        ).to_numpy(dtype=float)
+        corona_chord_values = corona_chord_values[np.isfinite(corona_chord_values)]
+        corona_diam_values = pd.to_numeric(
+            ads_particles_df.loc[corona_flags, "globule_diam_um"], errors="coerce"
+        ).to_numpy(dtype=float)
+        corona_diam_values = corona_diam_values[np.isfinite(corona_diam_values)]
+
     summary.update({
         "Selected Bubbles": int(len(per_bubble_df)),
         "Total Bubble Area (µm²)": round(total_bubble_area, 3),
@@ -2609,13 +3092,38 @@ def compute_interfacial_adsorption_metrics(
             else 0.0,
             4,
         ),
-        "Mean Contact Angle θ (°)": round(
-            float(ads_particles_df["contact_angle_deg"].mean())
-            if not ads_particles_df.empty
-            else 0.0,
-            3,
+        "Mean Contact Angle θ (°)": (
+            round(float(theta_values.mean()), 3) if theta_values.size else 0.0
         ),
+        "Median Contact Angle θ (°)": (
+            round(float(np.median(theta_values)), 3) if theta_values.size else 0.0
+        ),
+        "Contact Angle SD (°)": (
+            round(float(np.std(theta_values, ddof=1)), 3)
+            if theta_values.size > 1
+            else 0.0
+        ),
+        "Contact Angle Mode": angle_mode,
         "Total Adsorbed Globules": total_ads_count,
+        "Corona Globules": corona_count_total,
+        "Corona Globules (Valid for θ)": int(theta_values.size),
+        "Excluded from θ Globules": excluded_theta_total,
+        "Interior Adsorbed Globules": int(total_ads_count - corona_count_total),
+        "Corona Globule Fraction (%)": (
+            round(100.0 * corona_count_total / max(total_ads_count, 1), 2)
+            if total_ads_count
+            else 0.0
+        ),
+        "Mean Corona Chord (µm)": (
+            round(float(corona_chord_values.mean()), 4)
+            if corona_chord_values.size
+            else 0.0
+        ),
+        "Mean Corona Globule Diam (µm)": (
+            round(float(corona_diam_values.mean()), 4)
+            if corona_diam_values.size
+            else 0.0
+        ),
         "Mean Bubble Perimeter (µm)": round(
             float(np.mean(perimeters_um)) if perimeters_um else 0.0, 3
         ),
