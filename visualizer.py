@@ -1262,6 +1262,8 @@ def render_selected_bubbles_inspection_overlay(
     show_particle_ids: bool = False,
     globule_role: str = GLOBULE_ROLE_ALL,
     show_globule_ids: bool = False,
+    show_bubble_ids: bool = True,
+    show_fat_ids: bool = False,
 ) -> np.ndarray:
     """
     Build a QA inspection overlay for the user-selected bubbles and their adsorbed fat.
@@ -1269,8 +1271,11 @@ def render_selected_bubbles_inspection_overlay(
     Everything outside the selected bubble masks is dimmed (x0.45) so the inspected
     bubbles stay the only bright regions. Their contours are drawn in bright cyan
     (RGB 0, 210, 255), adsorbed fat globules inside them are tinted gold
-    (RGB 255, 215, 0, alpha 0.50) with a crisp outline (RGB 255, 240, 120), and each
-    adsorbed globule can be annotated with its apparent contact angle theta.
+    (RGB 255, 215, 0, alpha 0.50) with a crisp outline (RGB 255, 240, 120). Only
+    numeric identifiers are burned into the image: the ID of every inspected bubble and,
+    optionally, the particle ID of every rendered globule. Contact angle values (°) are
+    never drawn any more, because a degree label on the picture cannot be trusted to
+    match the θ table and simply covers the thin interfacial sliver.
 
     Args:
         image: 2D grayscale or 3D RGB base micrograph.
@@ -1282,32 +1287,35 @@ def render_selected_bubbles_inspection_overlay(
         ads_particles_df: Optional output of compute_interfacial_adsorption_metrics
             containing 'id', 'parent_bubble_id', 'is_corona_globule' and
             'contact_angle_deg'.
-        show_contact_angles: Annotate corona globules with theta when
-            ads_particles_df is supplied (defaults to True).
-        show_labels: Master switch for every text annotation (theta values,
-            particle IDs and bubble IDs). Set to False for a label-free close-up that
-            shows only the cyan bubble boundary and the gold adsorbed-fat masks, so
-            the adsorption corona can be inspected without text clutter.
+        show_labels: Master switch for every text annotation (bubble IDs and particle
+            IDs). Set to False for a label-free close-up that shows only the cyan bubble
+            boundary and the gold adsorbed-fat masks, so the adsorption corona can be
+            inspected without text clutter.
         corona_margin_px: Width in pixels of the corona rim band. When > 0 the gold
             adsorbed-fat layer is allowed to extend that far beyond the bubble
             contour, so Pickering globules straddling the interface are drawn in
             full instead of being clipped at the rim (0 keeps the strict clipping,
             which is what the areal Surface Coverage definition uses).
-        show_particle_ids: Annotate each corona globule as ``#<id>: <theta>`` instead
-            of the bare ``<theta>`` so the label on the crop can be matched to a row of
-            the ``Exclude from θ`` data editor. Globules flagged
-            ``excluded_from_theta`` in ``ads_particles_df`` (freeze-fracture artefacts
-            the researcher removed) keep their label but it is drawn in dim grey.
         globule_role: Which globule population is rendered and annotated —
             ``GLOBULE_ROLE_ALL`` (default, historic behaviour: interior + corona),
             ``GLOBULE_ROLE_INTERIOR`` (Surface Coverage mode: only
-            ``is_corona_globule == False`` globules on the crater floor, no theta
-            labels) or ``GLOBULE_ROLE_CORONA`` (Contact Angle mode: only
+            ``is_corona_globule == False`` globules on the crater floor) or
+            ``GLOBULE_ROLE_CORONA`` (Contact Angle mode: only
             ``is_corona_globule == True`` globules on the equatorial rim). Unknown
             values fall back to ``GLOBULE_ROLE_ALL``.
-        show_globule_ids: Print the bare particle ID of every rendered globule. Used by
-            the Surface Coverage inspection mode, where interior crater globules carry
-            no theta but must stay identifiable on the overlay/crop.
+        show_bubble_ids: Print the numeric ID of every inspected bubble at its mask
+            centroid (defaults to True).
+        show_fat_ids: Print only the bare numeric particle ID (e.g. ``142``) of every
+            rendered gold adsorbed/corona globule (defaults to False). Globules flagged
+            ``excluded_from_theta`` in ``ads_particles_df`` keep their ID but it is
+            drawn in dim grey so it cannot be mistaken for a valid θ globule.
+        show_globule_ids: Deprecated alias of ``show_fat_ids`` — still accepted so
+            legacy Surface Coverage callers keep their particle IDs on the overlay.
+        show_contact_angles: Deprecated and ignored — contact angle values (°) are
+            never drawn on the image any more. Kept in the signature so legacy callers
+            keep working.
+        show_particle_ids: Deprecated and ignored (it used to prefix a θ label with
+            ``#<id>: ``). Superseded by ``show_fat_ids``.
 
     Returns:
         np.ndarray: RGB uint8 inspection overlay.
@@ -1450,12 +1458,15 @@ def render_selected_bubbles_inspection_overlay(
         )
         cv2.drawContours(rgb, bubble_cnts, -1, (0, 210, 255), 2, lineType=cv2.LINE_AA)
 
-    # Role-aware globule annotations. Only the globules the role filter actually draws
-    # are annotated, so a Surface Coverage overlay never shows a theta and a Contact
-    # Angle overlay never labels an interior crater globule.
+    # Role-aware globule ID annotations. Only the globules the role filter actually
+    # draws are annotated, so a Surface Coverage overlay never labels a hidden corona
+    # rim globule and a Contact Angle overlay never labels an interior crater globule.
+    # Contact angle values (°) are never burned in any more: the image carries numeric
+    # identifiers only, and the legacy ``show_globule_ids`` flag is honoured as an
+    # alias of ``show_fat_ids``.
     if (
         show_labels
-        and (show_contact_angles or show_globule_ids)
+        and (show_fat_ids or show_globule_ids)
         and isinstance(ads_particles_df, pd.DataFrame)
         and not ads_particles_df.empty
         and "id" in ads_particles_df.columns
@@ -1516,39 +1527,15 @@ def render_selected_bubbles_inspection_overlay(
             if not ads_region_bool[int(round(cy)), int(round(cx))]:
                 continue
 
-            is_corona_flag = row.get("is_corona_globule", False)
-            is_corona = bool(is_corona_flag) if pd.notna(is_corona_flag) else False
             excluded_val = row.get("excluded_from_theta", False)
             excluded = bool(excluded_val) if pd.notna(excluded_val) else False
 
-            if is_corona:
-                # Corona rim globule: theta (optionally prefixed with its ID).
-                if not show_contact_angles:
-                    continue
-                theta_val = row.get("contact_angle_deg")
-                try:
-                    theta = float(theta_val)
-                except (TypeError, ValueError):
-                    theta = float("nan")
-                if np.isfinite(theta):
-                    text = (
-                        f"#{particle_id}: {theta:.0f}°"
-                        if show_particle_ids
-                        else f"{theta:.0f}°"
-                    )
-                    # Excluded-from-theta globules keep their label for traceability but
-                    # are drawn in dim grey so they cannot be mistaken for a valid theta.
-                    text_color = (150, 150, 150) if excluded else (255, 255, 255)
-                else:
-                    text = str(particle_id)
-                    text_color = (255, 255, 255)
-            else:
-                # Interior crater globule: it never carries a theta, so only its bare
-                # particle ID can be printed (Surface Coverage inspection mode).
-                if not (show_globule_ids or show_contact_angles):
-                    continue
-                text = str(particle_id)
-                text_color = (255, 255, 255)
+            # Bare numeric particle ID only (e.g. ``142``) — the contact angle value is
+            # never burned into the image. Globules excluded from θ keep their ID for
+            # traceability but are drawn in dim grey so they cannot be mistaken for a
+            # globule that contributes to the θ statistics.
+            text = str(particle_id)
+            text_color = (150, 150, 150) if excluded else (255, 255, 255)
 
             (tw, th), _ = cv2.getTextSize(text, font, font_scale, font_thickness)
             tx = int(np.clip(round(cx - tw / 2.0), 1, max(1, shape[1] - tw - 2)))
@@ -1562,9 +1549,10 @@ def render_selected_bubbles_inspection_overlay(
                 thickness=font_thickness, lineType=cv2.LINE_AA,
             )
 
-    # Large bubble ID labels exactly at each bubble-mask centroid (drawn on top).
-    # Skipped entirely when ``show_labels`` is False so the close-up crop stays clean.
-    if show_labels:
+    # Large numeric bubble ID labels exactly at each bubble-mask centroid (drawn on
+    # top). Skipped when ``show_bubble_ids`` or the ``show_labels`` master switch is
+    # False, so the close-up crop can stay label-free.
+    if show_labels and show_bubble_ids:
         for b_id, b_mask in bubble_masks.items():
             ys_b, xs_b = np.nonzero(b_mask)
             if len(xs_b) > 0:

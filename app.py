@@ -297,6 +297,64 @@ def get_theta_excluded_ids(image_name: str) -> set:
     return set()
 
 
+# ---------------- INTERACTIVE ADSORBED-GLOBULE TABLE ACTIONS ----------------
+# Tri-state action selector of the ``🟡 Adsorbed Globule Detail`` data editor.
+ADSORBED_DETAIL_ACTION_KEEP = "Keep"
+ADSORBED_DETAIL_ACTION_MOVE = "Move to Matrix Fat"
+ADSORBED_DETAIL_ACTION_DELETE = "Delete"
+ADSORBED_DETAIL_ACTIONS = (
+    ADSORBED_DETAIL_ACTION_KEEP,
+    ADSORBED_DETAIL_ACTION_MOVE,
+    ADSORBED_DETAIL_ACTION_DELETE,
+)
+
+
+def adsorbed_detail_column_config() -> dict:
+    """Column configuration of the interactive ``🟡 Adsorbed Globule Detail`` editor.
+
+    The first four columns are the action surface: ``Particle ID`` and ``Bubble ID`` are
+    read-only identifiers, ``Excluded from θ`` is the editable checkbox that feeds the
+    θ statistics and ``Action`` is the tri-state selector committed by
+    ``✅ Apply Changes``. Every remaining column keeps the default numeric rendering of
+    :func:`visualizer.clean_adsorbed_globule_table`.
+
+    Returns:
+        dict: ``st.data_editor`` ``column_config`` mapping.
+    """
+    return {
+        "Particle ID": st.column_config.NumberColumn(
+            "Particle ID",
+            help="Read-only: particle ID of this globule.",
+            format="%d",
+        ),
+        "Bubble ID": st.column_config.NumberColumn(
+            "Bubble ID",
+            help="Read-only: parent bubble of this globule.",
+            format="%d",
+        ),
+        "Excluded from θ": st.column_config.CheckboxColumn(
+            "Excluded from θ",
+            help=(
+                "Tick to drop this **corona rim globule** from every θ statistic "
+                "(histogram and mean; Rim Coverage is unaffected). Interior crater "
+                "globules carry no θ and are always inert."
+            ),
+            default=False,
+        ),
+        "Action": st.column_config.SelectboxColumn(
+            "Action",
+            help=(
+                "**Keep** = unchanged · **Move to Matrix Fat** = reclassify this "
+                "particle as free matrix fat (`fat_particles`) · **Delete** = drop the "
+                "particle from every downstream statistic."
+            ),
+            options=list(ADSORBED_DETAIL_ACTIONS),
+            required=True,
+            default=ADSORBED_DETAIL_ACTION_KEEP,
+        ),
+    }
+
+
 def set_theta_excluded_ids(image_name: str, new_ids) -> None:
     """Persist the excluded-from-theta ids and bump the crop-editor revision.
 
@@ -314,6 +372,125 @@ def set_theta_excluded_ids(image_name: str, new_ids) -> None:
     st.session_state[theta_exclusion_rev_key(image_name)] = (
         int(st.session_state.get(theta_exclusion_rev_key(image_name), 0) or 0) + 1
     )
+
+
+def apply_adsorbed_globule_detail_changes(
+    image_name: str,
+    baseline_table: pd.DataFrame,
+    edited_table: pd.DataFrame,
+    corona_particle_ids,
+) -> dict:
+    """Commit the edits of the ``🟡 Adsorbed Globule Detail`` data editor.
+
+    Each row of that editor exposes three researcher controls, applied in this order:
+
+    * ``Excluded from θ`` — only rows whose checkbox actually flipped are merged into
+      the image-wide ``theta_excluded_particle_ids_{image_name}`` set (exclusions of
+      other images / bubbles are preserved). Only corona rim globules may enter or leave
+      the set, because interior crater globules never carry a θ. The revision counter is
+      bumped through :func:`set_theta_excluded_ids`, so the editor rebuilds from the
+      freshly stored state on the next run.
+    * ``Move to Matrix Fat`` — writes ``manual_phase_overrides[particle_id] =
+      "fat_particles"`` so the globule is reclassified as free matrix fat.
+    * ``Delete`` — adds the particle to ``interactive_excluded_ids`` so it drops out of
+      every downstream statistic.
+
+    Args:
+        image_name: Source image name (scopes the θ exclusion session state).
+        baseline_table: Table exactly as rendered (its ``Excluded from θ`` column holds
+            the current state used as the "before" reference).
+        edited_table: Table returned by ``st.data_editor``.
+        corona_particle_ids: Iterable of particle ids that are corona rim globules and
+            therefore eligible for θ exclusions.
+
+    Returns:
+        dict: Counts ``{"theta": int, "moved": int, "deleted": int}`` of applied edits.
+    """
+    summary = {"theta": 0, "moved": 0, "deleted": 0}
+    if not isinstance(edited_table, pd.DataFrame) or edited_table.empty:
+        return summary
+
+    eligible_ids = set()
+    for value in corona_particle_ids or ():
+        try:
+            eligible_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    baseline_flags: dict = {}
+    if isinstance(baseline_table, pd.DataFrame) and not baseline_table.empty:
+        base_ids = pd.to_numeric(
+            baseline_table.get("Particle ID", pd.Series(dtype=float)), errors="coerce"
+        ).tolist()
+        base_theta = baseline_table.get(
+            "Excluded from θ", pd.Series(False, index=baseline_table.index)
+        ).tolist()
+        for raw_id, flag in zip(base_ids, base_theta):
+            if pd.isna(raw_id):
+                continue
+            baseline_flags[int(raw_id)] = bool(flag) if pd.notna(flag) else False
+
+    edited_ids = pd.to_numeric(
+        edited_table.get("Particle ID", pd.Series(dtype=float)), errors="coerce"
+    ).tolist()
+    edited_theta = edited_table.get(
+        "Excluded from θ", pd.Series(False, index=edited_table.index)
+    ).tolist()
+    edited_actions = edited_table.get(
+        "Action", pd.Series(ADSORBED_DETAIL_ACTION_KEEP, index=edited_table.index)
+    ).tolist()
+
+    new_excluded_ids = get_theta_excluded_ids(image_name)
+    theta_changes = 0
+    moved_ids: list[int] = []
+    deleted_ids: list[int] = []
+
+    for raw_id, theta_flag, action in zip(edited_ids, edited_theta, edited_actions):
+        if pd.isna(raw_id):
+            continue
+        try:
+            particle_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+
+        wants_excluded = bool(theta_flag) if pd.notna(theta_flag) else False
+        was_excluded = baseline_flags.get(particle_id, wants_excluded)
+        if (
+            particle_id in eligible_ids
+            and wants_excluded != was_excluded
+        ):
+            if wants_excluded:
+                new_excluded_ids.add(particle_id)
+            else:
+                new_excluded_ids.discard(particle_id)
+            theta_changes += 1
+
+        action_value = str(action).strip() if pd.notna(action) else ""
+        if action_value == ADSORBED_DETAIL_ACTION_MOVE:
+            moved_ids.append(particle_id)
+        elif action_value == ADSORBED_DETAIL_ACTION_DELETE:
+            deleted_ids.append(particle_id)
+
+    if theta_changes:
+        set_theta_excluded_ids(image_name, new_excluded_ids)
+        summary["theta"] = theta_changes
+
+    if moved_ids:
+        if "manual_phase_overrides" not in st.session_state:
+            st.session_state["manual_phase_overrides"] = {}
+        for particle_id in moved_ids:
+            st.session_state["manual_phase_overrides"][int(particle_id)] = "fat_particles"
+        summary["moved"] = len(moved_ids)
+
+    if deleted_ids:
+        if "interactive_excluded_ids" not in st.session_state:
+            st.session_state["interactive_excluded_ids"] = set()
+        st.session_state["interactive_excluded_ids"].update(
+            {int(particle_id) for particle_id in deleted_ids}
+        )
+        summary["deleted"] = len(deleted_ids)
+
+    return summary
 
 
 def merge_bubble_theta_exclusions(
@@ -438,13 +615,6 @@ def render_theta_exclusion_editor(
         bubble_particles: Corona-globule rows of this bubble (analyzer output).
         individual_theta_mode: True when θ is computed for corona globules only.
     """
-    st.caption(
-        "Uncheck / check **Exclude from θ** for freeze-fracture artefacts (globules "
-        "cleaved off-centre or partially occluded, whose visible cross-section is not "
-        "their true diameter), then press **✅ Apply θ Exclusions**. Excluded globules "
-        "keep their corona/interior role (areal interior coverage and rim metrics are "
-        "unchanged) but drop out of every θ statistic."
-    )
 
     theta_excluded_ids = get_theta_excluded_ids(image_name)
     bubble_particles = (
@@ -3062,11 +3232,11 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.1) ----------------
+# ---------------- BUILD IDENTITY (v1.8.2) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.1"
+PHASEPIX_BUILD_VERSION = "v1.8.2"
 PHASEPIX_BUILD_DATE = "2026.11.04"
 PHASEPIX_BUILD_TITLE = "Publication-Ready Plot-Data CSV Exports"
 
@@ -8579,16 +8749,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
     # ---------------- TAB: INTERFACIAL ADSORPTION ANALYTICS ----------------
     elif active_tab == "🛡️ Interfacial Analytics":
         st.subheader("🛡️ Interfacial Adsorption Analytics (Pickering Stabilization)")
-        st.markdown(
-            "Two globule populations, two surfaces — reported separately. "
-            "**Interior crater globules** (*is_corona_globule = False*) sit on the inner "
-            "crater floor and define the 2D areal **Surface Coverage (%)** and "
-            "**Packing Density (globules / µm²)** inside the bubble area Ω_b. "
-            "**Corona rim globules** (*is_corona_globule = True*) sit on the fractured "
-            "equatorial perimeter cross-section and define **Rim Coverage (%)** and the "
-            "three-phase contact angle $\\theta_i = \\arcsin(L_{c,i} / D_i)$ from each "
-            "globule's own diameter $D_i$ and interfacial chord $L_{c,i}$."
-        )
 
         def _safe_ui_float(value, default: float = 0.0) -> float:
             """Convert a widget/table value to a finite float for captions and metrics."""
@@ -8773,21 +8933,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     f"{theta_excluded_total} excluded from θ"
                 )
 
-                if individual_theta_mode:
-                    st.caption(
-                        "θ is evaluated **only for corona rim globules** with their own "
-                        "measured geometry: $D_i = \\max(\\text{major axis},\\ "
-                        "\\text{diameter})$ and $L_{c,i}$ = chord of the globule mask at the "
-                        "bubble boundary, so $\\theta_i = \\arcsin(L_{c,i}/D_i)$ and "
-                        "$\\cos\\theta_i = d_i/R_i$ (cross-check column "
-                        "`contact_angle_protrusion_deg`). Interior crater globules expose "
-                        "only a 2D cap projection, so their `contact_angle_deg` is **NaN** "
-                        "and they never enter the θ mean; they are the only population "
-                        "behind Surface Coverage (%) and Packing Density (glob/µm²), while "
-                        "Rim Coverage (%) is measured on the corona union across a "
-                        f"{resolved_d_ref:.2f} µm equatorial rim band."
-                    )
-
                 if theta_excluded_ids:
                     st.info(
                         f"🚫 **{len(theta_excluded_ids)}** particle ID(s) excluded from the θ "
@@ -8819,32 +8964,25 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     with col_img:
                         st.markdown("#### 🖼️ Selected Bubble Inspection Overlay")
                         st.caption(f"Active inspection mode: **{inspection_mode}**")
-                        if coverage_mode:
-                            show_interior_ids = st.checkbox(
-                                "🔢 Show Particle IDs on Image",
+                        col_ids_bubble, col_ids_fat = st.columns(2)
+                        with col_ids_bubble:
+                            show_bubble_ids = st.checkbox(
+                                "🫧 Show Air Bubble IDs",
                                 value=True,
                                 help=(
-                                    "Prints the bare particle ID of every **interior crater "
-                                    "globule** drawn in gold. Interior globules sit on the "
-                                    "crater floor, so they carry no contact angle — only "
-                                    "their ID is shown."
+                                    "Prints the numeric ID of every inspected bubble at "
+                                    "its mask centroid, so the overlay can be matched to "
+                                    "a row of the per-bubble table."
                                 ),
                             )
-                            show_theta_labels = False
-                            show_particle_ids_with_theta = False
-                        else:
-                            show_interior_ids = False
-                            show_theta_labels = st.checkbox(
-                                "Show Contact Angle Labels (°) on Image",
-                                value=True,
-                            )
-                            show_particle_ids_with_theta = st.checkbox(
-                                "🏷️ Show Particle ID next to θ (e.g. #142: 68°)",
+                        with col_ids_fat:
+                            show_fat_ids = st.checkbox(
+                                "🟡 Show Fat Particle IDs",
                                 value=False,
                                 help=(
-                                    "Prefixes every θ label with the particle ID so the "
-                                    "annotation on the overlay/crop can be matched to a row of "
-                                    "the Exclude from θ editor below."
+                                    "Prints only the bare numeric particle ID (e.g. 142) "
+                                    "of every gold adsorbed / corona globule. Contact "
+                                    "angle values are never drawn on the image."
                                 ),
                             )
                         inspection_img = render_selected_bubbles_inspection_overlay(
@@ -8855,25 +8993,24 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             fat_masks=padded_masks,
                             manual_polygons=active_manual_polygons,
                             ads_particles_df=ads_particles_df,
-                            show_contact_angles=bool(show_theta_labels),
                             # Coverage mode clips strictly to Ω_b, exactly like the areal
                             # Surface Coverage metric; θ mode keeps the corona rim band so
                             # rim-straddling globules are drawn in full.
                             corona_margin_px=0 if coverage_mode else int(corona_px),
-                            show_particle_ids=bool(show_particle_ids_with_theta),
                             globule_role=globule_role,
-                            show_globule_ids=bool(show_interior_ids),
+                            show_bubble_ids=bool(show_bubble_ids),
+                            show_fat_ids=bool(show_fat_ids),
                         )
                         st.image(
                             inspection_img,
                             caption=(
                                 "Cyan: verified bubbles · Gold: interior crater globules "
-                                "(Surface Coverage) · Labels: particle IDs · "
+                                "(Surface Coverage) · Labels: bubble + particle IDs · "
                                 "corona rim globules hidden"
                                 if coverage_mode
                                 else (
                                     "Cyan: verified bubbles · Gold: equatorial corona "
-                                    "globules (θ) · Labels: corona contact angle θ "
+                                    "globules (θ) · Labels: bubble + particle IDs "
                                     "(grey = excluded from θ) · interior crater globules "
                                     "hidden"
                                 )
@@ -8897,17 +9034,26 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             options=inspect_options,
                             format_func=lambda value: f"Bubble #{int(value)}",
                         )
-                        crop_show_labels = st.checkbox(
-                            "🔢 Show Labels / Contact Angles on Crop",
-                            value=bool(
-                                show_interior_ids if coverage_mode else show_theta_labels
-                            ),
-                            help=(
-                                "Uncheck for a label-free close-up: only the cyan bubble "
-                                "boundary and the gold globule masks of the active "
-                                "inspection mode are drawn."
-                            ),
-                        )
+                        col_crop_bubble, col_crop_fat = st.columns(2)
+                        with col_crop_bubble:
+                            crop_show_bubble_ids = st.checkbox(
+                                "🫧 Show Air Bubble IDs",
+                                value=True,
+                                help=(
+                                    "Keep the numeric bubble ID printed at the bubble "
+                                    "centroid of the close-up crop."
+                                ),
+                            )
+                        with col_crop_fat:
+                            crop_show_fat_ids = st.checkbox(
+                                "🟡 Show Fat Particle IDs",
+                                value=True,
+                                help=(
+                                    "Prints only the bare numeric particle ID (e.g. 142) "
+                                    "of every gold globule, so the crop can be matched to "
+                                    "a row of the Exclude from θ editor."
+                                ),
+                            )
                         inspect_row = per_bubble_df.loc[
                             per_bubble_df["Bubble ID"] == inspect_id
                         ].iloc[0]
@@ -8948,32 +9094,28 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                 x0 = max(0, center_x - half_side)
                                 x1 = min(full_w, center_x + half_side)
                                 if y1 > y0 and x1 > x0:
-                                    crop_source_img = inspection_img
-                                    if not crop_show_labels:
-                                        # Label-free render: cyan bubble boundary and the gold
-                                        # masks of the active inspection mode only (no theta /
-                                        # ID text), so the population can be verified without
-                                        # text clutter.
-                                        crop_source_img = (
-                                            render_selected_bubbles_inspection_overlay(
-                                                image=base_display_img,
-                                                df=classified_df,
-                                                selected_bubble_ids=selected_bubble_ids,
-                                                air_masks=padded_air_masks,
-                                                fat_masks=padded_masks,
-                                                manual_polygons=active_manual_polygons,
-                                                ads_particles_df=ads_particles_df,
-                                                show_contact_angles=False,
-                                                show_labels=False,
-                                                corona_margin_px=(
-                                                    0 if coverage_mode else int(corona_px)
-                                                ),
-                                                globule_role=globule_role,
-                                            )
+                                    # Re-render for the crop so its own ID toggles apply
+                                    # independently of the full-size inspection overlay.
+                                    crop_source_img = (
+                                        render_selected_bubbles_inspection_overlay(
+                                            image=base_display_img,
+                                            df=classified_df,
+                                            selected_bubble_ids=selected_bubble_ids,
+                                            air_masks=padded_air_masks,
+                                            fat_masks=padded_masks,
+                                            manual_polygons=active_manual_polygons,
+                                            ads_particles_df=ads_particles_df,
+                                            corona_margin_px=(
+                                                0 if coverage_mode else int(corona_px)
+                                            ),
+                                            globule_role=globule_role,
+                                            show_bubble_ids=bool(crop_show_bubble_ids),
+                                            show_fat_ids=bool(crop_show_fat_ids),
                                         )
+                                    )
                                     crop_img = crop_source_img[y0:y1, x0:x1]
                                     crop_caption = f"Bubble #{inspect_id} — close-up"
-                                    if not crop_show_labels:
+                                    if not (crop_show_bubble_ids or crop_show_fat_ids):
                                         crop_caption += " (labels hidden)"
                                     crop_caption += (
                                         " · interior crater globules (Surface Coverage)"
@@ -9028,15 +9170,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                     if coverage_mode:
                                         st.markdown(
                                             f"##### 🫧 Interior Crater Globules on Bubble #{inspect_id}"
-                                        )
-                                        st.caption(
-                                            "The globules tinted in gold above are the **interior "
-                                            "adsorbed globules** (`is_corona_globule = False`) that "
-                                            "define the 2D areal Surface Coverage (%) and Packing "
-                                            "Density (glob/µm²) of this bubble. Corona rim "
-                                            "globules are hidden in this mode — switch to "
-                                            "*👑 Contact Angle θ Mode* to inspect and exclude "
-                                            "them."
                                         )
                                         interior_table = pd.DataFrame(
                                             {
@@ -9112,22 +9245,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                     else:
                                         st.markdown(
                                             f"##### 👑 Equatorial Corona Globules on Bubble #{inspect_id}"
-                                        )
-                                        st.caption(
-                                            "The globules tinted in gold above are the "
-                                            "**equatorial corona globules** "
-                                            "(`is_corona_globule = True`) that define the "
-                                            "three-phase contact angle "
-                                            "$\\theta_i = \\arcsin(L_{c,i}/D_i)$ and Rim "
-                                            "Coverage (%) of this bubble. Interior crater "
-                                            "globules are hidden in this mode. Tick "
-                                            "**Exclude from θ** for freeze-fracture artefacts "
-                                            "(globules cleaved off-centre or partially "
-                                            "occluded, whose visible cross-section is not their "
-                                            "true diameter), then press **✅ Apply θ "
-                                            "Exclusions**. Excluded globules keep their corona "
-                                            "role (rim coverage is unchanged) but drop out of "
-                                            "every θ statistic."
                                         )
                                         render_theta_exclusion_editor(
                                             image_name=image_name,
@@ -9253,145 +9370,150 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             use_container_width=True,
                         )
 
-                        st.markdown("#### 📈 Contact Angle Distribution")
-                        theta_frame = ads_particles_df.copy()
-                        if not theta_frame.empty and "excluded_from_theta" in theta_frame.columns:
-                            theta_frame = theta_frame[
-                                ~theta_frame["excluded_from_theta"].fillna(False).astype(bool)
-                            ]
-                        theta_values = pd.to_numeric(
-                            theta_frame.get(
-                                "contact_angle_deg", pd.Series(dtype=float)
-                            ),
-                            errors="coerce",
-                        ).dropna()
-                        if theta_excluded_total:
-                            st.caption(
-                                f"n = {int(theta_values.size)} corona globules valid for θ · "
-                                f"{theta_excluded_total} excluded by the researcher "
-                                "(🚫 not plotted, not averaged)."
-                            )
-                        if theta_values.empty:
+                        # The θ histogram only belongs to the Contact Angle θ mode:
+                        # in Surface Coverage mode there is no corona rim globule to
+                        # plot, so the whole section (plot + PNG/CSV downloads + the
+                        # binned θ table) is hidden instead of showing empty states.
+                        if inspection_mode == INSPECTION_MODE_THETA_LABEL:
+                            st.markdown("#### 📈 Contact Angle Distribution")
+                            theta_frame = ads_particles_df.copy()
+                            if not theta_frame.empty and "excluded_from_theta" in theta_frame.columns:
+                                theta_frame = theta_frame[
+                                    ~theta_frame["excluded_from_theta"].fillna(False).astype(bool)
+                                ]
+                            theta_values = pd.to_numeric(
+                                theta_frame.get(
+                                    "contact_angle_deg", pd.Series(dtype=float)
+                                ),
+                                errors="coerce",
+                            ).dropna()
                             if theta_excluded_total:
-                                st.info(
-                                    f"All measurable θ values were excluded by the "
-                                    f"researcher ({theta_excluded_total} globule(s)). "
-                                    "Use **🔄 Reset θ Exclusions** in the crop inspector to "
-                                    "bring them back."
-                                )
-                            elif individual_theta_mode:
-                                st.info(
-                                    "No **corona rim globules** with a measurable "
-                                    "contact angle in the selected bubbles — interior "
-                                    "crater globules are excluded from θ by design "
-                                    "(they only feed Surface Coverage / Packing Density). "
-                                    "Check the `👑 Corona Rim Capture Distance (µm)` slider "
-                                    "if a visible corona was not captured."
-                                )
-                            else:
-                                st.info(
-                                    "No adsorbed globules were detected inside the "
-                                    "selected bubbles."
-                                )
-                        else:
-                            # Bins are computed once and handed to seaborn, so the
-                            # exported plot-data table matches the drawn bars exactly.
-                            theta_bin_count = int(
-                                min(20, max(5, theta_values.size // 2))
-                            )
-                            theta_bin_edges = np.histogram_bin_edges(
-                                theta_values.to_numpy(dtype=float),
-                                bins=theta_bin_count,
-                            )
-                            theta_plot_table = compute_histogram_plot_table(
-                                theta_values,
-                                bin_edges=theta_bin_edges,
-                                interval_label="Angle Interval (°)",
-                                center_label="Bin Center (°)",
-                                lower_label="Angle Lower (°)",
-                                upper_label="Angle Upper (°)",
-                            )
-                            fig_theta, ax_theta = plt.subplots(
-                                figsize=(6.4, 3.0), dpi=130
-                            )
-                            sns.histplot(
-                                theta_values,
-                                bins=theta_bin_edges,
-                                kde=bool(theta_values.size >= 3),
-                                color="#ffd700",
-                                ax=ax_theta,
-                            )
-                            ax_theta.set_xlabel(
-                                "Corona globule contact angle θ (°)"
-                                if individual_theta_mode
-                                else "Apparent contact angle θ (°)"
-                            )
-                            ax_theta.set_ylabel("Globule count")
-                            ax_theta.set_title(
-                                (
-                                    f"Corona rim globule contact angle "
-                                    f"(n = {theta_values.size}, true D_i)"
-                                    if individual_theta_mode
-                                    else "Adsorbed globule contact-angle distribution"
-                                )
-                            )
-                            ax_theta.grid(alpha=0.25)
-                            fig_theta.tight_layout()
-                            st.pyplot(fig_theta, use_container_width=True)
-                            buf_theta = io.BytesIO()
-                            fig_theta.savefig(
-                                buf_theta, format="png", dpi=300, bbox_inches="tight"
-                            )
-                            plt.close(fig_theta)
-
-                            col_theta_png, col_theta_csv = st.columns(2)
-                            with col_theta_png:
-                                st.download_button(
-                                    "📥 Download Contact Angle Plot (PNG)",
-                                    data=buf_theta.getvalue(),
-                                    file_name=f"Contact_Angle_Distribution_{clean_stem}.png",
-                                    mime="image/png",
-                                    use_container_width=True,
-                                    key=f"dl_theta_png_{clean_stem}",
-                                )
-                            with col_theta_csv:
-                                st.download_button(
-                                    "📥 Download Contact Angle Plot Data (CSV)",
-                                    data=theta_plot_table.to_csv(index=False).encode(
-                                        "utf-8"
-                                    ),
-                                    file_name=f"Contact_Angle_Plot_Data_{clean_stem}.csv",
-                                    mime="text/csv",
-                                    use_container_width=True,
-                                    disabled=theta_plot_table.empty,
-                                    key=f"dl_theta_plot_data_{clean_stem}",
-                                    help=(
-                                        "Clean binned θ histogram (angle interval, numeric "
-                                        "bin centre, angle bounds, count, percentage, "
-                                        "cumulative %) — ready to re-plot in Excel, Origin "
-                                        "or GraphPad Prism."
-                                    ),
-                                )
-                            with st.expander(
-                                "📊 View Exact Binned θ Table (Σ = 100%)",
-                                expanded=False,
-                            ):
-                                theta_rows = (
-                                    0 if theta_plot_table.empty
-                                    else int(theta_plot_table["Count (n)"].sum())
-                                )
                                 st.caption(
-                                    f"{len(theta_plot_table)} intervals · n = {theta_rows:,} · "
-                                    "valid (non-excluded) corona globules only · this is "
-                                    "exactly the `📥 Download Contact Angle Plot Data "
-                                    "(CSV)` table"
+                                    f"n = {int(theta_values.size)} corona globules valid for θ · "
+                                    f"{theta_excluded_total} excluded by the researcher "
+                                    "(🚫 not plotted, not averaged)."
                                 )
-                                st.dataframe(
-                                    theta_plot_table,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    height=220,
+                            if theta_values.empty:
+                                if theta_excluded_total:
+                                    st.info(
+                                        f"All measurable θ values were excluded by the "
+                                        f"researcher ({theta_excluded_total} globule(s)). "
+                                        "Use **🔄 Reset θ Exclusions** in the crop inspector to "
+                                        "bring them back."
+                                    )
+                                elif individual_theta_mode:
+                                    st.info(
+                                        "No **corona rim globules** with a measurable "
+                                        "contact angle in the selected bubbles — interior "
+                                        "crater globules are excluded from θ by design "
+                                        "(they only feed Surface Coverage / Packing Density). "
+                                        "Check the `👑 Corona Rim Capture Distance (µm)` slider "
+                                        "if a visible corona was not captured."
+                                    )
+                                else:
+                                    st.info(
+                                        "No adsorbed globules were detected inside the "
+                                        "selected bubbles."
+                                    )
+                            else:
+                                # Bins are computed once and handed to seaborn, so the
+                                # exported plot-data table matches the drawn bars exactly.
+                                theta_bin_count = int(
+                                    min(20, max(5, theta_values.size // 2))
                                 )
+                                theta_bin_edges = np.histogram_bin_edges(
+                                    theta_values.to_numpy(dtype=float),
+                                    bins=theta_bin_count,
+                                )
+                                theta_plot_table = compute_histogram_plot_table(
+                                    theta_values,
+                                    bin_edges=theta_bin_edges,
+                                    interval_label="Angle Interval (°)",
+                                    center_label="Bin Center (°)",
+                                    lower_label="Angle Lower (°)",
+                                    upper_label="Angle Upper (°)",
+                                )
+                                fig_theta, ax_theta = plt.subplots(
+                                    figsize=(6.4, 3.0), dpi=130
+                                )
+                                sns.histplot(
+                                    theta_values,
+                                    bins=theta_bin_edges,
+                                    kde=bool(theta_values.size >= 3),
+                                    color="#ffd700",
+                                    ax=ax_theta,
+                                )
+                                ax_theta.set_xlabel(
+                                    "Corona globule contact angle θ (°)"
+                                    if individual_theta_mode
+                                    else "Apparent contact angle θ (°)"
+                                )
+                                ax_theta.set_ylabel("Globule count")
+                                ax_theta.set_title(
+                                    (
+                                        f"Corona rim globule contact angle "
+                                        f"(n = {theta_values.size}, true D_i)"
+                                        if individual_theta_mode
+                                        else "Adsorbed globule contact-angle distribution"
+                                    )
+                                )
+                                ax_theta.grid(alpha=0.25)
+                                fig_theta.tight_layout()
+                                st.pyplot(fig_theta, use_container_width=True)
+                                buf_theta = io.BytesIO()
+                                fig_theta.savefig(
+                                    buf_theta, format="png", dpi=300, bbox_inches="tight"
+                                )
+                                plt.close(fig_theta)
+
+                                col_theta_png, col_theta_csv = st.columns(2)
+                                with col_theta_png:
+                                    st.download_button(
+                                        "📥 Download Contact Angle Plot (PNG)",
+                                        data=buf_theta.getvalue(),
+                                        file_name=f"Contact_Angle_Distribution_{clean_stem}.png",
+                                        mime="image/png",
+                                        use_container_width=True,
+                                        key=f"dl_theta_png_{clean_stem}",
+                                    )
+                                with col_theta_csv:
+                                    st.download_button(
+                                        "📥 Download Contact Angle Plot Data (CSV)",
+                                        data=theta_plot_table.to_csv(index=False).encode(
+                                            "utf-8"
+                                        ),
+                                        file_name=f"Contact_Angle_Plot_Data_{clean_stem}.csv",
+                                        mime="text/csv",
+                                        use_container_width=True,
+                                        disabled=theta_plot_table.empty,
+                                        key=f"dl_theta_plot_data_{clean_stem}",
+                                        help=(
+                                            "Clean binned θ histogram (angle interval, numeric "
+                                            "bin centre, angle bounds, count, percentage, "
+                                            "cumulative %) — ready to re-plot in Excel, Origin "
+                                            "or GraphPad Prism."
+                                        ),
+                                    )
+                                with st.expander(
+                                    "📊 View Exact Binned θ Table (Σ = 100%)",
+                                    expanded=False,
+                                ):
+                                    theta_rows = (
+                                        0 if theta_plot_table.empty
+                                        else int(theta_plot_table["Count (n)"].sum())
+                                    )
+                                    st.caption(
+                                        f"{len(theta_plot_table)} intervals · n = {theta_rows:,} · "
+                                        "valid (non-excluded) corona globules only · this is "
+                                        "exactly the `📥 Download Contact Angle Plot Data "
+                                        "(CSV)` table"
+                                    )
+                                    st.dataframe(
+                                        theta_plot_table,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=220,
+                                    )
 
                         st.markdown("#### 🟡 Adsorbed Globule Detail")
                         # Clean, whitelisted scientific columns only — internal flags
@@ -9400,12 +9522,95 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         ads_globules_clean = clean_adsorbed_globule_table(
                             ads_particles_df
                         )
-                        st.dataframe(
-                            ads_globules_clean,
+                        # Editable state, aligned row-by-row with the clean table (the
+                        # cleaner keeps the analyzer row order). Only corona rim globules
+                        # can be excluded from θ — an interior crater globule has no θ at
+                        # all, so its checkbox stays unticked and inert.
+                        detail_source = (
+                            ads_particles_df.reset_index(drop=True)
+                            if isinstance(ads_particles_df, pd.DataFrame)
+                            else pd.DataFrame()
+                        )
+                        if len(detail_source) == len(ads_globules_clean):
+                            detail_corona_series = (
+                                detail_source.get(
+                                    "is_corona_globule",
+                                    pd.Series(False, index=detail_source.index),
+                                )
+                                .fillna(False)
+                                .astype(bool)
+                            )
+                            detail_excluded_series = (
+                                detail_source.get(
+                                    "excluded_from_theta",
+                                    pd.Series(False, index=detail_source.index),
+                                )
+                                .fillna(False)
+                                .astype(bool)
+                            )
+                            detail_corona_flags = detail_corona_series.tolist()
+                            detail_theta_flags = (
+                                detail_corona_series & detail_excluded_series
+                            ).tolist()
+                            detail_corona_ids = {
+                                int(particle_id)
+                                for particle_id, is_corona in zip(
+                                    pd.to_numeric(
+                                        detail_source.get("id", pd.Series(dtype=float)),
+                                        errors="coerce",
+                                    ).tolist(),
+                                    detail_corona_flags,
+                                )
+                                if is_corona and pd.notna(particle_id)
+                            }
+                        else:
+                            detail_corona_flags = [False] * len(ads_globules_clean)
+                            detail_theta_flags = [False] * len(ads_globules_clean)
+                            detail_corona_ids = set()
+
+                        # Interactive detail table: the first four columns are the action
+                        # surface — Particle ID / Bubble ID (read-only), the θ-exclusion
+                        # checkbox and the tri-state Action selector — followed by every
+                        # scientific column of the publication table, unchanged.
+                        detail_table = ads_globules_clean.drop(
+                            columns=["Excluded from θ"], errors="ignore"
+                        ).copy()
+                        detail_table.insert(2, "Excluded from θ", detail_theta_flags)
+                        detail_table.insert(3, "Action", ADSORBED_DETAIL_ACTION_KEEP)
+                        edited_detail_table = st.data_editor(
+                            detail_table,
                             use_container_width=True,
                             hide_index=True,
                             height=260,
+                            disabled=["Particle ID", "Bubble ID"],
+                            column_config=adsorbed_detail_column_config(),
+                            key=(
+                                f"ads_globule_detail_editor_{clean_stem}_"
+                                f"{int(st.session_state.get(theta_exclusion_rev_key(image_name), 0) or 0)}"
+                            ),
                         )
+                        if st.button(
+                            "✅ Apply Changes",
+                            use_container_width=True,
+                            key=f"apply_ads_globule_detail_{clean_stem}",
+                            help=(
+                                "Commits the θ exclusions, phase moves and deletions of "
+                                "the table above and recomputes every statistic."
+                            ),
+                        ):
+                            detail_summary = apply_adsorbed_globule_detail_changes(
+                                image_name=image_name,
+                                baseline_table=detail_table,
+                                edited_table=edited_detail_table,
+                                corona_particle_ids=detail_corona_ids,
+                            )
+                            if detail_summary["theta"] or detail_summary["moved"] or detail_summary["deleted"]:
+                                st.toast(
+                                    f"Applied · θ {detail_summary['theta']} · "
+                                    f"moved {detail_summary['moved']} · "
+                                    f"deleted {detail_summary['deleted']}"
+                                )
+                            st.rerun()
                         st.download_button(
                             label="📥 Download Adsorbed Globules (CSV)",
                             data=ads_globules_clean.to_csv(index=False).encode("utf-8"),

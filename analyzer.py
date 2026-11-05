@@ -2441,7 +2441,11 @@ def compute_interfacial_adsorption_metrics(
         seen in cross-section along the perimeter, so both their true individual diameter
         D_i and their interfacial contact chord L_c,i are directly visible. These globules
         are the **only** population used for the three-phase contact angle and for
-        ``Rim Coverage (%)`` measured along the equatorial rim band.
+        ``Rim Coverage (%)`` measured along the equatorial rim band. A candidate that
+        reports no interfacial chord (``L_c,i = 0``) or a non-positive / non-finite θ is
+        demoted back to an interior crater globule (``is_corona_globule = False``,
+        ``contact_angle_deg = NaN``, v1.8.2), so particles that never really intersect
+        the interface cannot create a 0° spike in the θ histogram.
 
     Mixing the two populations is physically meaningless: a corona globule straddles the
     fractured rim, so counting its area as crater area would inflate Surface Coverage /
@@ -2920,6 +2924,21 @@ def compute_interfacial_adsorption_metrics(
                     and centre_to_rim_px <= radius_px + contact_reach_px
                 )
             )
+            if is_corona:
+                # A candidate without a measurable interfacial cross-section has no
+                # three-phase contact angle: theta_i = arcsin(L_c,i / D_i) collapses to
+                # 0 deg (or NaN) when the particle does not actually intersect the
+                # interface. Such a globule is NOT a corona globule — demote it to an
+                # interior crater globule (contact_angle_deg = NaN) so a non-intersecting
+                # particle can never inject a spurious 0 deg spike into the contact
+                # angle histogram or the mean θ.
+                candidate_theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
+                if (
+                    not np.isfinite(candidate_theta_deg)
+                    or chord_um <= 0.0
+                    or candidate_theta_deg <= 0.0
+                ):
+                    is_corona = False
             if is_corona:
                 corona_count += 1
                 corona_chords_um.append(chord_um)
