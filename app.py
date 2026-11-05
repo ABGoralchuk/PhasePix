@@ -248,10 +248,12 @@ CORONA_CAPTURE_UM_DEFAULT = 1.2
 # are freeze-fracture debris, so they are rejected below this circularity (0.30 is the
 # permissive floor, 0.60 the scientifically sensible default).
 CORONA_MIN_CIRCULARITY_DEFAULT = 0.60
-# Bright lime-gold used for ``corona_fat`` everywhere in the UI (RGB 191, 255, 0) —
-# distinct from interior adsorbed_fat (255, 215, 0), matrix fat (255, 165, 0) and
-# Unclassified (50, 205, 50).
-CORONA_FAT_RGB = (191, 255, 0)
+# Pure bright lemon-yellow used for ``corona_fat`` everywhere in the UI
+# (RGB 255, 242, 32 / #FFF220) with a warm golden-amber edge (255, 190, 0) — an
+# unmistakably yellow shade, so it can never clash with the lime-green Unclassified
+# underlay (50, 205, 50); lighter than the interior adsorbed_fat honey-gold
+# (230, 175, 0) and the matrix fat (255, 165, 0).
+CORONA_FAT_RGB = (255, 242, 32)
 # Smallest rim band even at 0 µm: absorbs the anti-aliased edge of the air contour.
 CORONA_PX_FLOOR = 2
 
@@ -361,8 +363,8 @@ def adsorbed_detail_column_config() -> dict:
             "Action",
             help=(
                 "**Keep** = unchanged · **Move to Corona Fat** = reclassify this "
-                "particle as an equatorial corona rim globule (`corona_fat`, bright "
-                "lime-gold) · **Move to Interior Adsorbed** = reclassify it as an "
+                "particle as an equatorial corona rim globule (`corona_fat`, pure "
+                "lemon-yellow) · **Move to Interior Adsorbed** = reclassify it as an "
                 "interior crater globule (`adsorbed_fat`, warm gold) · **Move to Matrix "
                 "Fat** = reclassify it as free matrix fat (`fat_particles`) · **Delete** "
                 "= drop the particle from every downstream statistic."
@@ -411,7 +413,7 @@ def apply_adsorbed_globule_detail_changes(
       freshly stored state on the next run.
     * ``Move to Corona Fat`` — writes ``manual_phase_overrides[particle_id] =
       "corona_fat"`` so the globule becomes an equatorial Pickering rim globule
-      (bright lime-gold, feeds the corona / θ population).
+      (pure lemon-yellow, feeds the corona / θ population).
     * ``Move to Interior Adsorbed`` — writes ``manual_phase_overrides[particle_id] =
       "adsorbed_fat"`` so the globule becomes an interior crater globule (warm gold,
       feeds Surface Coverage / Packing Density).
@@ -3281,13 +3283,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.3) ----------------
+# ---------------- BUILD IDENTITY (v1.8.4) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.3"
-PHASEPIX_BUILD_DATE = "2026.11.04"
-PHASEPIX_BUILD_TITLE = "Corona Fat Phase Class, Circularity Gate & Smooth Interface θ"
+PHASEPIX_BUILD_VERSION = "v1.8.4"
+PHASEPIX_BUILD_DATE = "2026.11.05"
+PHASEPIX_BUILD_TITLE = "Independent Corona Toggle, Yellow Palette & Rim-Shard Rejection"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -4203,7 +4205,7 @@ def _promote_corona_rim_globules(
     The interfacial analysis already knows which particles straddle the bubble rim
     (``is_corona_globule == True``) and how compact each one is. Every such globule whose
     ``circularity`` reaches ``corona_min_circularity`` is an *intact* corona globule, so
-    it gets its own phase class: it is drawn in bright lime-gold (RGB 191, 255, 0)
+    it gets its own phase class: it is drawn in pure lemon-yellow (RGB 255, 242, 32)
     everywhere, excluded from the matrix-fat PSD, and reported as its own population.
 
     Args:
@@ -4326,9 +4328,9 @@ def _canvas_phase_visibility(
         reclassify_mode: True when the 🎨 Group Click selection method is active.
         show_unclassified: Paint green Unclassified particles.
         show_fat: Paint orange matrix-fat particles.
-        show_adsorbed: Paint gold adsorbed-fat globules.
+        show_adsorbed: Paint honey-gold interior adsorbed-fat globules.
         show_air: Paint sky-blue air bubbles.
-        show_corona: Paint bright lime-gold ``corona_fat`` (equatorial rim) globules.
+        show_corona: Paint pure lemon-yellow ``corona_fat`` (equatorial rim) globules.
         isolate_unclassified: Hide fat / adsorbed fat / air entirely.
 
     Returns:
@@ -5658,10 +5660,15 @@ with st.sidebar:
                         "with circularity ≥ this value are classified as corona rim "
                         "globules (`corona_fat`), so round globules (default 0.60) are "
                         "kept while irregular rim-wall shards (~0.30) are rejected and "
-                        "fall back to the interior crater population. It also sets the "
-                        "threshold above which an auto-detected corona globule is "
-                        "promoted to the `corona_fat` phase and is counted as *intact* "
-                        "in the 👑 Include Intact Corona Fat in Fat PSD option."
+                        "fall back to the interior crater population. Since v1.8.4 it is "
+                        "combined with two further gates measured on the raw pixel mask — "
+                        "solidity ≥ 0.78 (rejects curved crescent rim strips) and "
+                        "aspect ratio ≤ 1.65 (rejects elongated rim-wall segments) — and "
+                        "an elongated shard sitting on the outer rim band is dropped from "
+                        "the interior population as well. It also sets the threshold "
+                        "above which an auto-detected corona globule is promoted to the "
+                        "`corona_fat` phase and is counted as *intact* in the "
+                        "👑 Include Intact Corona Fat in Fat PSD option."
                     ),
                     key="sem_corona_circ_slider",
                 )
@@ -6020,7 +6027,7 @@ with st.sidebar:
         z_order = "Fat over Air"
 
     else:
-        col_vis1, col_vis2, col_vis3, col_vis4 = st.columns(4)
+        col_vis1, col_vis2, col_vis3, col_vis4, col_vis5 = st.columns(5)
         with col_vis1:
             show_air = st.checkbox("Show Air Bubbles", value=True)
         with col_vis2:
@@ -6035,6 +6042,24 @@ with st.sidebar:
                 help=(
                     "Toggles the green Unclassified underlay in the dashboard overlay and "
                     "in the 🎨 Click-to-Reclassify canvas."
+                ),
+            )
+        with col_vis5:
+            # 🌕 Pickering corona rim globules: their own phase (corona_fat) and their own
+            # pure lemon-yellow tint with a warm golden-amber edge, so they are told apart
+            # from the honey-gold interior adsorbed globules at a glance — and can be hidden
+            # on demand for clean exports. 100% independent of "Show Adsorbed Fat".
+            show_corona = st.checkbox(
+                "Show Corona Fat",
+                value=True,
+                key="show_corona_toggle",
+                help=(
+                    "Renders the equatorial Pickering corona globules — phase_class "
+                    "`corona_fat`, or every globule flagged `is_corona_globule == True` in "
+                    "the interfacial analysis — in pure lemon-yellow (RGB 255, 242, 32) with "
+                    "a warm golden-amber contour (RGB 255, 190, 0). Fully independent of "
+                    "`Show Adsorbed Fat`: interior crater globules keep the honey-gold "
+                    "(230, 175, 0) tint and stay visible even when this layer is off."
                 ),
             )
 
@@ -6070,22 +6095,6 @@ with st.sidebar:
             options=["Fat over Air", "Air over Fat"],
             index=0,
             help="Layering priority: 'Fat over Air' renders fat particles on top of air bubbles; 'Air over Fat' renders air bubbles on top.",
-        )
-
-        # 👑 Pickering corona rim globules: their own phase (corona_fat) and their own
-        # bright lime-gold tint, so they can be told apart from the warm-gold interior
-        # adsorbed globules at a glance — and hidden on demand for clean exports.
-        show_corona = st.checkbox(
-            "👑 Show Corona Fat",
-            value=True,
-            key="show_corona_toggle",
-            help=(
-                "Renders the equatorial Pickering corona globules — phase_class "
-                "`corona_fat`, or every globule flagged `is_corona_globule == True` in "
-                "the interfacial analysis — in bright lime-gold (RGB 191, 255, 0) with a "
-                "crisp outer contour. Interior crater globules keep the warm gold "
-                "(255, 215, 0) tint. Uncheck to hide the corona population entirely."
-            ),
         )
 
     # Universal for all sample types (Foam / Emulsion / Whipped Emulsion)
@@ -6997,12 +7006,27 @@ else:
         for value in (set(confirmed_air_ids) | set(manual_air_ids) | _classified_air_ids)
     })
 
+    # 🌕 The interfacial table drives the corona_fat overlay, its θ labels and every
+    # adsorption metric, so it must NEVER be gated on the visual toggles
+    # (``show_adsorbed`` / ``show_labels``). Gating it there left
+    # ``ads_particles_df_global`` empty, which silently hid every corona globule as soon
+    # as the researcher unchecked "Show Adsorbed Fat (in Bubbles)" or
+    # "Show Particle ID Numbers". It now runs whenever a bubble is selected and there is
+    # at least one adsorbed *or* already-promoted corona globule to analyse.
+    _corona_fat_count = (
+        int(
+            classified_df["phase_class"]
+            .astype(str)
+            .str.lower()
+            .eq("corona_fat")
+            .sum()
+        )
+        if (not classified_df.empty and "phase_class" in classified_df.columns)
+        else 0
+    )
     ads_particles_df_global = pd.DataFrame()
-    if (
-        selected_bubble_ids_for_ads
-        and show_adsorbed
-        and show_labels
-        and adsorbed_fat_count > 0
+    if selected_bubble_ids_for_ads and (
+        adsorbed_fat_count > 0 or _corona_fat_count > 0
     ):
         try:
             _, ads_particles_df_global, _ = compute_interfacial_adsorption_metrics(
@@ -7024,7 +7048,7 @@ else:
             ads_particles_df_global = pd.DataFrame()
 
     # 👑 Auto-promote every detected, intact corona rim globule to its own phase class
-    # (`corona_fat`) so the lime-gold rendering, the tables and every export agree.
+    # (`corona_fat`) so the lemon-yellow rendering, the tables and every export agree.
     # Manual phase assignments always win: an id the researcher reclassified is never
     # promoted automatically.
     classified_df = _promote_corona_rim_globules(
@@ -8241,7 +8265,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             "By default, manually added pores/bubbles are locked as air_bubbles regardless of their size, "
                             "so small or huge pores are never misclassified as fat or Unclassified. "
                             "Use `corona_fat` to draw a missed equatorial Pickering globule: it is rendered in "
-                            "bright lime-gold (RGB 191, 255, 0) and feeds the coronal/interfacial metrics, while "
+                            "pure lemon-yellow (RGB 255, 242, 32) and feeds the coronal/interfacial metrics, while "
                             "`adsorbed_fat` stays the warm-gold interior crater population."
                         ),
                     )
@@ -8314,7 +8338,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         value=bool(show_corona),
                         key="canvas_show_corona",
                         help=(
-                            "Paint the bright lime-gold equatorial Pickering corona globules "
+                            "Paint the pure lemon-yellow equatorial Pickering corona globules "
                             "(phase_class = corona_fat, synced with Sidebar → Section 6)."
                         ),
                     )
@@ -8399,11 +8423,12 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     )
 
                     # Color coding: Sky blue for air_bubbles, Orange for fat_particles,
-                    # Gold for adsorbed_fat, Green for Unclassified
+                    # Honey-gold for adsorbed_fat, lemon-yellow for corona_fat,
+                    # Green for Unclassified
                     if str(item_phase).lower() == "fat_particles":
                         obj_color = (255, 165, 0)
                     elif str(item_phase).lower() == "adsorbed_fat":
-                        obj_color = (255, 215, 0)
+                        obj_color = (230, 175, 0)
                     elif str(item_phase).lower() == "corona_fat":
                         obj_color = CORONA_FAT_RGB
                     elif str(item_phase).lower() == "unclassified":
@@ -8437,7 +8462,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             _phase_palette = {
                 "air_bubbles": (0, 191, 255),
                 "fat_particles": (255, 165, 0),
-                "adsorbed_fat": (255, 215, 0),
+                "adsorbed_fat": (230, 175, 0),
                 "corona_fat": CORONA_FAT_RGB,
                 "unclassified": (50, 205, 50),
             }
@@ -8538,11 +8563,11 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         if assist_mode.startswith("🎨"):
             # Group Click Mode: the click dots take the colour of the target phase.
             if click_target_phase == "adsorbed_fat":
-                canvas_fill_color = "rgba(255, 215, 0, 0.45)"
-                canvas_stroke_color = "#FFD700"
+                canvas_fill_color = "rgba(230, 175, 0, 0.45)"
+                canvas_stroke_color = "#E6AF00"
             elif click_target_phase == "corona_fat":
-                canvas_fill_color = "rgba(191, 255, 0, 0.45)"
-                canvas_stroke_color = "#BFFF00"
+                canvas_fill_color = "rgba(255, 242, 32, 0.45)"
+                canvas_stroke_color = "#FFF220"
             elif click_target_phase == "fat_particles":
                 canvas_fill_color = "rgba(255, 165, 0, 0.45)"
                 canvas_stroke_color = "#FFA500"
@@ -8559,11 +8584,11 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             canvas_fill_color = "rgba(255, 165, 0, 0.4)"
             canvas_stroke_color = "#FFA500"
         elif default_manual_phase == "adsorbed_fat":
-            canvas_fill_color = "rgba(255, 215, 0, 0.4)"
-            canvas_stroke_color = "#FFD700"
+            canvas_fill_color = "rgba(230, 175, 0, 0.4)"
+            canvas_stroke_color = "#E6AF00"
         elif default_manual_phase == "corona_fat":
-            canvas_fill_color = "rgba(191, 255, 0, 0.4)"
-            canvas_stroke_color = "#BFFF00"
+            canvas_fill_color = "rgba(255, 242, 32, 0.4)"
+            canvas_stroke_color = "#FFF220"
         elif default_manual_phase == "Unclassified":
             canvas_fill_color = "rgba(50, 205, 50, 0.4)"
             canvas_stroke_color = "#32CD32"

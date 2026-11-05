@@ -20,11 +20,12 @@ logger = logging.getLogger(__name__)
 PALETTE_COLORS = {
     "air_bubbles": "#1f77b4",   # Blue for air bubbles (dark pores in SEM)
     "fat_particles": "#ff7f0e",  # Orange for fat particles (bright features in SEM)
-    "adsorbed_fat": "#ffd700",   # Gold for adsorbed fat particles on bubble walls
-    # Bright lime-gold for equatorial Pickering corona globules: visually distinct
-    # from interior adsorbed_fat (#FFD700), matrix fat_particles (#FFA500) and the
-    # lime-green Unclassified underlay (#32CD32).
-    "corona_fat": "#BFFF00",
+    "adsorbed_fat": "#E6AF00",   # Warm honey-gold for interior crater adsorbed fat globules
+    # Pure bright lemon-yellow (golden-amber edge) for equatorial Pickering corona
+    # globules: unmistakably yellow, so it can never clash with the lime-green
+    # Unclassified underlay (#32CD32), and always lighter than the interior
+    # adsorbed_fat honey-gold (#E6AF00) above.
+    "corona_fat": "#FFF220",
     "Unclassified": "#32cd32",   # Lime Green for unclassified particles (RGB 50, 205, 50)
     "unclassified": "#32cd32",   # Lime Green alias
 }
@@ -40,6 +41,9 @@ DEFAULT_HIST_BINS = 15
 # to one of them:
 #   interior crater globules (is_corona_globule == False) -> Surface Coverage (%)
 #   equatorial corona globules (is_corona_globule == True) -> contact angle theta + Rim Coverage
+# v1.8.4: only compact, convex, short globules can carry is_corona_globule == True —
+# elongated / crescent rim-wall shards are rejected by the analyzer's compactness gates,
+# so they are never rendered in 👑 Contact Angle θ Mode.
 GLOBULE_ROLE_ALL = "all"
 GLOBULE_ROLE_INTERIOR = "interior"
 GLOBULE_ROLE_CORONA = "corona"
@@ -849,9 +853,10 @@ def create_mask_overlay(
     Color coding (RGB):
     - 'fat_particles': Orange (RGB: 255, 165, 0)
     - 'air_bubbles': Deep Sky Blue (RGB: 0, 191, 255)
-    - 'adsorbed_fat': Warm gold (RGB: 255, 215, 0) — interior crater globules only
-    - 'corona_fat' / ``is_corona_globule == True``: Bright lime-gold
-      (RGB: 191, 255, 0) with a crisp outer contour — equatorial Pickering rim globules
+    - 'adsorbed_fat': Warm honey-gold (RGB: 230, 175, 0) — interior crater globules only
+    - 'corona_fat' / ``is_corona_globule == True``: Pure lemon-yellow
+      (RGB: 255, 242, 32) with a warm golden-amber outer contour (RGB 255, 190, 0) —
+      equatorial Pickering rim globules
     - Other / unlabeled: Yellow (RGB: 255, 235, 59)
 
     Features:
@@ -874,11 +879,14 @@ def create_mask_overlay(
         show_adsorbed: Whether to render and number adsorbed fat globules (defaults to True).
         show_corona: Whether to render and number equatorial Pickering corona globules —
             rows with ``phase_class == 'corona_fat'`` or ``is_corona_globule == True`` in
-            ``ads_particles_df`` — in bright lime-gold (RGB 191, 255, 0) with a crisp
-            outer contour (defaults to True). Interior ``adsorbed_fat`` globules keep the
-            warm gold tint (RGB 255, 215, 0), so the two globule populations stay visually
-            separate.
-        corona_opacity: Opacity for the lime-gold corona_fat overlay layer (0.0 to 1.0,
+            ``ads_particles_df`` — in pure lemon-yellow (RGB 255, 242, 32) with a warm
+            golden-amber outer contour (RGB 255, 190, 0); defaults to True. This layer is
+            100% independent of ``show_adsorbed``: corona globules stay visible even when
+            the interior adsorbed-fat layer is switched off. Interior ``adsorbed_fat``
+            globules keep the warm honey-gold tint (RGB 230, 175, 0) and stay visible when
+            ``show_corona`` is False, so the two globule populations never merge and never
+            clash with the lime-green Unclassified underlay (RGB 50, 205, 50).
+        corona_opacity: Opacity for the lemon-yellow corona_fat overlay layer (0.0 to 1.0,
             defaults to 0.50).
         show_unclassified: Whether to render and number green Unclassified particles
             (defaults to True). Turning it off keeps the overlay focused on the
@@ -933,9 +941,9 @@ def create_mask_overlay(
     FAT_COLOR = (255, 165, 0)        # Orange for fat particles
     AIR_COLOR = (0, 191, 255)        # Deep sky blue for air bubbles
     UNCLASS_COLOR = (50, 205, 50)    # Lime Green for unclassified particles (RGB 50, 205, 50)
-    ADSORBED_COLOR = (255, 215, 0)   # Warm gold for interior crater adsorbed globules
-    CORONA_COLOR = (191, 255, 0)     # Bright lime-gold for equatorial corona globules
-    CORONA_EDGE_COLOR = (235, 255, 150)  # Crisp pale-lime outline around corona globules
+    ADSORBED_COLOR = (230, 175, 0)   # Warm honey-gold for interior crater adsorbed globules
+    CORONA_COLOR = (255, 242, 32)    # Pure lemon-yellow for equatorial corona globules
+    CORONA_EDGE_COLOR = (255, 190, 0)  # Warm golden-amber outline around corona globules
     DEFAULT_COLOR = (255, 235, 59)   # Fallback yellow
 
     # Fallback for unclassified / raw mask when df is not provided
@@ -1083,34 +1091,35 @@ def create_mask_overlay(
         _draw_manual_for_phase(phase, phase_color, phase_opacity)
 
     # 2b. Render adsorbed_fat (adsorbed globules inside bubble craters)
-    # Rendered with the warm-gold ADSORBED_COLOR (255, 215, 0) defined above:
-    # interior crater globules only — corona ids are peeled off for the lime-gold 2c pass.
-    # Corona ids are collected first: equatorial Pickering rim globules get their OWN
-    # lime-gold tint (2c), so they are excluded from this warm-gold interior layer.
+    # Rendered with the warm honey-gold ADSORBED_COLOR (230, 175, 0) defined above:
+    # interior crater globules only — corona ids are peeled off for the lemon-yellow 2c pass.
+    # Corona ids are collected first and UNCONDITIONALLY (never inside ``if show_corona``):
+    # the two globule layers are 100% independent, so hiding the corona layer must not
+    # repaint equatorial rim globules as interior honey-gold ones, and hiding the adsorbed
+    # layer must never hide the corona globules.
     corona_ids: set = set()
-    if show_corona:
-        if "phase_class" in df.columns:
-            corona_phase = (
-                df["phase_class"].astype(str).str.lower() == "corona_fat"
-            )
-            for value in df.loc[corona_phase, "id"].tolist():
-                try:
-                    corona_ids.add(int(value))
-                except (TypeError, ValueError):
-                    continue
-        if (
-            isinstance(ads_particles_df, pd.DataFrame)
-            and not ads_particles_df.empty
-            and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
-        ):
-            corona_flags = (
-                ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
-            )
-            for value in ads_particles_df.loc[corona_flags, "id"].tolist():
-                try:
-                    corona_ids.add(int(value))
-                except (TypeError, ValueError):
-                    continue
+    if "phase_class" in df.columns:
+        corona_phase = (
+            df["phase_class"].astype(str).str.lower() == "corona_fat"
+        )
+        for value in df.loc[corona_phase, "id"].tolist():
+            try:
+                corona_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    if (
+        isinstance(ads_particles_df, pd.DataFrame)
+        and not ads_particles_df.empty
+        and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+    ):
+        corona_flags = (
+            ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
+        )
+        for value in ads_particles_df.loc[corona_flags, "id"].tolist():
+            try:
+                corona_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
     if show_adsorbed and adsorbed_opacity > 0.0:
         pf_opacity = float(np.clip(adsorbed_opacity, 0.0, 1.0))
         partial_ids = df.loc[df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"]), "id"].tolist()
@@ -1126,13 +1135,15 @@ def create_mask_overlay(
                 ).clip(0, 255).astype(np.uint8)
             pf_cnts, _ = cv2.findContours(partial_mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
             for cnt in pf_cnts:
-                cv2.drawContours(blended, [cnt], -1, (255, 240, 100), 1, lineType=cv2.LINE_AA)
+                cv2.drawContours(blended, [cnt], -1, (205, 150, 0), 1, lineType=cv2.LINE_AA)
         _draw_manual_for_phase("adsorbed_fat", ADSORBED_COLOR, pf_opacity)
 
-    # 2c. Render corona_fat (equatorial Pickering rim globules) in bright lime-gold.
+    # 2c. Render corona_fat (equatorial Pickering rim globules) in pure lemon-yellow.
     # A corona globule sits on the fractured rim cross-section and is the only globule
     # population that carries a three-phase contact angle, so it must never be confused
-    # with the warm-gold interior crater globules above.
+    # with the honey-gold interior crater globules above. This pass is gated on
+    # ``show_corona`` ALONE — never on ``show_adsorbed`` — so the two globule layers stay
+    # 100% independent in both directions.
     if show_corona and corona_opacity > 0.0 and corona_ids:
         corona_fill_ids = sorted(corona_ids)
         corona_fill_opacity = float(np.clip(corona_opacity, 0.0, 1.0))
@@ -1435,7 +1446,12 @@ def render_selected_bubbles_inspection_overlay(
             ``is_corona_globule == False`` globules on the crater floor) or
             ``GLOBULE_ROLE_CORONA`` (Contact Angle mode: only
             ``is_corona_globule == True`` globules on the equatorial rim). Unknown
-            values fall back to ``GLOBULE_ROLE_ALL``.
+            values fall back to ``GLOBULE_ROLE_ALL``. The role is read from
+            ``ads_particles_df['is_corona_globule']``, so a rim-wall shard that
+            ``analyzer.compute_interfacial_adsorption_metrics`` rejected with its v1.8.4
+            compactness gates (non-convex curved strip or elongated segment) can never be
+            painted in 👑 Contact Angle θ Mode — and if it also lies on the outer rim band
+            it never reaches this overlay at all.
         show_bubble_ids: Print the numeric ID of every inspected bubble at its mask
             centroid (defaults to True).
         show_fat_ids: Print only the bare numeric particle ID (e.g. ``142``) of every

@@ -5,6 +5,7 @@ Calculates area, equivalent diameter, and mean intensity from labeled segmentati
 
 from typing import Any, Iterable, Optional, Tuple, Union
 import io
+import logging
 import math
 import zipfile
 import cv2
@@ -15,6 +16,8 @@ from scipy.ndimage import find_objects, median_filter
 from skimage.measure import regionprops
 from skimage.segmentation import watershed
 import tifffile
+
+logger = logging.getLogger(__name__)
 
 # Fraction of a globule's own segmented area that must fall inside the dilated
 # bubble-rim band for it to count as Pickering corona (adsorbed) fat. A globule
@@ -59,6 +62,34 @@ _CONTACT_REACH_MAX_PX = 3
 # true diameter, so such globules are flagged ``excluded_from_theta`` instead of
 # distorting the mean theta.
 _CORONA_MAX_ASPECT_RATIO = 1.65
+
+# ---------------------------------------------------------------------------
+# Rim-shard rejection (v1.8.4)
+# ---------------------------------------------------------------------------
+# A measurement-table (or Fourier-regularised) ``circularity`` is computed on a smoothed
+# outline, so a thin CURVED strip lying along the bubble rim can still report a roundness
+# that its raw pixels do not have. Two extra descriptors are therefore measured directly
+# on the raw pixel mask of every corona candidate, and the WORST of the two circularities
+# / solidities is used::
+#
+#     circularity = 4 * pi * area / perimeter**2   (chain-coded pixel perimeter)
+#     solidity    = area / convex_hull_area        (crescents and rim strips are concave)
+#
+# A Pickering corona globule must be compact AND convex AND short. ``_CORONA_MIN_SOLIDITY``
+# is the hard convexity floor of the corona population; values below
+# ``_SHARD_MAX_SOLIDITY`` / above ``_SHARD_MAX_ASPECT_RATIO`` additionally identify the
+# particle as a rim-wall shard, which is dropped from the INTERIOR crater population as
+# well whenever it sits on the outer rim band instead of the eroded crater core — so a
+# rim-edge artefact can pollute neither ``Surface Coverage`` nor ``Contact Angle θ Mode``.
+_CORONA_MIN_SOLIDITY = 0.78
+_SHARD_MAX_SOLIDITY = 0.72
+_SHARD_MAX_ASPECT_RATIO = 1.85
+# Fraction of a globule's own area that must sit in the interface strip before the shard
+# is considered to lie ON the rim band (instead of inside the crater core).
+_SHARD_STRIP_FRACTION_MIN = 0.50
+# Smallest rim band (px) used by that outer-rim test, so the anti-aliased bubble edge can
+# never be mistaken for the crater core.
+_SHARD_RIM_BAND_MIN_PX = 3
 
 
 def extract_metrics(
@@ -2194,6 +2225,28 @@ def _mask_shape_descriptors(mask: np.ndarray) -> Tuple[float, float]:
     return float(np.clip(solidity, 0.0, 1.0)), float(aspect_ratio)
 
 
+def _mask_circularity(mask: np.ndarray) -> float:
+    """Return ``4 * pi * area / perimeter**2`` measured on a raw binary mask.
+
+    The measurement-table ``circularity`` is computed on a smoothed object outline, so a
+    thin CURVED rim-wall strip can look rounder than its pixels really are. This raw
+    pixel-scale value is the conservative counterpart used by the v1.8.4 rim-shard gate: a
+    chain-coded perimeter is long compared with the area of a crescent or a wall fragment,
+    so the ratio collapses even when the smoothed outline looked compact. Perfect circle
+    -> 1.0, thin strip -> far below 0.3, empty/degenerate mask -> 0.0.
+    """
+    binary = (mask > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return 0.0
+    main = max(contours, key=cv2.contourArea)
+    area_px = float(cv2.contourArea(main))
+    perimeter_px = float(cv2.arcLength(main, True))
+    if area_px <= 0.0 or perimeter_px <= 0.0:
+        return 0.0
+    return float(np.clip(4.0 * math.pi * area_px / (perimeter_px ** 2), 0.0, 1.0))
+
+
 def _mask_crop(mask: np.ndarray) -> Optional[dict]:
     """Crop a binary mask to its bounding box for fast pairwise gap tests."""
     ys, xs = np.nonzero(mask)
@@ -2485,10 +2538,36 @@ def compute_interfacial_adsorption_metrics(
         Interior globules receive ``contact_angle_deg = NaN`` so they never bias the mean.
         The bubble interface used for L_c,i is Fourier-regularised (5 harmonics,
         180 vertices) before the chord is measured, so jagged rim pixels dented by the
-        globules themselves cannot tilt the local tangent. Corona globules whose
-        ``aspect_ratio > _CORONA_MAX_ASPECT_RATIO`` (1.65) are cleaved / incomplete
-        half-globules: they keep their corona role and rim coverage, but they are flagged
-        ``excluded_from_theta`` so their distorted cross-section cannot bias θ.
+        globules themselves cannot tilt the local tangent. Corona globules whose ``aspect_ratio >
+        _CORONA_MAX_ASPECT_RATIO`` (1.65) are cleaved / incomplete half-globules: they keep
+        their corona role and rim coverage, but they are flagged ``excluded_from_theta`` so
+        their distorted cross-section cannot bias θ. Since v1.8.4 the compactness gates
+        below reject such a globule from the corona population outright, so this flag now
+        only fires for an explicit ``corona_fat`` override.
+
+    Rim-wall shard rejection (v1.8.4):
+        A genuine Pickering corona globule is compact, CONVEX and short. Freeze-fracture
+        rim-wall strips, however, are thin curved shards that can pass both the geometric
+        interface test and a Fourier-smoothed circularity, which is why they used to
+        appear as yellow corona particles (e.g. ``Bubble #54``). Every corona candidate is
+        therefore re-measured directly on its raw pixel mask::
+
+            raw_mask_circ = 4 * pi * area / perimeter**2        # chain-coded perimeter
+            raw_solidity  = area / convex_hull_area             # crescents are concave
+            eff_circ      = min(circularity, raw_mask_circ)
+            eff_solidity  = min(solidity, raw_solidity)
+
+        and ``is_corona_globule = True`` requires **all three** of
+        ``eff_circ >= corona_min_circularity``, ``eff_solidity >= _CORONA_MIN_SOLIDITY``
+        (0.78) and ``aspect_ratio <= _CORONA_MAX_ASPECT_RATIO`` (1.65). A particle that
+        fails any gate is not corona and is therefore never drawn in
+        ``👑 Contact Angle θ Mode``. When the failing particle is *also* an elongated shard
+        (``eff_solidity < _SHARD_MAX_SOLIDITY`` 0.72 or ``aspect_ratio >
+        _SHARD_MAX_ASPECT_RATIO`` 1.85) sitting on the outer rim band rather than inside
+        the eroded crater core, it is a rim-edge artefact and is dropped from **both**
+        populations — it is neither counted nor rasterised into the interior coverage
+        union. Only an explicit ``phase_class = "corona_fat"`` assignment by the researcher
+        bypasses these gates.
 
     Adsorbed area is measured as the union of the globule masks clipped by the bubble
     interior mask Ω_b (falling back to the summed row areas when no masks are available),
@@ -2522,12 +2601,18 @@ def compute_interfacial_adsorption_metrics(
             dropped from the mean / median / SD and they are flagged in the
             ``excluded_from_theta`` column so the UI can hide their theta label.
         corona_min_circularity: Minimum ``circularity`` (4·π·A / P²) a globule must
-            reach to stay a corona rim globule. Elongated rim-wall shards can touch the
-            interface for purely geometric reasons without being adsorbed globules, so
-            any particle below this threshold is treated as non-corona
+            reach to stay a corona rim globule. Elongated / curved rim-wall shards can
+            touch the interface for purely geometric reasons without being adsorbed
+            globules, so any particle below this threshold is treated as non-corona
             (``is_corona_globule = False``) and falls back to the interior crater
-            population. Particles whose ``phase_class`` is already ``corona_fat`` bypass
-            the gate. Defaults to 0.60.
+            population. Since v1.8.4 this is only the FIRST of three gates: the globule
+            must also be convex (``eff_solidity >= 0.78``) and short
+            (``aspect_ratio <= 1.65``), where ``eff_*`` is the WORST of the
+            measurement-table value and the value re-measured on the raw pixel mask (see
+            ``_mask_circularity`` / ``_mask_shape_descriptors``). A shard that fails a
+            gate and lies on the outer rim band is dropped from the interior population
+            as well. Particles whose ``phase_class`` is already ``corona_fat`` (an explicit
+            manual assignment) bypass all three gates. Defaults to 0.60.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -2713,6 +2798,10 @@ def compute_interfacial_adsorption_metrics(
             "area_um2": _safe_float(prow.get("area_um2"), 0.0),
             "major_axis_um": _finite_or_none(prow.get("major_axis_um")),
             "circularity": _safe_float(prow.get("circularity"), 0.0),
+            # Convexity of the segmented globule (area / convex hull area). Carried
+            # through so the v1.8.4 rim-shard gate can combine it with the raw-mask
+            # solidity instead of trusting the smoothed contour alone.
+            "solidity": _safe_float(prow.get("solidity"), 1.0),
             # Elongation of the globule: the primary flag for a cleaved half-globule.
             # Read from the measurement table when available, with a mask-based
             # fallback computed in the per-bubble loop below.
@@ -2901,6 +2990,9 @@ def compute_interfacial_adsorption_metrics(
         corona_count = 0
         corona_valid_for_theta = 0
         excluded_from_theta_count = 0
+        # Non-globule rim-wall shards rejected by the v1.8.4 compactness gates. They are
+        # neither corona nor interior globules, so they are excluded from every count.
+        rejected_rim_shard_count = 0
         corona_chords_um: list[float] = []
         corona_diams_um: list[float] = []
         for particle in inside:
@@ -3031,23 +3123,83 @@ def compute_interfacial_adsorption_metrics(
                     or candidate_theta_deg <= 0.0
                 ):
                     is_corona = False
-            if is_corona:
-                # Shape gate (v1.9.x): a genuine corona globule is a compact, roundish
-                # fat globule sitting on the fractured equatorial rim. Elongated
-                # rim-wall shards (fracture debris, wall fragments) can satisfy the
-                # geometric interface test above without being adsorbed globules, so
-                # they are rejected from the corona population unless the classifier
-                # already labelled them explicitly as ``corona_fat``. Rejected
-                # particles fall back to the interior crater population
-                # (``is_corona_globule = False``), where they can never contribute a
-                # spurious contact angle.
-                _corona_min_circ = float(corona_min_circularity)
-                _particle_circ = float(particle["circularity"])
-                _phase_key = str(particle.get("phase_class") or "").strip().lower()
+            # --- Compactness gates (v1.8.4): reject rim-wall shards ----------------
+            # A genuine corona globule is a compact, roundish, CONVEX fat globule sitting
+            # on the fractured equatorial rim. Curved / elongated rim-wall strips
+            # (freeze-fracture debris, wall fragments) can satisfy the geometric
+            # interface test above — and even a Fourier-smoothed circularity, because
+            # smoothing rounds a thin curved strip — so both descriptors are re-measured
+            # on the raw pixel mask and the WORST of the two values is kept. An explicit
+            # ``corona_fat`` phase assignment by the researcher always wins.
+            _phase_key = str(particle.get("phase_class") or "").strip().lower()
+            _manual_corona = _phase_key == "corona_fat"
+            _particle_circ = float(particle["circularity"])
+            _particle_solidity = _safe_float(particle.get("solidity"), 1.0)
+            _raw_mask_circ = float("nan")
+            _raw_solidity = float("nan")
+            if local_mask is not None:
+                try:
+                    _raw_mask_circ = _mask_circularity(local_mask)
+                    _raw_solidity = float(_mask_shape_descriptors(local_mask)[0])
+                except Exception:
+                    _raw_mask_circ = float("nan")
+                    _raw_solidity = float("nan")
+            eff_circ = (
+                min(_particle_circ, _raw_mask_circ)
+                if np.isfinite(_raw_mask_circ)
+                else _particle_circ
+            )
+            eff_solidity = (
+                min(_particle_solidity, _raw_solidity)
+                if np.isfinite(_raw_solidity)
+                else _particle_solidity
+            )
+            if is_corona and not _manual_corona:
+                # ALL THREE gates must hold: compact (circularity), convex (solidity) and
+                # short (aspect ratio). A curved crescent rim strip passes none of the
+                # last two, and an elongated rim-wall segment fails the third, so neither
+                # can ever inject a spurious three-phase contact angle.
                 is_corona = bool(
-                    _phase_key == "corona_fat"
-                    or (np.isfinite(_particle_circ) and _particle_circ >= _corona_min_circ)
+                    np.isfinite(eff_circ)
+                    and eff_circ >= float(corona_min_circularity)
+                    and np.isfinite(eff_solidity)
+                    and eff_solidity >= _CORONA_MIN_SOLIDITY
+                    and aspect_ratio_val <= _CORONA_MAX_ASPECT_RATIO
                 )
+            # An elongated shard that lies ON the outer rim band instead of inside the
+            # eroded crater core is a rim-edge artefact, not an adsorbed globule: it is
+            # dropped from the interior crater population as well (coverage, packing
+            # density, counts, inspection overlays) so it can pollute neither mode.
+            _rim_band_px = max(float(_SHARD_RIM_BAND_MIN_PX), float(corona_px))
+            _on_outer_rim_band = bool(
+                strip_fraction >= _SHARD_STRIP_FRACTION_MIN
+                or (
+                    np.isfinite(centre_to_rim_px)
+                    and centre_to_rim_px <= _rim_band_px
+                )
+            )
+            is_rim_shard = bool(
+                not is_corona
+                and not _manual_corona
+                and (
+                    eff_solidity < _SHARD_MAX_SOLIDITY
+                    or aspect_ratio_val > _SHARD_MAX_ASPECT_RATIO
+                )
+                and _on_outer_rim_band
+            )
+            if is_rim_shard:
+                rejected_rim_shard_count += 1
+                logger.debug(
+                    "Bubble #%s: rim shard #%s rejected (eff_circ=%.3f, "
+                    "eff_solidity=%.3f, aspect_ratio=%.2f, strip_fraction=%.2f)",
+                    b_id,
+                    p_id,
+                    eff_circ,
+                    eff_solidity,
+                    aspect_ratio_val,
+                    strip_fraction,
+                )
+                continue
             if is_corona:
                 corona_count += 1
                 corona_chords_um.append(chord_um)
@@ -3076,7 +3228,10 @@ def compute_interfacial_adsorption_metrics(
                 # cleaved off-centre keeps only an elongated cross-section, so neither
                 # its D_i nor its chord is the true equatorial geometry. Such a globule
                 # stays a corona globule (rim coverage, counts) but its theta is dropped
-                # from the mean / median / SD instead of biasing them.
+                # from the mean / median / SD instead of biasing them. Since v1.8.4 an
+                # auto-detected globule above this ratio never reaches this point (it is
+                # rejected outright by the compactness gate), so this branch now only
+                # fires for an explicit ``corona_fat`` override or a researcher exclusion.
                 excluded_from_theta = bool(
                     p_id in excluded_theta_ids
                     or aspect_ratio_val > _CORONA_MAX_ASPECT_RATIO
@@ -3167,7 +3322,7 @@ def compute_interfacial_adsorption_metrics(
         # 6) Interior crater metrics — INTERIOR globules only. Corona rim globules sit on
         #    the equatorial perimeter cross-section, so they are never part of the crater
         #    areal coverage or the areal packing density.
-        interior_count = len(inside) - corona_count
+        interior_count = len(inside) - corona_count - rejected_rim_shard_count
         interior_px = float(np.count_nonzero(interior_union_mask))
         interior_area_um2 = (
             interior_px * pixel_area_um2 if interior_px > 0 else interior_row_area_um2
@@ -3223,8 +3378,8 @@ def compute_interfacial_adsorption_metrics(
             "Mean Contact Angle θ (°)": mean_theta,
             "Mean Corona Chord (µm)": mean_corona_chord,
             "Mean Corona Globule Diam (µm)": mean_corona_diam,
-            # Combined context only
-            "Total Adsorbed Globules": len(inside),
+            # Combined context only (rejected rim shards are globules of neither role)
+            "Total Adsorbed Globules": len(inside) - rejected_rim_shard_count,
         })
 
     per_bubble_df = pd.DataFrame(per_bubble_rows, columns=per_bubble_columns)
