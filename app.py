@@ -62,6 +62,9 @@ from visualizer import (
     classify_by_size,
     plot_single_phase_distribution,
     compute_phase_histogram_table,
+    compute_histogram_plot_table,
+    build_coordination_plot_table,
+    clean_adsorbed_globule_table,
     PALETTE_COLORS,
     apply_footer_dimming,
     create_mask_overlay,
@@ -3059,13 +3062,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.0) ----------------
+# ---------------- BUILD IDENTITY (v1.8.1) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.0"
+PHASEPIX_BUILD_VERSION = "v1.8.1"
 PHASEPIX_BUILD_DATE = "2026.11.04"
-PHASEPIX_BUILD_TITLE = "Dual-Mode Interfacial Analytics (Coverage vs Corona θ)"
+PHASEPIX_BUILD_TITLE = "Publication-Ready Plot-Data CSV Exports"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -7534,8 +7537,8 @@ else:
                     ),
                 )
 
-        def _render_phase_distribution(phase_key: str, title: str, png_name: str, csv_name: str, dl_prefix: str):
-            phase_csv = classified_df[classified_df["phase_class"] == phase_key] if not classified_df.empty else classified_df
+        def _render_phase_distribution(phase_key: str, title: str, png_name: str, dl_prefix: str):
+            """Render one phase PSD and export exactly the data behind the bars."""
             bin_width = float(fat_bin_width if phase_key == "fat_particles" else air_bin_width)
             fig_phase, _ = plot_single_phase_distribution(
                 classified_df,
@@ -7545,33 +7548,46 @@ else:
                 bin_width=bin_width,
             )
             st.pyplot(fig_phase, use_container_width=True)
-            buf_png = io.BytesIO()
-            fig_phase.savefig(buf_png, format="png", dpi=300, bbox_inches="tight")
-            st.download_button(
-                label=f"📥 Download {dl_prefix} Plot (PNG)",
-                data=buf_png.getvalue(),
-                file_name=png_name,
-                mime="image/png",
-                use_container_width=True,
-                key=f"dl_png_{phase_key}_{clean_stem}",
-            )
-            plt.close(fig_phase)
-            if phase_csv is not None and not phase_csv.empty:
-                st.download_button(
-                    label=f"📥 Download {dl_prefix} (CSV)",
-                    data=phase_csv.to_csv(index=False).encode("utf-8"),
-                    file_name=csv_name,
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"dl_csv_{phase_key}_{clean_stem}",
-                )
 
-            # Exact binned percentage table (Σ = 100%) mirroring the rendered bars
+            # Exact binned plot table (Σ = 100%) mirroring the rendered bars: this is
+            # the only thing needed to re-create the chart in Excel / Origin / Prism.
             binned_table = compute_phase_histogram_table(
                 classified_df,
                 phase_class=phase_key,
                 bin_width=bin_width,
             )
+
+            buf_png = io.BytesIO()
+            fig_phase.savefig(buf_png, format="png", dpi=300, bbox_inches="tight")
+            plt.close(fig_phase)
+
+            col_png, col_csv = st.columns(2)
+            with col_png:
+                st.download_button(
+                    label=f"📥 Download {dl_prefix} Plot (PNG)",
+                    data=buf_png.getvalue(),
+                    file_name=png_name,
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"dl_png_{phase_key}_{clean_stem}",
+                )
+            with col_csv:
+                st.download_button(
+                    label=f"📥 Download {dl_prefix} Plot Data (CSV)",
+                    data=binned_table.to_csv(index=False).encode("utf-8"),
+                    file_name=f"phasepix_{phase_key}_plot_data_{clean_stem}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    disabled=binned_table.empty,
+                    key=f"dl_plot_data_{phase_key}_{clean_stem}",
+                    help=(
+                        "Clean binned histogram series (bin interval, numeric bin centre, "
+                        "bin bounds, count, percentage, cumulative %) — ready to re-plot "
+                        "the bars in Excel, Origin or GraphPad Prism."
+                    ),
+                )
+
+            # Same table on screen, so the exported CSV is verifiable at a glance
             with st.expander(
                 f"📊 View Exact Binned Percentage Table — {dl_prefix} (Σ = 100%)",
                 expanded=False,
@@ -7585,21 +7601,14 @@ else:
                         f"∆ = {bin_width:g} µm · "
                         f"n = {int(binned_table['Count (n)'].sum()):,} · "
                         f"Σ = 100% of the {dl_prefix.lower()} population · "
-                        f"{len(binned_table)} intervals"
+                        f"{len(binned_table)} intervals · "
+                        f"this is exactly the `📥 Download {dl_prefix} Plot Data (CSV)` table"
                     )
                     st.dataframe(
                         binned_table,
                         use_container_width=True,
                         hide_index=True,
                         height=260,
-                    )
-                    st.download_button(
-                        label=f"📥 Download {dl_prefix} Binned Table (CSV)",
-                        data=binned_table.to_csv(index=False).encode("utf-8"),
-                        file_name=f"phasepix_{phase_key}_binned_table_{clean_stem}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                        key=f"dl_binned_{phase_key}_{clean_stem}",
                     )
 
         if sample_type == "Whipped Emulsion":
@@ -7609,7 +7618,6 @@ else:
                     "fat_particles",
                     "Fat Particles Size Distribution",
                     f"phasepix_fat_distribution_{clean_stem}.png",
-                    f"phasepix_fat_particles_{clean_stem}.csv",
                     "Fat",
                 )
             with col_plot_air:
@@ -7617,7 +7625,6 @@ else:
                     "air_bubbles",
                     "Air Bubbles Size Distribution",
                     f"phasepix_air_distribution_{clean_stem}.png",
-                    f"phasepix_air_bubbles_{clean_stem}.csv",
                     "Air",
                 )
         elif sample_type == "Emulsion":
@@ -7625,7 +7632,6 @@ else:
                 "fat_particles",
                 "Fat Particles Size Distribution",
                 f"phasepix_fat_distribution_{clean_stem}.png",
-                f"phasepix_fat_particles_{clean_stem}.csv",
                 "Fat",
             )
         else:
@@ -7633,7 +7639,6 @@ else:
                 "air_bubbles",
                 "Air Bubbles Size Distribution",
                 f"phasepix_air_distribution_{clean_stem}.png",
-                f"phasepix_air_bubbles_{clean_stem}.csv",
                 "Air",
             )
 
@@ -9289,12 +9294,29 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                     "selected bubbles."
                                 )
                         else:
+                            # Bins are computed once and handed to seaborn, so the
+                            # exported plot-data table matches the drawn bars exactly.
+                            theta_bin_count = int(
+                                min(20, max(5, theta_values.size // 2))
+                            )
+                            theta_bin_edges = np.histogram_bin_edges(
+                                theta_values.to_numpy(dtype=float),
+                                bins=theta_bin_count,
+                            )
+                            theta_plot_table = compute_histogram_plot_table(
+                                theta_values,
+                                bin_edges=theta_bin_edges,
+                                interval_label="Angle Interval (°)",
+                                center_label="Bin Center (°)",
+                                lower_label="Angle Lower (°)",
+                                upper_label="Angle Upper (°)",
+                            )
                             fig_theta, ax_theta = plt.subplots(
                                 figsize=(6.4, 3.0), dpi=130
                             )
                             sns.histplot(
                                 theta_values,
-                                bins=int(min(20, max(5, theta_values.size // 2))),
+                                bins=theta_bin_edges,
                                 kde=bool(theta_values.size >= 3),
                                 color="#ffd700",
                                 ax=ax_theta,
@@ -9320,28 +9342,84 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             fig_theta.savefig(
                                 buf_theta, format="png", dpi=300, bbox_inches="tight"
                             )
-                            st.download_button(
-                                "📥 Download Contact Angle Plot (PNG)",
-                                data=buf_theta.getvalue(),
-                                file_name=f"Contact_Angle_Distribution_{clean_stem}.png",
-                                mime="image/png",
-                                use_container_width=True,
-                            )
                             plt.close(fig_theta)
 
+                            col_theta_png, col_theta_csv = st.columns(2)
+                            with col_theta_png:
+                                st.download_button(
+                                    "📥 Download Contact Angle Plot (PNG)",
+                                    data=buf_theta.getvalue(),
+                                    file_name=f"Contact_Angle_Distribution_{clean_stem}.png",
+                                    mime="image/png",
+                                    use_container_width=True,
+                                    key=f"dl_theta_png_{clean_stem}",
+                                )
+                            with col_theta_csv:
+                                st.download_button(
+                                    "📥 Download Contact Angle Plot Data (CSV)",
+                                    data=theta_plot_table.to_csv(index=False).encode(
+                                        "utf-8"
+                                    ),
+                                    file_name=f"Contact_Angle_Plot_Data_{clean_stem}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                    disabled=theta_plot_table.empty,
+                                    key=f"dl_theta_plot_data_{clean_stem}",
+                                    help=(
+                                        "Clean binned θ histogram (angle interval, numeric "
+                                        "bin centre, angle bounds, count, percentage, "
+                                        "cumulative %) — ready to re-plot in Excel, Origin "
+                                        "or GraphPad Prism."
+                                    ),
+                                )
+                            with st.expander(
+                                "📊 View Exact Binned θ Table (Σ = 100%)",
+                                expanded=False,
+                            ):
+                                theta_rows = (
+                                    0 if theta_plot_table.empty
+                                    else int(theta_plot_table["Count (n)"].sum())
+                                )
+                                st.caption(
+                                    f"{len(theta_plot_table)} intervals · n = {theta_rows:,} · "
+                                    "valid (non-excluded) corona globules only · this is "
+                                    "exactly the `📥 Download Contact Angle Plot Data "
+                                    "(CSV)` table"
+                                )
+                                st.dataframe(
+                                    theta_plot_table,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=220,
+                                )
+
                         st.markdown("#### 🟡 Adsorbed Globule Detail")
+                        # Clean, whitelisted scientific columns only — internal flags
+                        # (in_bubble / is_partial_in_bubble / area_px) stay in the raw
+                        # 🔬 Metrics and 💾 Reproducibility & Export datasets.
+                        ads_globules_clean = clean_adsorbed_globule_table(
+                            ads_particles_df
+                        )
                         st.dataframe(
-                            ads_particles_df,
+                            ads_globules_clean,
                             use_container_width=True,
                             hide_index=True,
                             height=260,
                         )
                         st.download_button(
                             label="📥 Download Adsorbed Globules (CSV)",
-                            data=ads_particles_df.to_csv(index=False).encode("utf-8"),
+                            data=ads_globules_clean.to_csv(index=False).encode("utf-8"),
                             file_name=f"phasepix_adsorbed_globules_{clean_stem}.csv",
                             mime="text/csv",
                             use_container_width=True,
+                            disabled=ads_globules_clean.empty,
+                            key=f"dl_ads_globules_{clean_stem}",
+                            help=(
+                                "Publication-ready globule table (particle ID, bubble ID, "
+                                "globule role, diameters, chord, area, circularity, θ and "
+                                "the θ cross-check). Full raw particle data stays "
+                                "available in 🔬 Metrics and 💾 Reproducibility & Export."
+                            ),
                         )
 
     # ---------------- TAB: MATRIX COALESCENCE NETWORK ----------------
@@ -9503,16 +9581,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 if z_series.empty:
                     st.info("No globules are available for a coordination-number distribution.")
                 else:
-                    total_z = max(int(z_series.size), 1)
-                    z_share_df = pd.DataFrame({
-                        "Coordination (Z)": ["Z = 0", "Z = 1", "Z = 2", "Z ≥ 3"],
-                        "Share of Globules (%)": [
-                            float((z_series == 0).sum()) / total_z * 100.0,
-                            float((z_series == 1).sum()) / total_z * 100.0,
-                            float((z_series == 2).sum()) / total_z * 100.0,
-                            float((z_series >= 3).sum()) / total_z * 100.0,
-                        ],
-                    })
+                    # Exact bar-chart series: motif, Z label, raw count and share (%)
+                    z_share_df = build_coordination_plot_table(z_series)
                     fig_z, ax_z = plt.subplots(figsize=(6, 3), dpi=130)
                     ax_z.bar(
                         z_share_df["Coordination (Z)"],
@@ -9525,17 +9595,38 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     st.pyplot(fig_z, use_container_width=True)
                     buf_z = io.BytesIO()
                     fig_z.savefig(buf_z, format="png", dpi=300, bbox_inches="tight")
-                    st.download_button(
-                        "📥 Download Z-Distribution Plot (PNG)",
-                        data=buf_z.getvalue(),
-                        file_name=f"Coordination_Number_Distribution_{clean_stem}.png",
-                        mime="image/png",
-                        use_container_width=True,
-                    )
                     plt.close(fig_z)
+
+                    col_z_png, col_z_csv = st.columns(2)
+                    with col_z_png:
+                        st.download_button(
+                            "📥 Download Z-Distribution Plot (PNG)",
+                            data=buf_z.getvalue(),
+                            file_name=f"Coordination_Number_Distribution_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            key=f"dl_z_png_{clean_stem}",
+                        )
+                    with col_z_csv:
+                        st.download_button(
+                            "📥 Download Z-Distribution Plot Data (CSV)",
+                            data=z_share_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"Coordination_Z_Plot_Data_{clean_stem}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            disabled=z_share_df.empty,
+                            key=f"dl_z_plot_data_{clean_stem}",
+                            help=(
+                                "Exact bar-chart series behind this figure (coordination "
+                                "motif, Z label, globule count and share of globules %) — "
+                                "ready to re-plot in Excel, Origin or GraphPad Prism."
+                            ),
+                        )
                     st.caption(
                         f"{int(z_series.size)} matrix globules analysed · "
-                        f"{len(coalescence_edges)} contact bridges"
+                        f"{len(coalescence_edges)} contact bridges · "
+                        "this is exactly the `📥 Download Z-Distribution Plot Data (CSV)` "
+                        "table"
                     )
 
                 st.markdown("#### 🍇 Cluster Agglomerates (N_agg ≥ 2)")

@@ -427,6 +427,104 @@ def plot_single_phase_distribution(
     return fig, ax
 
 
+def compute_histogram_plot_table(
+    values,
+    *,
+    bin_width: Optional[float] = None,
+    num_bins: Optional[int] = None,
+    bin_edges: Optional[np.ndarray] = None,
+    interval_label: str = "Bin Interval (µm)",
+    center_label: str = "Bin Center (µm)",
+    lower_label: str = "Bin Lower (µm)",
+    upper_label: str = "Bin Upper (µm)",
+    decimals: int = 2,
+    max_rows: int = 200,
+) -> pd.DataFrame:
+    """Build a publication-ready binned table for any numeric histogram.
+
+    Every row describes exactly one rendered bar, so the table can recreate the
+    chart in Excel / Origin / GraphPad Prism without the raw particle list: the
+    editable interval label, the numeric X-axis centre, the numeric interval bounds,
+    the raw count, the bar height in percent (Σ = 100 %) and the cumulative percent
+    curve (closing at exactly 100 %).
+
+    Args:
+        values: Iterable of numeric values to bin (NaN/inf entries are dropped).
+        bin_width: Optional physical bar width; aligned to multiples of that width.
+        num_bins: Optional fixed number of bars (used when ``bin_width`` is absent).
+        bin_edges: Optional explicit edges (highest priority) so the table matches a
+            histogram plotted with those exact edges.
+        interval_label: Column name of the textual interval (e.g. "1.00 – 1.50").
+        center_label: Column name of the numeric bar centre (X axis).
+        lower_label: Column name of the numeric interval start.
+        upper_label: Column name of the numeric interval end.
+        decimals: Decimal places used for the interval text and numeric bounds.
+        max_rows: When more intervals than this are produced (wide outliers), only
+            non-empty intervals are kept so the table stays readable.
+
+    Returns:
+        pd.DataFrame: Columns ``interval_label``, ``center_label``, ``lower_label``,
+        ``upper_label``, 'Count (n)', 'Percentage (%)' and 'Cumulative (%)'
+        (empty frame with those columns when there is nothing to bin).
+    """
+    columns = [
+        interval_label,
+        center_label,
+        lower_label,
+        upper_label,
+        "Count (n)",
+        "Percentage (%)",
+        "Cumulative (%)",
+    ]
+    array = np.asarray(values if isinstance(values, np.ndarray) else list(values))
+    try:
+        array = array.astype(float)
+    except (TypeError, ValueError):
+        return pd.DataFrame(columns=columns)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return pd.DataFrame(columns=columns)
+
+    if bin_edges is not None:
+        edges = np.asarray(bin_edges, dtype=float)
+        if edges.size < 2:
+            return pd.DataFrame(columns=columns)
+    else:
+        edges = _resolve_bin_edges(array, bin_width=bin_width, num_bins=num_bins)
+    if edges.size < 2:
+        return pd.DataFrame(columns=columns)
+
+    counts, edges = np.histogram(array, bins=edges)
+    total = int(counts.sum())
+    if total <= 0:
+        return pd.DataFrame(columns=columns)
+
+    percentages = counts.astype(float) / float(total) * 100.0
+    cumulative = np.cumsum(percentages)
+
+    rows = []
+    for idx in range(len(edges) - 1):
+        lower = float(edges[idx])
+        upper = float(edges[idx + 1])
+        rows.append(
+            {
+                interval_label: f"{lower:.{decimals}f} – {upper:.{decimals}f}",
+                center_label: round((lower + upper) / 2.0, decimals),
+                lower_label: round(lower, decimals),
+                upper_label: round(upper, decimals),
+                "Count (n)": int(counts[idx]),
+                "Percentage (%)": round(float(percentages[idx]), 2),
+                "Cumulative (%)": round(float(cumulative[idx]), 2),
+            }
+        )
+
+    table = pd.DataFrame(rows, columns=columns)
+    if not table.empty:
+        # Percentages are rounded per row, so pin the closing balance to exactly 100 %
+        table.loc[table.index[-1], "Cumulative (%)"] = 100.0
+    if len(table) > max_rows:
+        table = table[table["Count (n)"] > 0].reset_index(drop=True)
+    return table
 def compute_phase_histogram_table(
     df: pd.DataFrame,
     phase_class: str,
@@ -434,13 +532,12 @@ def compute_phase_histogram_table(
     num_bins: Optional[int] = None,
     max_rows: int = 200,
 ) -> pd.DataFrame:
-    """
-    Build an exact binned percentage table (Σ = 100%) for a single phase.
+    """Build the exact, plot-ready binned table (Σ = 100%) for a single phase.
 
-    The intervals are produced with the very same edges seaborn uses for the
-    matching ``plot_single_phase_distribution`` call, so the table always explains
-    the rendered bars. Adsorbed fat globules are excluded from ``fat_particles``
-    exactly as in the plot.
+    The intervals are produced with the very same edges seaborn uses for the matching
+    ``plot_single_phase_distribution`` call, so the table always explains the rendered
+    bars. Adsorbed fat globules are excluded from ``fat_particles`` exactly as in the
+    plot.
 
     Args:
         df: DataFrame with 'diameter_um' and (optionally) 'phase_class' columns.
@@ -451,44 +548,156 @@ def compute_phase_histogram_table(
             non-empty intervals are kept so the table stays readable.
 
     Returns:
-        pd.DataFrame: Columns 'Size Interval (µm)', 'Count (n)', 'Percentage (%)'
-        and 'Cumulative (%)' (the final row closes at exactly 100.0%).
+        pd.DataFrame: Plot-ready columns 'Bin Interval (µm)', 'Bin Center (µm)',
+        'Bin Lower (µm)', 'Bin Upper (µm)', 'Count (n)', 'Percentage (%)' and
+        'Cumulative (%)' (the final row closes at exactly 100.0%).
     """
-    columns = ["Size Interval (µm)", "Count (n)", "Percentage (%)", "Cumulative (%)"]
     values = _extract_phase_diameters(df, phase_class).to_numpy(dtype=float)
-    if values.size == 0:
+    return compute_histogram_plot_table(
+        values,
+        bin_width=bin_width,
+        num_bins=num_bins,
+        max_rows=max_rows,
+    )
+
+
+def build_coordination_plot_table(z_values) -> pd.DataFrame:
+    """Build the publication-ready coordination-number (Z) bar-chart table.
+
+    Args:
+        z_values: Iterable of per-globule coordination numbers.
+
+    Returns:
+        pd.DataFrame: Columns 'Coordination Motif', 'Coordination (Z)',
+        'Globule Count (n)' and 'Share of Globules (%)' (shares sum to 100 %).
+    """
+    columns = [
+        "Coordination Motif",
+        "Coordination (Z)",
+        "Globule Count (n)",
+        "Share of Globules (%)",
+    ]
+    series = pd.to_numeric(pd.Series(list(z_values or [])), errors="coerce").dropna()
+    if series.empty:
         return pd.DataFrame(columns=columns)
 
-    bin_edges = _resolve_bin_edges(values, bin_width=bin_width, num_bins=num_bins)
-    if bin_edges.size < 2:
-        return pd.DataFrame(columns=columns)
+    total = max(int(series.size), 1)
+    counts = [
+        int((series == 0).sum()),
+        int((series == 1).sum()),
+        int((series == 2).sum()),
+        int((series >= 3).sum()),
+    ]
+    motifs = [
+        "Isolated globule",
+        "Single contact (chain end)",
+        "Two contacts (chain interior)",
+        "Branching node (Z >= 3)",
+    ]
+    labels = ["Z = 0", "Z = 1", "Z = 2", "Z ≥ 3"]
 
-    counts, edges = np.histogram(values, bins=bin_edges)
-    total = int(counts.sum())
-    if total <= 0:
-        return pd.DataFrame(columns=columns)
+    table = pd.DataFrame(
+        {
+            "Coordination Motif": motifs,
+            "Coordination (Z)": labels,
+            "Globule Count (n)": counts,
+            "Share of Globules (%)": [
+                round(count / float(total) * 100.0, 2) for count in counts
+            ],
+        },
+        columns=columns,
+    )
+    # Rounded shares are pinned so the exported column sums to exactly 100 %
+    if not table.empty:
+        difference = round(100.0 - float(table["Share of Globules (%)"].sum()), 2)
+        if abs(difference) >= 0.01:
+            last_index = table.index[-1]
+            table.loc[last_index, "Share of Globules (%)"] = round(
+                float(table.loc[last_index, "Share of Globules (%)"]) + difference, 2
+            )
+    return table
 
-    percentages = counts.astype(float) / float(total) * 100.0
-    cumulative = np.cumsum(percentages)
 
-    rows = []
-    for idx in range(len(edges) - 1):
-        rows.append(
-            {
-                "Size Interval (µm)": f"{edges[idx]:.2f} – {edges[idx + 1]:.2f}",
-                "Count (n)": int(counts[idx]),
-                "Percentage (%)": round(float(percentages[idx]), 2),
-                "Cumulative (%)": round(float(cumulative[idx]), 2),
-            }
+#: Publication-ready column order of the adsorbed-globule table. Internal bookkeeping
+#: flags (``in_bubble``, ``is_partial_in_bubble``, ``area_px``, …) are deliberately
+#: never exported — full raw particle data lives in 🔬 Metrics / 💾 Reproducibility.
+ADSORBED_GLOBULE_EXPORT_COLUMNS = [
+    "Particle ID",
+    "Bubble ID",
+    "Globule Role",
+    "Diameter (µm)",
+    "Major Axis (µm)",
+    "True Globule Ø (µm)",
+    "Contact Chord L_c (µm)",
+    "Area (µm²)",
+    "Circularity (0-1)",
+    "Contact Angle θ (°)",
+    "Excluded from θ",
+    "Protrusion Ratio d/R",
+    "Protrusion Distance (µm)",
+    "θ Protrusion (°)",
+]
+
+
+def clean_adsorbed_globule_table(ads_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return the adsorbed-globule table with clean, journal-ready column names.
+
+    Only scientific quantities are kept — every internal bookkeeping flag
+    (``in_bubble``, ``is_partial_in_bubble``, ``area_px``, …) is dropped by the
+    explicit whitelist, so the on-screen detail table and its CSV can be pasted
+    straight into a manuscript or a plotting package.
+
+    Args:
+        ads_df: Adsorbed-globule table returned by
+            ``analyzer.compute_interfacial_adsorption_metrics``.
+
+    Returns:
+        pd.DataFrame: Columns ``ADSORBED_GLOBULE_EXPORT_COLUMNS`` (empty with those
+        columns when the input is empty).
+    """
+    if not isinstance(ads_df, pd.DataFrame) or ads_df.empty:
+        return pd.DataFrame(columns=ADSORBED_GLOBULE_EXPORT_COLUMNS)
+
+    def _numeric(column: str) -> pd.Series:
+        return pd.to_numeric(
+            ads_df.get(column, pd.Series(np.nan, index=ads_df.index)),
+            errors="coerce",
         )
 
-    table = pd.DataFrame(rows, columns=columns)
-    if not table.empty:
-        # Percentages are rounded per row, so pin the closing balance to exactly 100%
-        table.loc[table.index[-1], "Cumulative (%)"] = 100.0
-    if len(table) > max_rows:
-        table = table[table["Count (n)"] > 0].reset_index(drop=True)
+    corona_flags = (
+        ads_df.get("is_corona_globule", pd.Series(False, index=ads_df.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    excluded_flags = (
+        ads_df.get("excluded_from_theta", pd.Series(False, index=ads_df.index))
+        .fillna(False)
+        .astype(bool)
+    )
+
+    return pd.DataFrame(
+        {
+            "Particle ID": _numeric("id").astype("Int64"),
+            "Bubble ID": _numeric("parent_bubble_id").astype("Int64"),
+            "Globule Role": np.where(corona_flags, "Corona Rim", "Interior Crater"),
+            "Diameter (µm)": _numeric("diameter_um").round(3),
+            "Major Axis (µm)": _numeric("major_axis_um").round(3),
+            "True Globule Ø (µm)": _numeric("globule_diam_um").round(3),
+            "Contact Chord L_c (µm)": _numeric("corona_chord_um").round(3),
+            "Area (µm²)": _numeric("area_um2").round(3),
+            "Circularity (0-1)": _numeric("circularity").round(3),
+            "Contact Angle θ (°)": _numeric("contact_angle_deg").round(2),
+            "Excluded from θ": excluded_flags,
+            "Protrusion Ratio d/R": _numeric("protrusion_ratio").round(3),
+            "Protrusion Distance (µm)": _numeric("protrusion_distance_um").round(3),
+            "θ Protrusion (°)": _numeric("contact_angle_protrusion_deg").round(2),
+        },
+        columns=ADSORBED_GLOBULE_EXPORT_COLUMNS,
+    )
+
+
     return table
+
 
 
 def plot_size_distribution(
