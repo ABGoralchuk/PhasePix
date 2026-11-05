@@ -569,11 +569,43 @@ def compute_phase_histogram_table(
     )
 
 
+def _coerce_numeric_series(values) -> pd.Series:
+    """Normalise any collection of values into a clean float Series.
+
+    Accepts ``None``, scalars, lists/tuples/sets/ranges, generators, numpy arrays and
+    pandas ``Series`` / ``Index`` / ``DataFrame`` (one or more columns). The common
+    ``values or []`` idiom cannot be used here: pandas objects raise
+    ``ValueError: The truth value of a Series is ambiguous``, so the input type is
+    inspected explicitly instead. Non-numeric entries and NaN/inf values are dropped.
+
+    Args:
+        values: Anything that yields per-globule numbers (or a single number).
+
+    Returns:
+        pd.Series: Float dtype series of finite numeric values (empty when nothing
+        numeric is supplied).
+    """
+    if values is None:
+        return pd.Series(dtype=float)
+    if isinstance(values, (pd.Series, pd.Index, pd.DataFrame)):
+        array = values.to_numpy(dtype=object).ravel()
+    elif isinstance(values, np.ndarray):
+        array = values.ravel()
+    elif isinstance(values, (str, bytes)) or np.isscalar(values):
+        array = [values]
+    else:
+        array = list(values)
+    numeric = pd.to_numeric(pd.Series(array, dtype=object), errors="coerce")
+    numeric = numeric.replace([np.inf, -np.inf], np.nan).dropna()
+    return numeric.astype(float).reset_index(drop=True)
+
+
 def build_coordination_plot_table(z_values) -> pd.DataFrame:
     """Build the publication-ready coordination-number (Z) bar-chart table.
 
     Args:
-        z_values: Iterable of per-globule coordination numbers.
+        z_values: Iterable of per-globule coordination numbers (list, numpy array,
+            pandas Series/DataFrame column or a single scalar value).
 
     Returns:
         pd.DataFrame: Columns 'Coordination Motif', 'Coordination (Z)',
@@ -585,7 +617,7 @@ def build_coordination_plot_table(z_values) -> pd.DataFrame:
         "Globule Count (n)",
         "Share of Globules (%)",
     ]
-    series = pd.to_numeric(pd.Series(list(z_values or [])), errors="coerce").dropna()
+    series = _coerce_numeric_series(z_values)
     if series.empty:
         return pd.DataFrame(columns=columns)
 
