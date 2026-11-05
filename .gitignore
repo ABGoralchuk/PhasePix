@@ -33,6 +33,8 @@ images/light/*
 .agents/
 .cursor/
 .claude/
+.roorules
+.clinerules
 scratch/
 test_*
 verify_*.py
