@@ -53,6 +53,12 @@ _CONTACT_STRIP_MAX_PX = 3
 # Widest segmentation gap (px) between a globule mask and the bubble contour that
 # still counts as interfacial contact. Absorbs the anti-aliased contour edge only.
 _CONTACT_REACH_MAX_PX = 3
+# Widest aspect ratio (major/minor axis) a corona rim globule may show and still enter
+# the contact-angle statistics. Cryo-SEM freeze-fracture can cleave a globule
+# off-centre and leave an elongated half-globule whose visible cross-section is not its
+# true diameter, so such globules are flagged ``excluded_from_theta`` instead of
+# distorting the mean theta.
+_CORONA_MAX_ASPECT_RATIO = 1.65
 
 
 def extract_metrics(
@@ -263,9 +269,10 @@ def calculate_granulometry_metrics(
         return pd.DataFrame(columns=cols)
 
     records = []
-    # adsorbed_fat is explicitly excluded from PSD statistics (Sauter/De Brouckere/histogram)
-    # because partially-visible globules on bubble walls underestimate the true size.
-    # They appear as a separate informational row only.
+    # adsorbed_fat / corona_fat are explicitly excluded from PSD statistics
+    # (Sauter/De Brouckere/histogram) because partially-visible globules on bubble walls
+    # underestimate the true size. They appear as a separate informational row only.
+    _ADSORBED_PHASES = ("adsorbed_fat", "corona_fat")
     canonical_phases = [
         ("fat_particles", "Fat Particles"),
         ("air_bubbles", "Air Bubbles"),
@@ -277,7 +284,7 @@ def calculate_granulometry_metrics(
             mask_phase = df[phase_col].astype(str).str.lower() == p_key.lower()
             # Explicit scientific safety: fat_particles PSD strictly excludes any adsorbed globules
             if p_key.lower() == "fat_particles":
-                mask_phase = mask_phase & (~df[phase_col].astype(str).str.lower().isin(["adsorbed_fat"]))
+                mask_phase = mask_phase & (~df[phase_col].astype(str).str.lower().isin(list(_ADSORBED_PHASES)))
                 if "is_partial_in_bubble" in df.columns:
                     mask_phase = mask_phase & (~df["is_partial_in_bubble"].fillna(False).astype(bool))
             subset = df[mask_phase][diameter_col].values
@@ -288,7 +295,7 @@ def calculate_granulometry_metrics(
 
     # Informational row for adsorbed fat globules (excluded from PSD)
     if phase_col in df.columns:
-        partial_mask = df[phase_col].astype(str).str.lower().isin(["adsorbed_fat"])
+        partial_mask = df[phase_col].astype(str).str.lower().isin(list(_ADSORBED_PHASES))
         partial_count = int(partial_mask.sum())
         if partial_count > 0:
             partial_row = {
@@ -304,7 +311,7 @@ def calculate_granulometry_metrics(
             records.append(partial_row)
 
     if phase_col in df.columns:
-        known_keys = {k.lower() for k, _ in canonical_phases} | {"adsorbed_fat"}
+        known_keys = {k.lower() for k, _ in canonical_phases} | set(_ADSORBED_PHASES)
         other_phases = [p for p in df[phase_col].dropna().unique() if str(p).lower() not in known_keys]
         for p in other_phases:
             subset = df[df[phase_col] == p][diameter_col].values
@@ -2406,13 +2413,15 @@ def compute_interfacial_adsorption_metrics(
     corona_margin_px: int = 0,
     contact_angle_mode: str = CONTACT_ANGLE_MODE_INDIVIDUAL,
     excluded_theta_particle_ids: Optional[Iterable[int]] = None,
+    corona_min_circularity: float = 0.60,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Quantify Pickering-type interfacial adsorption of fat globules on selected air bubbles.
 
     For every bubble the function rasterizes its individual mask (automatic ids from
     ``air_masks`` / ``fat_masks`` or manual polygons with id >= 10000), then collects all
-    fat globules (``phase_class`` in {'adsorbed_fat', 'fat_particles'}) whose centroid lies
+    fat globules (``phase_class`` in {'adsorbed_fat', 'corona_fat', 'fat_particles'})
+    whose centroid lies
     inside that mask **or inside the dilated corona rim band** (``corona_margin_px``).
     Corona globules straddle the interface, so the segmented bubble contour often runs
     along their inner edge and their centroid lands a few pixels outside the mask; they
@@ -2474,6 +2483,12 @@ def compute_interfacial_adsorption_metrics(
         ``contact_angle_protrusion_deg`` for cross-checking.
 
         Interior globules receive ``contact_angle_deg = NaN`` so they never bias the mean.
+        The bubble interface used for L_c,i is Fourier-regularised (5 harmonics,
+        180 vertices) before the chord is measured, so jagged rim pixels dented by the
+        globules themselves cannot tilt the local tangent. Corona globules whose
+        ``aspect_ratio > _CORONA_MAX_ASPECT_RATIO`` (1.65) are cleaved / incomplete
+        half-globules: they keep their corona role and rim coverage, but they are flagged
+        ``excluded_from_theta`` so their distorted cross-section cannot bias θ.
 
     Adsorbed area is measured as the union of the globule masks clipped by the bubble
     interior mask Ω_b (falling back to the summed row areas when no masks are available),
@@ -2506,6 +2521,13 @@ def compute_interfacial_adsorption_metrics(
             (interior areal coverage, packed density, adsorbed count) but their theta is
             dropped from the mean / median / SD and they are flagged in the
             ``excluded_from_theta`` column so the UI can hide their theta label.
+        corona_min_circularity: Minimum ``circularity`` (4·π·A / P²) a globule must
+            reach to stay a corona rim globule. Elongated rim-wall shards can touch the
+            interface for purely geometric reasons without being adsorbed globules, so
+            any particle below this threshold is treated as non-corona
+            (``is_corona_globule = False``) and falls back to the interior crater
+            population. Particles whose ``phase_class`` is already ``corona_fat`` bypass
+            the gate. Defaults to 0.60.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -2660,7 +2682,10 @@ def compute_interfacial_adsorption_metrics(
         fat_vals = fat_vals[np.isfinite(fat_vals) & (fat_vals > 0)]
         if fat_vals.size == 0:
             adsorbed_vals = pd.to_numeric(
-                work.loc[work["phase_class"] == "adsorbed_fat", "diameter_um"],
+                work.loc[
+                    work["phase_class"].isin(["adsorbed_fat", "corona_fat"]),
+                    "diameter_um",
+                ],
                 errors="coerce",
             ).to_numpy(dtype=float)
             fat_vals = adsorbed_vals[np.isfinite(adsorbed_vals) & (adsorbed_vals > 0)]
@@ -2668,8 +2693,12 @@ def compute_interfacial_adsorption_metrics(
     d_ref = max(float(d_ref), 1e-6)
     summary["d_ref_um"] = float(d_ref)
 
-    # Pre-extract candidate adsorbed/matrix globules once (avoids repeated iterrows)
-    particle_df = work[work["phase_class"].isin(["adsorbed_fat", "fat_particles"])]
+    # Pre-extract candidate adsorbed/matrix globules once (avoids repeated iterrows).
+    # ``corona_fat`` is an explicit rim-wall adsorption class produced by the phase
+    # classifier and is treated exactly like ``adsorbed_fat`` here.
+    particle_df = work[
+        work["phase_class"].isin(["adsorbed_fat", "corona_fat", "fat_particles"])
+    ]
     particles = []
     for _, prow in particle_df.iterrows():
         px = _finite_or_none(prow.get("centroid_x"))
@@ -2684,6 +2713,14 @@ def compute_interfacial_adsorption_metrics(
             "area_um2": _safe_float(prow.get("area_um2"), 0.0),
             "major_axis_um": _finite_or_none(prow.get("major_axis_um")),
             "circularity": _safe_float(prow.get("circularity"), 0.0),
+            # Elongation of the globule: the primary flag for a cleaved half-globule.
+            # Read from the measurement table when available, with a mask-based
+            # fallback computed in the per-bubble loop below.
+            "aspect_ratio": _finite_or_none(prow.get("aspect_ratio")),
+            "minor_axis_um": _finite_or_none(prow.get("minor_axis_um")),
+            # Carried through so the corona gate can honour an explicit
+            # ``corona_fat`` classification (see below).
+            "phase_class": str(prow.get("phase_class") or ""),
         })
 
     per_bubble_rows: list[dict] = []
@@ -2752,6 +2789,27 @@ def compute_interfacial_adsorption_metrics(
             if np.size(bubble_contour)
             else np.empty((0, 2), dtype=np.float32)
         )
+
+        # Smoothed copy of the same closed interface, used to measure the corona
+        # contact chord L_c,i. The raw segmentation contour is jagged exactly where rim
+        # globules eat into the evacuated interface, and those pixel steps bias the
+        # local tangent (hence the chord). Fourier regularisation keeps only 5
+        # low-order harmonics (180 uniformly spaced vertices), so the interface line is
+        # a smooth, natural curve instead of a stair-cased pixel path.
+        bubble_contour_smooth_xy = bubble_contour_xy
+        if bubble_contour_xy.shape[0] >= 3:
+            try:
+                smoothed = np.asarray(
+                    _smooth_contour_fourier(
+                        bubble_contour_xy, n_harmonics=5, num_points=180
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1, 2)
+                if smoothed.shape[0] >= 3:
+                    bubble_contour_smooth_xy = smoothed
+            except Exception:
+                # Never let contour regularisation break the metric: fall back to raw.
+                bubble_contour_smooth_xy = bubble_contour_xy
 
         # 3) Globules whose centroid falls inside this bubble — or inside its dilated
         #    corona rim band. A Pickering corona globule straddles the interface, so
@@ -2878,6 +2936,40 @@ def compute_interfacial_adsorption_metrics(
                 p_id, shape, fat_source, fat_slices,
                 manual_polygons, fat_masks, air_masks,
             )
+            # Elongation of THIS globule, used to recognise cleaved half-globules.
+            # Priority: measurement table -> fitted major/minor axes -> own mask shape.
+            aspect_ratio_val = particle.get("aspect_ratio")
+            if (
+                aspect_ratio_val is None
+                or not np.isfinite(aspect_ratio_val)
+                or aspect_ratio_val <= 0
+            ):
+                minor_axis_val = particle.get("minor_axis_um")
+                if (
+                    minor_axis_val is not None
+                    and np.isfinite(minor_axis_val)
+                    and minor_axis_val > 0
+                    and major_axis_val > 0
+                ):
+                    aspect_ratio_val = float(major_axis_val / minor_axis_val)
+            if (
+                aspect_ratio_val is None
+                or not np.isfinite(aspect_ratio_val)
+                or aspect_ratio_val <= 0
+            ) and local_mask is not None:
+                try:
+                    _, aspect_ratio_val = _mask_shape_descriptors(local_mask)
+                except Exception:
+                    aspect_ratio_val = None
+            if (
+                aspect_ratio_val is None
+                or not np.isfinite(aspect_ratio_val)
+                or aspect_ratio_val <= 0
+            ):
+                # Unknown elongation must never silently exclude a globule.
+                aspect_ratio_val = 1.0
+            else:
+                aspect_ratio_val = float(max(aspect_ratio_val, 1.0))
             strip_fraction = 0.0
             if local_mask is not None:
                 strip_half = int(
@@ -2898,7 +2990,7 @@ def compute_interfacial_adsorption_metrics(
                 local_mask,
                 local_x0,
                 local_y0,
-                bubble_contour_xy,
+                bubble_contour_smooth_xy,
                 (particle["cx"], particle["cy"]),
             )
 
@@ -2940,6 +3032,23 @@ def compute_interfacial_adsorption_metrics(
                 ):
                     is_corona = False
             if is_corona:
+                # Shape gate (v1.9.x): a genuine corona globule is a compact, roundish
+                # fat globule sitting on the fractured equatorial rim. Elongated
+                # rim-wall shards (fracture debris, wall fragments) can satisfy the
+                # geometric interface test above without being adsorbed globules, so
+                # they are rejected from the corona population unless the classifier
+                # already labelled them explicitly as ``corona_fat``. Rejected
+                # particles fall back to the interior crater population
+                # (``is_corona_globule = False``), where they can never contribute a
+                # spurious contact angle.
+                _corona_min_circ = float(corona_min_circularity)
+                _particle_circ = float(particle["circularity"])
+                _phase_key = str(particle.get("phase_class") or "").strip().lower()
+                is_corona = bool(
+                    _phase_key == "corona_fat"
+                    or (np.isfinite(_particle_circ) and _particle_circ >= _corona_min_circ)
+                )
+            if is_corona:
                 corona_count += 1
                 corona_chords_um.append(chord_um)
                 corona_diams_um.append(globule_diam_um)
@@ -2963,7 +3072,15 @@ def compute_interfacial_adsorption_metrics(
                 )
                 reported_chord_um = chord_um
                 protrusion_angle_out = protrusion_angle
-                excluded_from_theta = p_id in excluded_theta_ids
+                # Cleaved / incomplete half-globule: a freeze-fractured globule that was
+                # cleaved off-centre keeps only an elongated cross-section, so neither
+                # its D_i nor its chord is the true equatorial geometry. Such a globule
+                # stays a corona globule (rim coverage, counts) but its theta is dropped
+                # from the mean / median / SD instead of biasing them.
+                excluded_from_theta = bool(
+                    p_id in excluded_theta_ids
+                    or aspect_ratio_val > _CORONA_MAX_ASPECT_RATIO
+                )
             else:
                 # Interior crater globule: only a 2D cap projection is visible, so
                 # neither a true diameter nor a contact angle exists. It still counts

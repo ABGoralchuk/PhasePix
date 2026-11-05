@@ -243,6 +243,15 @@ MANUAL_MODE_WIDGET_KEY = "manual_assist_mode"
 CORONA_OVERLAP_MIN = 0.15
 # Canonical ``👑 Corona Rim Capture Distance (µm)`` default (1.2 µm rim band).
 CORONA_CAPTURE_UM_DEFAULT = 1.2
+# Canonical ``👑 Corona Fat Min Circularity`` default. A Pickering corona globule is a
+# compact, roundish fat globule sitting on the fractured rim; elongated rim-wall shards
+# are freeze-fracture debris, so they are rejected below this circularity (0.30 is the
+# permissive floor, 0.60 the scientifically sensible default).
+CORONA_MIN_CIRCULARITY_DEFAULT = 0.60
+# Bright lime-gold used for ``corona_fat`` everywhere in the UI (RGB 191, 255, 0) —
+# distinct from interior adsorbed_fat (255, 215, 0), matrix fat (255, 165, 0) and
+# Unclassified (50, 205, 50).
+CORONA_FAT_RGB = (191, 255, 0)
 # Smallest rim band even at 0 µm: absorbs the anti-aliased edge of the air contour.
 CORONA_PX_FLOOR = 2
 
@@ -298,12 +307,19 @@ def get_theta_excluded_ids(image_name: str) -> set:
 
 
 # ---------------- INTERACTIVE ADSORBED-GLOBULE TABLE ACTIONS ----------------
-# Tri-state action selector of the ``🟡 Adsorbed Globule Detail`` data editor.
+# Action selector of the ``🟡 Adsorbed Globule Detail`` data editor. Beyond keeping or
+# deleting a particle, the researcher can now switch it between the three fat populations
+# straight from the table: equatorial corona (`corona_fat`), interior crater adsorbed
+# (`adsorbed_fat`) and free matrix fat (`fat_particles`).
 ADSORBED_DETAIL_ACTION_KEEP = "Keep"
+ADSORBED_DETAIL_ACTION_CORONA = "Move to Corona Fat"
+ADSORBED_DETAIL_ACTION_INTERIOR = "Move to Interior Adsorbed"
 ADSORBED_DETAIL_ACTION_MOVE = "Move to Matrix Fat"
 ADSORBED_DETAIL_ACTION_DELETE = "Delete"
 ADSORBED_DETAIL_ACTIONS = (
     ADSORBED_DETAIL_ACTION_KEEP,
+    ADSORBED_DETAIL_ACTION_CORONA,
+    ADSORBED_DETAIL_ACTION_INTERIOR,
     ADSORBED_DETAIL_ACTION_MOVE,
     ADSORBED_DETAIL_ACTION_DELETE,
 )
@@ -344,9 +360,12 @@ def adsorbed_detail_column_config() -> dict:
         "Action": st.column_config.SelectboxColumn(
             "Action",
             help=(
-                "**Keep** = unchanged · **Move to Matrix Fat** = reclassify this "
-                "particle as free matrix fat (`fat_particles`) · **Delete** = drop the "
-                "particle from every downstream statistic."
+                "**Keep** = unchanged · **Move to Corona Fat** = reclassify this "
+                "particle as an equatorial corona rim globule (`corona_fat`, bright "
+                "lime-gold) · **Move to Interior Adsorbed** = reclassify it as an "
+                "interior crater globule (`adsorbed_fat`, warm gold) · **Move to Matrix "
+                "Fat** = reclassify it as free matrix fat (`fat_particles`) · **Delete** "
+                "= drop the particle from every downstream statistic."
             ),
             options=list(ADSORBED_DETAIL_ACTIONS),
             required=True,
@@ -382,7 +401,7 @@ def apply_adsorbed_globule_detail_changes(
 ) -> dict:
     """Commit the edits of the ``🟡 Adsorbed Globule Detail`` data editor.
 
-    Each row of that editor exposes three researcher controls, applied in this order:
+    Each row of that editor exposes the researcher controls, applied in this order:
 
     * ``Excluded from θ`` — only rows whose checkbox actually flipped are merged into
       the image-wide ``theta_excluded_particle_ids_{image_name}`` set (exclusions of
@@ -390,10 +409,19 @@ def apply_adsorbed_globule_detail_changes(
       the set, because interior crater globules never carry a θ. The revision counter is
       bumped through :func:`set_theta_excluded_ids`, so the editor rebuilds from the
       freshly stored state on the next run.
+    * ``Move to Corona Fat`` — writes ``manual_phase_overrides[particle_id] =
+      "corona_fat"`` so the globule becomes an equatorial Pickering rim globule
+      (bright lime-gold, feeds the corona / θ population).
+    * ``Move to Interior Adsorbed`` — writes ``manual_phase_overrides[particle_id] =
+      "adsorbed_fat"`` so the globule becomes an interior crater globule (warm gold,
+      feeds Surface Coverage / Packing Density).
     * ``Move to Matrix Fat`` — writes ``manual_phase_overrides[particle_id] =
       "fat_particles"`` so the globule is reclassified as free matrix fat.
     * ``Delete`` — adds the particle to ``interactive_excluded_ids`` so it drops out of
       every downstream statistic.
+
+    Manual overrides are authoritative: an explicit move always wins over the automatic
+    corona promotion (see :func:`_promote_corona_rim_globules`).
 
     Args:
         image_name: Source image name (scopes the θ exclusion session state).
@@ -404,9 +432,16 @@ def apply_adsorbed_globule_detail_changes(
             therefore eligible for θ exclusions.
 
     Returns:
-        dict: Counts ``{"theta": int, "moved": int, "deleted": int}`` of applied edits.
+        dict: Counts ``{"theta": int, "corona": int, "interior": int, "moved": int,
+        "deleted": int}`` of applied edits.
     """
-    summary = {"theta": 0, "moved": 0, "deleted": 0}
+    summary = {
+        "theta": 0,
+        "corona": 0,
+        "interior": 0,
+        "moved": 0,
+        "deleted": 0,
+    }
     if not isinstance(edited_table, pd.DataFrame) or edited_table.empty:
         return summary
 
@@ -442,6 +477,8 @@ def apply_adsorbed_globule_detail_changes(
 
     new_excluded_ids = get_theta_excluded_ids(image_name)
     theta_changes = 0
+    corona_override_ids: list[int] = []
+    interior_override_ids: list[int] = []
     moved_ids: list[int] = []
     deleted_ids: list[int] = []
 
@@ -466,7 +503,11 @@ def apply_adsorbed_globule_detail_changes(
             theta_changes += 1
 
         action_value = str(action).strip() if pd.notna(action) else ""
-        if action_value == ADSORBED_DETAIL_ACTION_MOVE:
+        if action_value == ADSORBED_DETAIL_ACTION_CORONA:
+            corona_override_ids.append(particle_id)
+        elif action_value == ADSORBED_DETAIL_ACTION_INTERIOR:
+            interior_override_ids.append(particle_id)
+        elif action_value == ADSORBED_DETAIL_ACTION_MOVE:
             moved_ids.append(particle_id)
         elif action_value == ADSORBED_DETAIL_ACTION_DELETE:
             deleted_ids.append(particle_id)
@@ -475,11 +516,18 @@ def apply_adsorbed_globule_detail_changes(
         set_theta_excluded_ids(image_name, new_excluded_ids)
         summary["theta"] = theta_changes
 
-    if moved_ids:
+    if corona_override_ids or interior_override_ids or moved_ids:
         if "manual_phase_overrides" not in st.session_state:
             st.session_state["manual_phase_overrides"] = {}
+        overrides = st.session_state["manual_phase_overrides"]
+        for particle_id in corona_override_ids:
+            overrides[int(particle_id)] = "corona_fat"
+        for particle_id in interior_override_ids:
+            overrides[int(particle_id)] = "adsorbed_fat"
         for particle_id in moved_ids:
-            st.session_state["manual_phase_overrides"][int(particle_id)] = "fat_particles"
+            overrides[int(particle_id)] = "fat_particles"
+        summary["corona"] = len(corona_override_ids)
+        summary["interior"] = len(interior_override_ids)
         summary["moved"] = len(moved_ids)
 
     if deleted_ids:
@@ -760,6 +808,7 @@ PARAMETER_WIDGET_DEFAULTS: dict = {
         "sem_ads_circ_slider": 0.30,
         "sem_deepscan_checkbox": False,
         "sem_corona_Capture_um": CORONA_CAPTURE_UM_DEFAULT,
+        "sem_corona_circ_slider": CORONA_MIN_CIRCULARITY_DEFAULT,
         "shared_clahe_checkbox": True,
         "shared_model_type_select": "cyto2",
     },
@@ -3232,13 +3281,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.2) ----------------
+# ---------------- BUILD IDENTITY (v1.8.3) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.2"
+PHASEPIX_BUILD_VERSION = "v1.8.3"
 PHASEPIX_BUILD_DATE = "2026.11.04"
-PHASEPIX_BUILD_TITLE = "Publication-Ready Plot-Data CSV Exports"
+PHASEPIX_BUILD_TITLE = "Corona Fat Phase Class, Circularity Gate & Smooth Interface θ"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -4143,12 +4192,126 @@ def _respect_manual_adsorbed_overrides(
     return classified_df, kept_overrides
 
 
+def _promote_corona_rim_globules(
+    classified_df: pd.DataFrame,
+    ads_particles_df: Optional[pd.DataFrame],
+    corona_min_circularity: float,
+    manual_override_ids: Optional[Iterable[int]] = None,
+) -> pd.DataFrame:
+    """Relabel detected equatorial corona globules as ``phase_class = 'corona_fat'``.
+
+    The interfacial analysis already knows which particles straddle the bubble rim
+    (``is_corona_globule == True``) and how compact each one is. Every such globule whose
+    ``circularity`` reaches ``corona_min_circularity`` is an *intact* corona globule, so
+    it gets its own phase class: it is drawn in bright lime-gold (RGB 191, 255, 0)
+    everywhere, excluded from the matrix-fat PSD, and reported as its own population.
+
+    Args:
+        classified_df: Classified metrics table (never modified in place).
+        ads_particles_df: Per-globule table from
+            ``compute_interfacial_adsorption_metrics`` ('id', 'is_corona_globule',
+            'circularity').
+        corona_min_circularity: Minimum circularity of an intact corona globule.
+        manual_override_ids: Object ids the researcher assigned manually; they keep
+            their explicit phase and are never auto-promoted.
+
+    Returns:
+        pd.DataFrame: Copy of ``classified_df`` with promoted ``phase_class`` values
+        (the original frame is returned untouched when nothing qualifies).
+    """
+    if (
+        classified_df is None
+        or not isinstance(classified_df, pd.DataFrame)
+        or classified_df.empty
+        or not {"id", "phase_class"}.issubset(classified_df.columns)
+        or not isinstance(ads_particles_df, pd.DataFrame)
+        or ads_particles_df.empty
+        or not {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+    ):
+        return classified_df
+
+    corona_flags = ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
+    if "circularity" in ads_particles_df.columns:
+        corona_circ = pd.to_numeric(ads_particles_df["circularity"], errors="coerce")
+        corona_flags = corona_flags & corona_circ.ge(float(corona_min_circularity))
+
+    promoted_ids = {
+        int(value)
+        for value in ads_particles_df.loc[corona_flags, "id"].tolist()
+        if pd.notna(value)
+    }
+    for raw_id in manual_override_ids or ():
+        try:
+            promoted_ids.discard(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    if not promoted_ids:
+        return classified_df
+
+    promoted = classified_df.copy()
+    # Air bubbles can never become globules, whatever the interfacial table says.
+    target = promoted["id"].isin(promoted_ids) & (
+        promoted["phase_class"].astype(str).str.lower() != "air_bubbles"
+    )
+    if not bool(target.any()):
+        return classified_df
+    promoted.loc[target, "phase_class"] = "corona_fat"
+    if "in_bubble" in promoted.columns:
+        promoted.loc[target, "in_bubble"] = True
+    if "is_partial_in_bubble" in promoted.columns:
+        # Corona globules are rim-adsorbed, so they are never free matrix fat either.
+        promoted.loc[target, "is_partial_in_bubble"] = True
+    return promoted
+
+
+def _include_intact_corona_in_fat_psd(
+    df: pd.DataFrame,
+    corona_min_circularity: float,
+) -> pd.DataFrame:
+    """Return a copy where intact ``corona_fat`` globules join the matrix-fat PSD.
+
+    Used by the ``👑 Include Intact Corona Fat in Fat PSD`` option: a corona globule whose
+    ``circularity`` reaches ``corona_min_circularity`` was cleaved through its equator, so
+    its visible diameter really is the globule diameter and it may be pooled with the free
+    matrix fat. Cleaved/incomplete fragments (lower circularity) stay excluded.
+
+    Args:
+        df: Classified metrics table.
+        corona_min_circularity: Minimum circularity of an intact corona globule.
+
+    Returns:
+        pd.DataFrame: ``df`` itself when nothing qualifies, else a relabelled copy where
+        those rows carry ``phase_class = 'fat_particles'`` and
+        ``is_partial_in_bubble = False``.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if not {"phase_class"}.issubset(df.columns):
+        return df
+
+    corona_mask = df["phase_class"].astype(str).str.lower().eq("corona_fat")
+    if not bool(corona_mask.any()):
+        return df
+    if "circularity" in df.columns:
+        circ = pd.to_numeric(df["circularity"], errors="coerce")
+        corona_mask = corona_mask & circ.ge(float(corona_min_circularity))
+    if not bool(corona_mask.any()):
+        return df
+
+    merged = df.copy()
+    merged.loc[corona_mask, "phase_class"] = "fat_particles"
+    if "is_partial_in_bubble" in merged.columns:
+        merged.loc[corona_mask, "is_partial_in_bubble"] = False
+    return merged
+
+
 def _canvas_phase_visibility(
     reclassify_mode: bool,
     show_unclassified: bool,
     show_fat: bool,
     show_adsorbed: bool,
     show_air: bool,
+    show_corona: bool = True,
     isolate_unclassified: bool = False,
 ) -> dict:
     """
@@ -4165,17 +4328,19 @@ def _canvas_phase_visibility(
         show_fat: Paint orange matrix-fat particles.
         show_adsorbed: Paint gold adsorbed-fat globules.
         show_air: Paint sky-blue air bubbles.
+        show_corona: Paint bright lime-gold ``corona_fat`` (equatorial rim) globules.
         isolate_unclassified: Hide fat / adsorbed fat / air entirely.
 
     Returns:
         dict: ``{phase_key: bool}`` for ``air_bubbles``, ``fat_particles``,
-        ``adsorbed_fat`` and ``unclassified``.
+        ``adsorbed_fat``, ``corona_fat`` and ``unclassified``.
     """
     if not reclassify_mode:
         return {
             "air_bubbles": True,
             "fat_particles": True,
             "adsorbed_fat": True,
+            "corona_fat": True,
             "unclassified": True,
         }
 
@@ -4183,12 +4348,14 @@ def _canvas_phase_visibility(
         "air_bubbles": bool(show_air),
         "fat_particles": bool(show_fat),
         "adsorbed_fat": bool(show_adsorbed),
+        "corona_fat": bool(show_corona),
         "unclassified": bool(show_unclassified),
     }
     if isolate_unclassified:
         visible["air_bubbles"] = False
         visible["fat_particles"] = False
         visible["adsorbed_fat"] = False
+        visible["corona_fat"] = False
     return visible
 
 
@@ -5474,6 +5641,40 @@ with st.sidebar:
                 st.session_state.get("sem_corona_Capture_um", CORONA_CAPTURE_UM_DEFAULT)
             )
 
+        # ── 👑 Corona shape gate ──────────────────────────────────────────────
+        # A Pickering corona globule is a compact, roundish globule on the fractured
+        # rim. Elongated rim-wall shards touch the interface purely by geometry, so
+        # they are rejected unless their circularity reaches this threshold.
+        if sample_type == "Whipped Emulsion":
+            corona_min_circularity = float(
+                st.slider(
+                    "👑 Corona Fat Min Circularity",
+                    min_value=0.30,
+                    max_value=0.90,
+                    value=float(CORONA_MIN_CIRCULARITY_DEFAULT),
+                    step=0.05,
+                    help=(
+                        "Shape gate for the equatorial Pickering corona. Only globules "
+                        "with circularity ≥ this value are classified as corona rim "
+                        "globules (`corona_fat`), so round globules (default 0.60) are "
+                        "kept while irregular rim-wall shards (~0.30) are rejected and "
+                        "fall back to the interior crater population. It also sets the "
+                        "threshold above which an auto-detected corona globule is "
+                        "promoted to the `corona_fat` phase and is counted as *intact* "
+                        "in the 👑 Include Intact Corona Fat in Fat PSD option."
+                    ),
+                    key="sem_corona_circ_slider",
+                )
+            )
+        else:
+            # Emulsion / Foam have no corona population; keep the stored value so the
+            # user's Whipped Emulsion recipe is restored on their next run.
+            corona_min_circularity = float(
+                st.session_state.get(
+                    "sem_corona_circ_slider", CORONA_MIN_CIRCULARITY_DEFAULT
+                )
+            )
+
         if sample_type == "Emulsion":
             st.caption(
                 "ℹ️ **Single-phase Emulsion** — only Matrix Fat tools are shown; "
@@ -5776,6 +5977,7 @@ with st.sidebar:
         show_air = st.checkbox("Show Air Bubbles", value=True)
         show_fat = False
         show_adsorbed = False
+        show_corona = False
         show_unclassified = st.checkbox(
             "Show Unclassified (Green)",
             value=True,
@@ -5798,6 +6000,7 @@ with st.sidebar:
         show_air = False
         show_fat = st.checkbox("Show Fat Particles", value=True)
         show_adsorbed = False
+        show_corona = False
         show_unclassified = st.checkbox(
             "Show Unclassified (Green)",
             value=True,
@@ -5867,6 +6070,22 @@ with st.sidebar:
             options=["Fat over Air", "Air over Fat"],
             index=0,
             help="Layering priority: 'Fat over Air' renders fat particles on top of air bubbles; 'Air over Fat' renders air bubbles on top.",
+        )
+
+        # 👑 Pickering corona rim globules: their own phase (corona_fat) and their own
+        # bright lime-gold tint, so they can be told apart from the warm-gold interior
+        # adsorbed globules at a glance — and hidden on demand for clean exports.
+        show_corona = st.checkbox(
+            "👑 Show Corona Fat",
+            value=True,
+            key="show_corona_toggle",
+            help=(
+                "Renders the equatorial Pickering corona globules — phase_class "
+                "`corona_fat`, or every globule flagged `is_corona_globule == True` in "
+                "the interfacial analysis — in bright lime-gold (RGB 191, 255, 0) with a "
+                "crisp outer contour. Interior crater globules keep the warm gold "
+                "(255, 215, 0) tint. Uncheck to hide the corona population entirely."
+            ),
         )
 
     # Universal for all sample types (Foam / Emulsion / Whipped Emulsion)
@@ -6313,6 +6532,13 @@ else:
     else:
         corona_px = 0
     corona_bubble_mask = _dilate_bubble_mask(combined_bubble_mask, corona_px)
+
+    # 👑 Corona shape gate (Sidebar Section 5). Read from the widget state so the value
+    # is always available, even when the control itself is hidden by the active
+    # modality (Light microscopy / Emulsion / Foam keep their stored Whipped recipe).
+    corona_min_circularity = float(
+        st.session_state.get("sem_corona_circ_slider", CORONA_MIN_CIRCULARITY_DEFAULT)
+    )
 
     # 4. Spatial Phase Filtering & Classification (Colloid Chemistry Rules)
     partial_ids = set()
@@ -6788,6 +7014,7 @@ else:
                 image_shape=base_display_img.shape[:2],
                 pixel_to_um_ratio=float(pixel_to_um_ratio),
                 corona_margin_px=int(corona_px),
+                corona_min_circularity=float(corona_min_circularity),
                 # Dashboard theta labels respect the researcher's per-image
                 # exclusions made in the 🔍 Single Bubble Crop Inspector.
                 excluded_theta_particle_ids=sorted(get_theta_excluded_ids(image_name)),
@@ -6795,6 +7022,19 @@ else:
         except Exception:
             # Keep the dashboard renderable even if contact-angle estimation fails
             ads_particles_df_global = pd.DataFrame()
+
+    # 👑 Auto-promote every detected, intact corona rim globule to its own phase class
+    # (`corona_fat`) so the lime-gold rendering, the tables and every export agree.
+    # Manual phase assignments always win: an id the researcher reclassified is never
+    # promoted automatically.
+    classified_df = _promote_corona_rim_globules(
+        classified_df,
+        ads_particles_df_global,
+        float(corona_min_circularity),
+        manual_override_ids=set(
+            (st.session_state.get("manual_phase_overrides") or {}).keys()
+        ),
+    )
 
     pipeline_timing["metrics"] = time.perf_counter() - _stage_started
     # ⏱️ Stage 4/4 — overlay & visualization rendering.
@@ -6811,6 +7051,7 @@ else:
             show_air=bool(show_air),
             show_fat=bool(show_fat),
             show_adsorbed=bool(show_adsorbed),
+            show_corona=bool(show_corona),
             show_unclassified=bool(show_unclassified),
             adsorbed_opacity=float(adsorbed_opacity),
             z_order=str(z_order),
@@ -6832,6 +7073,7 @@ else:
             show_air=bool(show_air),
             show_fat=bool(show_fat),
             show_adsorbed=bool(show_adsorbed),
+            show_corona=bool(show_corona),
             show_unclassified=bool(show_unclassified),
             adsorbed_opacity=float(adsorbed_opacity),
             z_order=str(z_order),
@@ -7291,7 +7533,13 @@ else:
                 elif sample_type == "Foam":
                     phase_class_options = ["air_bubbles", "Unclassified"]
                 else:
-                    phase_class_options = ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
+                    phase_class_options = [
+                        "air_bubbles",
+                        "fat_particles",
+                        "adsorbed_fat",
+                        "corona_fat",
+                        "Unclassified",
+                    ]
 
                 # ── 🔍 Search / Filter by Particle ID + ⚠️ QC filter ──────────
                 # Hundreds of rows make marking a single artifact slow; the filters
@@ -7660,6 +7908,23 @@ else:
         # Full-width Size Distribution section beneath image + table
         st.subheader("3. Size Distribution")
 
+        # 👑 Opt-in: pool the INTACT equatorial corona globules into the matrix-fat PSD.
+        # A corona globule cleaved through its equator shows its true diameter, so it may
+        # legitimately join the fat population; cleaved fragments stay excluded.
+        include_corona_in_fat_psd = False
+        if sample_type == "Whipped Emulsion":
+            include_corona_in_fat_psd = st.checkbox(
+                "👑 Include Intact Corona Fat in Fat PSD",
+                value=False,
+                key="include_corona_in_fat_psd",
+                help=(
+                    "Pools every intact corona globule (phase_class = corona_fat with "
+                    f"circularity ≥ {float(corona_min_circularity):.2f}) into the Fat "
+                    "Particles size distribution below. Cleaved / incomplete fragments stay "
+                    "excluded, exactly like the warm-gold interior adsorbed globules."
+                ),
+            )
+
         # Fixed physical bar width (∆µm): every bar covers the same diameter interval, so
         # bar heights (% of that phase) stay directly comparable between micrographs with
         # very different particle counts (e.g. n = 3176 fat particles).
@@ -7710,8 +7975,14 @@ else:
         def _render_phase_distribution(phase_key: str, title: str, png_name: str, dl_prefix: str):
             """Render one phase PSD and export exactly the data behind the bars."""
             bin_width = float(fat_bin_width if phase_key == "fat_particles" else air_bin_width)
+            # 👑 Fat PSD source: optionally pooled with the intact corona globules.
+            psd_df = classified_df
+            if phase_key == "fat_particles" and include_corona_in_fat_psd:
+                psd_df = _include_intact_corona_in_fat_psd(
+                    classified_df, float(corona_min_circularity)
+                )
             fig_phase, _ = plot_single_phase_distribution(
-                classified_df,
+                psd_df,
                 phase_class=phase_key,
                 title=title,
                 color=PALETTE_COLORS.get(phase_key),
@@ -7722,7 +7993,7 @@ else:
             # Exact binned plot table (Σ = 100%) mirroring the rendered bars: this is
             # the only thing needed to re-create the chart in Excel / Origin / Prism.
             binned_table = compute_phase_histogram_table(
-                classified_df,
+                psd_df,
                 phase_class=phase_key,
                 bin_width=bin_width,
             )
@@ -7921,6 +8192,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         if is_emulsion_ui
                         else [
                             "adsorbed_fat",
+                            "corona_fat",
                             "fat_particles",
                             "air_bubbles",
                             "Unclassified",
@@ -7956,12 +8228,21 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 else:
                     default_manual_phase = st.radio(
                         "Assign New Manual Objects As",
-                        options=["air_bubbles", "fat_particles", "adsorbed_fat", "Auto (by Min/Max Size)"],
+                        options=[
+                            "air_bubbles",
+                            "fat_particles",
+                            "adsorbed_fat",
+                            "corona_fat",
+                            "Auto (by Min/Max Size)",
+                        ],
                         index=0,
                         horizontal=True,
                         help=(
                             "By default, manually added pores/bubbles are locked as air_bubbles regardless of their size, "
-                            "so small or huge pores are never misclassified as fat or Unclassified."
+                            "so small or huge pores are never misclassified as fat or Unclassified. "
+                            "Use `corona_fat` to draw a missed equatorial Pickering globule: it is rendered in "
+                            "bright lime-gold (RGB 191, 255, 0) and feeds the coronal/interfacial metrics, while "
+                            "`adsorbed_fat` stays the warm-gold interior crater population."
                         ),
                     )
             with t_row2_col2:
@@ -7995,9 +8276,10 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             canvas_show_fat = bool(show_fat)
             canvas_show_adsorbed = bool(show_adsorbed)
             canvas_show_air = bool(show_air)
+            canvas_show_corona = bool(show_corona)
             isolate_unclassified_only = False
             if assist_mode.startswith("🎨"):
-                vis_col1, vis_col2, vis_col3, vis_col4 = st.columns(4)
+                vis_col1, vis_col2, vis_col3, vis_col4, vis_col5 = st.columns(5)
                 with vis_col1:
                     canvas_show_unclassified = st.checkbox(
                         "🟢 Show Unclassified",
@@ -8025,6 +8307,16 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         value=bool(show_air),
                         key="canvas_show_air",
                         help="Paint the sky-blue air bubbles (synced with Sidebar → Section 6).",
+                    )
+                with vis_col5:
+                    canvas_show_corona = st.checkbox(
+                        "👑 Show Corona Fat",
+                        value=bool(show_corona),
+                        key="canvas_show_corona",
+                        help=(
+                            "Paint the bright lime-gold equatorial Pickering corona globules "
+                            "(phase_class = corona_fat, synced with Sidebar → Section 6)."
+                        ),
                     )
                 isolate_unclassified_only = st.checkbox(
                     "🎯 Isolate Unclassified Only (Hide Fat & Air on Canvas)",
@@ -8055,6 +8347,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             show_fat=bool(canvas_show_fat),
             show_adsorbed=bool(canvas_show_adsorbed),
             show_air=bool(canvas_show_air),
+            show_corona=bool(canvas_show_corona),
             isolate_unclassified=bool(isolate_unclassified_only),
         )
 
@@ -8111,6 +8404,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         obj_color = (255, 165, 0)
                     elif str(item_phase).lower() == "adsorbed_fat":
                         obj_color = (255, 215, 0)
+                    elif str(item_phase).lower() == "corona_fat":
+                        obj_color = CORONA_FAT_RGB
                     elif str(item_phase).lower() == "unclassified":
                         obj_color = (50, 205, 50)
                     else:
@@ -8143,6 +8438,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 "air_bubbles": (0, 191, 255),
                 "fat_particles": (255, 165, 0),
                 "adsorbed_fat": (255, 215, 0),
+                "corona_fat": CORONA_FAT_RGB,
                 "unclassified": (50, 205, 50),
             }
             _phase_norm = classified_df["phase_class"].astype(str).str.lower()
@@ -8244,6 +8540,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             if click_target_phase == "adsorbed_fat":
                 canvas_fill_color = "rgba(255, 215, 0, 0.45)"
                 canvas_stroke_color = "#FFD700"
+            elif click_target_phase == "corona_fat":
+                canvas_fill_color = "rgba(191, 255, 0, 0.45)"
+                canvas_stroke_color = "#BFFF00"
             elif click_target_phase == "fat_particles":
                 canvas_fill_color = "rgba(255, 165, 0, 0.45)"
                 canvas_stroke_color = "#FFA500"
@@ -8262,6 +8561,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         elif default_manual_phase == "adsorbed_fat":
             canvas_fill_color = "rgba(255, 215, 0, 0.4)"
             canvas_stroke_color = "#FFD700"
+        elif default_manual_phase == "corona_fat":
+            canvas_fill_color = "rgba(191, 255, 0, 0.4)"
+            canvas_stroke_color = "#BFFF00"
         elif default_manual_phase == "Unclassified":
             canvas_fill_color = "rgba(50, 205, 50, 0.4)"
             canvas_stroke_color = "#32CD32"
@@ -8862,6 +9164,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     pixel_to_um_ratio=float(pixel_to_um_ratio),
                     d_ref_um=d_ref_argument,
                     corona_margin_px=int(corona_px),
+                    corona_min_circularity=float(corona_min_circularity),
                     contact_angle_mode=CONTACT_ANGLE_MODE_INDIVIDUAL,
                     excluded_theta_particle_ids=sorted(theta_excluded_ids),
                 )
@@ -9604,9 +9907,17 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                                 edited_table=edited_detail_table,
                                 corona_particle_ids=detail_corona_ids,
                             )
-                            if detail_summary["theta"] or detail_summary["moved"] or detail_summary["deleted"]:
+                            if (
+                                detail_summary["theta"]
+                                or detail_summary["corona"]
+                                or detail_summary["interior"]
+                                or detail_summary["moved"]
+                                or detail_summary["deleted"]
+                            ):
                                 st.toast(
                                     f"Applied · θ {detail_summary['theta']} · "
+                                    f"corona {detail_summary['corona']} · "
+                                    f"interior {detail_summary['interior']} · "
                                     f"moved {detail_summary['moved']} · "
                                     f"deleted {detail_summary['deleted']}"
                                 )

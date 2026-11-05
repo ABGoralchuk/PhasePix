@@ -21,6 +21,10 @@ PALETTE_COLORS = {
     "air_bubbles": "#1f77b4",   # Blue for air bubbles (dark pores in SEM)
     "fat_particles": "#ff7f0e",  # Orange for fat particles (bright features in SEM)
     "adsorbed_fat": "#ffd700",   # Gold for adsorbed fat particles on bubble walls
+    # Bright lime-gold for equatorial Pickering corona globules: visually distinct
+    # from interior adsorbed_fat (#FFD700), matrix fat_particles (#FFA500) and the
+    # lime-green Unclassified underlay (#32CD32).
+    "corona_fat": "#BFFF00",
     "Unclassified": "#32cd32",   # Lime Green for unclassified particles (RGB 50, 205, 50)
     "unclassified": "#32cd32",   # Lime Green alias
 }
@@ -827,8 +831,10 @@ def create_mask_overlay(
     show_air: bool = True,
     show_fat: bool = True,
     show_adsorbed: bool = True,
+    show_corona: bool = True,
     show_unclassified: bool = True,
     adsorbed_opacity: float = 0.45,
+    corona_opacity: float = 0.50,
     z_order: str = "Fat over Air",
     mask: Optional[np.ndarray] = None,
     manual_polygons: Optional[list] = None,
@@ -843,6 +849,9 @@ def create_mask_overlay(
     Color coding (RGB):
     - 'fat_particles': Orange (RGB: 255, 165, 0)
     - 'air_bubbles': Deep Sky Blue (RGB: 0, 191, 255)
+    - 'adsorbed_fat': Warm gold (RGB: 255, 215, 0) — interior crater globules only
+    - 'corona_fat' / ``is_corona_globule == True``: Bright lime-gold
+      (RGB: 191, 255, 0) with a crisp outer contour — equatorial Pickering rim globules
     - Other / unlabeled: Yellow (RGB: 255, 235, 59)
 
     Features:
@@ -863,6 +872,14 @@ def create_mask_overlay(
         show_air: Whether to render and number air bubbles (defaults to True).
         show_fat: Whether to render and number fat particles (defaults to True).
         show_adsorbed: Whether to render and number adsorbed fat globules (defaults to True).
+        show_corona: Whether to render and number equatorial Pickering corona globules —
+            rows with ``phase_class == 'corona_fat'`` or ``is_corona_globule == True`` in
+            ``ads_particles_df`` — in bright lime-gold (RGB 191, 255, 0) with a crisp
+            outer contour (defaults to True). Interior ``adsorbed_fat`` globules keep the
+            warm gold tint (RGB 255, 215, 0), so the two globule populations stay visually
+            separate.
+        corona_opacity: Opacity for the lime-gold corona_fat overlay layer (0.0 to 1.0,
+            defaults to 0.50).
         show_unclassified: Whether to render and number green Unclassified particles
             (defaults to True). Turning it off keeps the overlay focused on the
             explicitly classified phases.
@@ -916,6 +933,9 @@ def create_mask_overlay(
     FAT_COLOR = (255, 165, 0)        # Orange for fat particles
     AIR_COLOR = (0, 191, 255)        # Deep sky blue for air bubbles
     UNCLASS_COLOR = (50, 205, 50)    # Lime Green for unclassified particles (RGB 50, 205, 50)
+    ADSORBED_COLOR = (255, 215, 0)   # Warm gold for interior crater adsorbed globules
+    CORONA_COLOR = (191, 255, 0)     # Bright lime-gold for equatorial corona globules
+    CORONA_EDGE_COLOR = (235, 255, 150)  # Crisp pale-lime outline around corona globules
     DEFAULT_COLOR = (255, 235, 59)   # Fallback yellow
 
     # Fallback for unclassified / raw mask when df is not provided
@@ -1063,13 +1083,42 @@ def create_mask_overlay(
         _draw_manual_for_phase(phase, phase_color, phase_opacity)
 
     # 2b. Render adsorbed_fat (adsorbed globules inside bubble craters)
-    # Rendered with distinct vibrant Gold color (255, 215, 0)
-    ADSORBED_COLOR = (255, 215, 0)
+    # Rendered with the warm-gold ADSORBED_COLOR (255, 215, 0) defined above:
+    # interior crater globules only — corona ids are peeled off for the lime-gold 2c pass.
+    # Corona ids are collected first: equatorial Pickering rim globules get their OWN
+    # lime-gold tint (2c), so they are excluded from this warm-gold interior layer.
+    corona_ids: set = set()
+    if show_corona:
+        if "phase_class" in df.columns:
+            corona_phase = (
+                df["phase_class"].astype(str).str.lower() == "corona_fat"
+            )
+            for value in df.loc[corona_phase, "id"].tolist():
+                try:
+                    corona_ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        if (
+            isinstance(ads_particles_df, pd.DataFrame)
+            and not ads_particles_df.empty
+            and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+        ):
+            corona_flags = (
+                ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
+            )
+            for value in ads_particles_df.loc[corona_flags, "id"].tolist():
+                try:
+                    corona_ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
     if show_adsorbed and adsorbed_opacity > 0.0:
         pf_opacity = float(np.clip(adsorbed_opacity, 0.0, 1.0))
         partial_ids = df.loc[df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"]), "id"].tolist()
-        if partial_ids:
-            partial_mask = np.isin(mask_2d, partial_ids)
+        interior_ids = [
+            pid for pid in partial_ids if int(pid) not in corona_ids
+        ]
+        if interior_ids:
+            partial_mask = np.isin(mask_2d, interior_ids)
             if np.any(partial_mask):
                 blended[partial_mask] = (
                     blended[partial_mask].astype(np.float32) * (1.0 - pf_opacity)
@@ -1079,6 +1128,32 @@ def create_mask_overlay(
             for cnt in pf_cnts:
                 cv2.drawContours(blended, [cnt], -1, (255, 240, 100), 1, lineType=cv2.LINE_AA)
         _draw_manual_for_phase("adsorbed_fat", ADSORBED_COLOR, pf_opacity)
+
+    # 2c. Render corona_fat (equatorial Pickering rim globules) in bright lime-gold.
+    # A corona globule sits on the fractured rim cross-section and is the only globule
+    # population that carries a three-phase contact angle, so it must never be confused
+    # with the warm-gold interior crater globules above.
+    if show_corona and corona_opacity > 0.0 and corona_ids:
+        corona_fill_ids = sorted(corona_ids)
+        corona_fill_opacity = float(np.clip(corona_opacity, 0.0, 1.0))
+        corona_mask = np.isin(mask_2d, corona_fill_ids)
+        if air_masks is not None:
+            air_m2d_c = air_masks.squeeze() if air_masks.ndim == 3 else air_masks
+            if air_m2d_c.shape == mask_2d.shape:
+                corona_mask = corona_mask | np.isin(air_m2d_c, corona_fill_ids)
+        if np.any(corona_mask):
+            blended[corona_mask] = (
+                blended[corona_mask].astype(np.float32) * (1.0 - corona_fill_opacity)
+                + np.array(CORONA_COLOR, dtype=np.float32) * corona_fill_opacity
+            ).clip(0, 255).astype(np.uint8)
+            corona_cnts, _ = cv2.findContours(
+                corona_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            )
+            for ccnt in corona_cnts:
+                cv2.drawContours(
+                    blended, [ccnt], -1, CORONA_EDGE_COLOR, 1, lineType=cv2.LINE_AA
+                )
+        _draw_manual_for_phase("corona_fat", CORONA_COLOR, corona_fill_opacity)
 
     # 3. Draw particle ID numbers in the same Z-order (top phase labels last = on top)
     if show_labels:
@@ -1111,8 +1186,8 @@ def create_mask_overlay(
                     continue
                 _draw_id_label(cx, cy, int(row["id"]))
 
-        # Draw labels for adsorbed_fat objects when show_adsorbed is enabled
-        if show_adsorbed:
+        # Draw labels for adsorbed_fat / corona_fat objects when their layer is enabled
+        if show_adsorbed or show_corona:
             theta_lookup: dict = {}
             if (
                 isinstance(ads_particles_df, pd.DataFrame)
@@ -1136,7 +1211,10 @@ def create_mask_overlay(
                     if pd.notna(theta_value):
                         theta_lookup[theta_id] = float(theta_value)
 
-            pf_df = df[df["phase_class"].astype(str).str.lower().isin(["adsorbed_fat"])]
+            label_phases = ["adsorbed_fat"] if show_adsorbed else []
+            if show_corona:
+                label_phases.append("corona_fat")
+            pf_df = df[df["phase_class"].astype(str).str.lower().isin(label_phases)]
             for _, row in pf_df.iterrows():
                 centroid_x = row.get("centroid_x")
                 centroid_y = row.get("centroid_y")
@@ -1248,6 +1326,57 @@ def _apply_color_overlay(
     ).clip(0, 255).astype(np.uint8)
 
 
+def _draw_dashed_polyline(
+    rgb: np.ndarray,
+    pts: np.ndarray,
+    color: Tuple[int, int, int],
+    dash_px: float = 6.0,
+    gap_px: float = 4.0,
+    thickness: int = 1,
+) -> None:
+    """Draw a closed dashed polyline (in place) from an ordered (N, 2) point list.
+
+    Used to render the Fourier-regularised bubble baseline as a clean reference line:
+    a dashed stroke reads as an annotation, so it can never be mistaken for a second
+    segmentation edge burned into the micrograph.
+    """
+    if pts is None:
+        return
+    arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    if arr.shape[0] < 3:
+        return
+    dash = max(float(dash_px), 0.5)
+    period = max(dash + max(float(gap_px), 0.0), 1.0)
+    closed = np.vstack([arr, arr[0]])
+    phase = 0.0  # dash-phase carried across vertices so the pattern stays continuous
+    for start, end in zip(closed[:-1], closed[1:]):
+        seg = end - start
+        seg_len = float(np.hypot(seg[0], seg[1]))
+        if seg_len < 1e-6:
+            continue
+        direction = seg / seg_len
+        travelled = 0.0
+        while travelled < seg_len:
+            remaining = (dash - phase) if phase < dash else (period - phase)
+            run = min(remaining, seg_len - travelled)
+            if run <= 0.0:
+                phase = (phase + 1e-3) % period
+                continue
+            if phase < dash:
+                p0 = start + direction * travelled
+                p1 = p0 + direction * run
+                cv2.line(
+                    rgb,
+                    (int(round(p0[0])), int(round(p0[1]))),
+                    (int(round(p1[0])), int(round(p1[1]))),
+                    color,
+                    thickness,
+                    lineType=cv2.LINE_AA,
+                )
+            travelled += run
+            phase = (phase + run) % period
+
+
 def render_selected_bubbles_inspection_overlay(
     image: np.ndarray,
     df: pd.DataFrame,
@@ -1271,7 +1400,11 @@ def render_selected_bubbles_inspection_overlay(
     Everything outside the selected bubble masks is dimmed (x0.45) so the inspected
     bubbles stay the only bright regions. Their contours are drawn in bright cyan
     (RGB 0, 210, 255), adsorbed fat globules inside them are tinted gold
-    (RGB 255, 215, 0, alpha 0.50) with a crisp outline (RGB 255, 240, 120). Only
+    (RGB 255, 215, 0, alpha 0.50) with a crisp outline (RGB 255, 240, 120). In
+    ``GLOBULE_ROLE_CORONA`` (👑 Contact Angle θ Mode) the Fourier-regularised baseline
+    bubble interface is additionally drawn as a clean dashed cyan line (5 harmonics,
+    180 vertices), so the exact interface across which L_c,i / θ is measured is visible
+    instead of the staircase-jagged segmentation edge. Only
     numeric identifiers are burned into the image: the ID of every inspected bubble and,
     optionally, the particle ID of every rendered globule. Contact angle values (°) are
     never drawn any more, because a degree label on the picture cannot be trusted to
@@ -1457,6 +1590,45 @@ def render_selected_bubbles_inspection_overlay(
             b_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
         )
         cv2.drawContours(rgb, bubble_cnts, -1, (0, 210, 255), 2, lineType=cv2.LINE_AA)
+
+    # 👑 Contact Angle θ mode only: draw the SMOOTHED baseline bubble interface — the
+    # exact line across which the contact chord L_c,i (and therefore θ) is measured. The
+    # raw segmentation edge is staircase-jagged around every rim globule, so it cannot
+    # serve as the visual reference: the Fourier-regularised contour is drawn as a clean
+    # dashed cyan line so the researcher can see the true interface at a glance.
+    if role_filter == GLOBULE_ROLE_CORONA:
+        for b_mask in bubble_masks.values():
+            baseline_cnts, _ = cv2.findContours(
+                b_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            )
+            if not baseline_cnts:
+                continue
+            main_baseline = max(baseline_cnts, key=cv2.contourArea)
+            baseline_pts = (
+                np.asarray(main_baseline, dtype=np.float32).reshape(-1, 2)
+            )
+            try:
+                from analyzer import _smooth_contour_fourier
+
+                smoothed_baseline = np.asarray(
+                    _smooth_contour_fourier(
+                        baseline_pts, n_harmonics=5, num_points=180
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1, 2)
+                if smoothed_baseline.shape[0] >= 3:
+                    baseline_pts = smoothed_baseline
+            except Exception:
+                # A raw contour is still better than no reference line at all.
+                pass
+            _draw_dashed_polyline(
+                rgb,
+                baseline_pts,
+                (0, 255, 255),
+                dash_px=6.0,
+                gap_px=4.0,
+                thickness=1,
+            )
 
     # Role-aware globule ID annotations. Only the globules the role filter actually
     # draws are annotated, so a Surface Coverage overlay never labels a hidden corona
