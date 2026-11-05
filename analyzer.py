@@ -23,20 +23,29 @@ import tifffile
 _CORONA_OVERLAP_MIN = 0.15
 
 # ---------------------------------------------------------------------------
-# Three-phase contact angle (theta) geometry
+# Three-phase contact angle (theta) geometry — locked in v1.8.0
 # ---------------------------------------------------------------------------
-# ``compute_interfacial_adsorption_metrics`` supports two theta recipes:
+# A cryo-SEM freeze-fractured bubble exposes TWO different globule populations on
+# TWO different surfaces, and v1.8.0 keeps them strictly apart:
 #
-#   CONTACT_ANGLE_MODE_INDIVIDUAL  (default, v1.7.9)
+#   * Corona rim globules (is_corona_globule = True) sit on the fractured equatorial
+#     perimeter cross-section  ->  theta_i = arcsin(L_c,i / D_i)  +  Rim Coverage (%)
+#   * Interior adsorbed globules (is_corona_globule = False) sit on the inner crater
+#     floor                    ->  Surface Coverage (%) + Packing Density (glob/µm²)
+#
+# CONTACT_ANGLE_MODE_INDIVIDUAL is therefore the ONLY theta recipe:
+#
 #       theta_i = arcsin(L_c,i / D_i) computed ONLY for corona rim globules, where
 #       D_i is the globule's own measured diameter and L_c,i is the interfacial
 #       contact chord measured on its own mask at the bubble boundary.
-#   CONTACT_ANGLE_MODE_REFERENCE   (legacy)
-#       theta = arcsin(L_c / D_ref) for every adsorbed globule, with one global
-#       reference diameter D_ref taken from the free matrix fat fraction.
+#
+# CONTACT_ANGLE_MODE_REFERENCE (the legacy ``theta = arcsin(L_c / D_ref)`` recipe that
+# mixed interior and corona globules into one global-reference angle) was retired in
+# v1.8.0: the name is still accepted by ``contact_angle_mode`` for backward
+# compatibility with old scripts/exports, but the value is ignored.
 CONTACT_ANGLE_MODE_INDIVIDUAL = "individual_corona"
-CONTACT_ANGLE_MODE_REFERENCE = "d_ref"
-CONTACT_ANGLE_MODES = (CONTACT_ANGLE_MODE_INDIVIDUAL, CONTACT_ANGLE_MODE_REFERENCE)
+CONTACT_ANGLE_MODE_REFERENCE = "d_ref"  # retired in v1.8.0 — accepted but ignored
+CONTACT_ANGLE_MODES = (CONTACT_ANGLE_MODE_INDIVIDUAL,)
 
 # Half-width (px) of the interface strip used to measure the chord, capped so the
 # chord of a strongly curved rim cannot be inflated by a wide band.
@@ -2413,23 +2422,38 @@ def compute_interfacial_adsorption_metrics(
       b) at least ``_CORONA_OVERLAP_MIN`` (15 %) of the globule's own segmented area
          overlaps that band.
 
-    Every adsorbed globule is then split into one of two geometric roles:
+    Every adsorbed globule is then split into one of two geometric roles, and the two
+    roles feed **two different surfaces** of the freeze-fractured bubble (v1.8.0):
+
+      * **Interior adsorbed globule** (``is_corona_globule = False``) — lies completely
+        inside the eroded bubble crater, away from the perimeter, i.e. it sits on the
+        **inner crater floor**. Only a 2D cap projection is visible there, so its true
+        sphere diameter cannot be recovered and it must not enter the contact-angle
+        statistics. These globules are the **only** population used for the 2D areal
+        crater metrics::
+
+            Surface Coverage (%)      = |Ω_b ∩ ∪ interior globule masks| / |Ω_b| * 100
+            Packing Density (glob/µm²) = n_interior / Bubble Area (µm²)
 
       * **Corona rim globule** (``is_corona_globule = True``) — straddles, touches or
-        overlaps the bubble perimeter boundary. In the SEM projection these globules are
+        overlaps the bubble perimeter boundary, i.e. it sits on the **fractured
+        equatorial perimeter cross-section**. In the SEM projection these globules are
         seen in cross-section along the perimeter, so both their true individual diameter
-        D_i and their interfacial contact chord L_c,i are directly visible.
-      * **Interior adsorbed globule** (``is_corona_globule = False``) — lies completely
-        inside the eroded bubble crater, away from the perimeter. Only a 2D cap projection
-        is visible there, so its true sphere diameter cannot be recovered and it must not
-        enter the contact-angle statistics.
+        D_i and their interfacial contact chord L_c,i are directly visible. These globules
+        are the **only** population used for the three-phase contact angle and for
+        ``Rim Coverage (%)`` measured along the equatorial rim band.
 
-    Surface coverage, rim coverage, packing density and the adsorbed count always include
-    **all** adsorbed globules (interior + corona).
+    Mixing the two populations is physically meaningless: a corona globule straddles the
+    fractured rim, so counting its area as crater area would inflate Surface Coverage /
+    Packing Density with globules that do not sit on the crater floor at all. The split is
+    therefore enforced here, not left to the UI. Both populations are still reported per
+    bubble (``Interior Adsorbed Globules`` / ``Corona Globules``) and summed in
+    ``Total Adsorbed Globules``; the per-globule table carries
+    ``is_corona_globule`` + ``used_for_surface_coverage`` so every number is traceable.
 
-    Contact angle:
-        ``CONTACT_ANGLE_MODE_INDIVIDUAL`` (default, v1.7.9) evaluates theta **only** for
-        corona rim globules and uses each globule's own measured size::
+    Contact angle (locked to ``CONTACT_ANGLE_MODE_INDIVIDUAL`` in v1.8.0):
+        theta is evaluated **only** for corona rim globules and each globule uses its own
+        measured size::
 
             D_i   = max(major_axis_um, diameter_um)          # true individual diameter
             L_c,i = chord of the globule mask cut by the bubble boundary contour (um)
@@ -2447,14 +2471,10 @@ def compute_interfacial_adsorption_metrics(
 
         Interior globules receive ``contact_angle_deg = NaN`` so they never bias the mean.
 
-        ``CONTACT_ANGLE_MODE_REFERENCE`` reproduces the legacy v1.7.8 behaviour
-        ``theta = arcsin(L_c / d_ref)`` for **every** adsorbed globule, with ``L_c`` the
-        visible major axis and one global reference diameter ``d_ref`` (mean free matrix
-        fat diameter by default) — kept for reproducing historical numbers.
-
-    Adsorbed area is measured as the union of the globule masks clipped by the bubble mask
-    (falling back to the summed row areas when no masks are available), which prevents
-    double counting of overlapping globules.
+    Adsorbed area is measured as the union of the globule masks clipped by the bubble
+    interior mask Ω_b (falling back to the summed row areas when no masks are available),
+    which prevents double counting of overlapping globules; interior and corona unions are
+    accumulated separately so the areal crater metrics can never absorb rim particles.
 
     Args:
         df: Classified metrics DataFrame (extract_metrics + 'phase_class').
@@ -2465,55 +2485,66 @@ def compute_interfacial_adsorption_metrics(
         image_shape: Spatial shape of the analysis image as (height, width).
         pixel_to_um_ratio: Spatial calibration in micrometers per pixel (um/px).
         d_ref_um: Optional reference globule diameter in um. When None/<=0 it is derived
-            from the mean diameter of free matrix fat globules. Only used by
-            ``CONTACT_ANGLE_MODE_REFERENCE``.
+            from the mean diameter of free matrix fat globules. Since v1.8.0 it only sets
+            the thickness of the equatorial rim band used for ``Rim Coverage (%)`` — the
+            contact angle no longer uses a global reference diameter.
         corona_margin_px: Bubble-rim capture band in pixels (already converted from the
             ``👑 Corona Rim Capture Distance (µm)`` slider). 0 disables the band and
             restores the strict centroid-only behaviour.
-        contact_angle_mode: ``CONTACT_ANGLE_MODE_INDIVIDUAL`` (default; corona rim
-            globules only, each with its own D_i) or ``CONTACT_ANGLE_MODE_REFERENCE``
-            (legacy global D_ref for every adsorbed globule). Unknown values fall back to
-            the individual-corona default.
+        contact_angle_mode: Deprecated / ignored. v1.8.0 locks theta to
+            ``CONTACT_ANGLE_MODE_INDIVIDUAL`` (corona rim globules only, each with its own
+            D_i); the argument is kept so older scripts and exports keep running, but it
+            can never re-mix interior crater globules into the contact angle.
         excluded_theta_particle_ids: Object ids the researcher excluded from the theta
             statistics in the ``🔍 Single Bubble Crop Inspector`` (freeze-fracture
             artefacts — globules cleaved off-centre or partially occluded, whose visible
             cross-section is not their true diameter). Such globules stay ``adsorbed_fat``
-            (surface coverage, packed density, adsorbed count) but their theta is dropped
-            from the mean / median / SD and they are flagged in the
+            (interior areal coverage, packed density, adsorbed count) but their theta is
+            dropped from the mean / median / SD and they are flagged in the
             ``excluded_from_theta`` column so the UI can hide their theta label.
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, dict]:
-            1) per-bubble table (one row per bubble that produced a non-empty mask),
+            1) per-bubble table (one row per bubble that produced a non-empty mask) with
+               the interior crater metrics (``Interior Adsorbed Globules``,
+               ``Interior Adsorbed Area (µm²)``, ``Surface Coverage (%)``,
+               ``Packing Density (glob/µm²)``), the corona rim metrics
+               (``Corona Globules``, ``Corona Valid for θ``, ``Rim Coverage (%)``,
+               ``Mean Contact Angle θ (°)``) and the combined ``Total Adsorbed Globules``,
             2) table of every adsorbed globule with its parent bubble, its corona/interior
-               role, ``corona_chord_um``, ``globule_diam_um``, ``contact_angle_deg`` and the
-               ``excluded_from_theta`` flag (True for interior crater globules in the
-               individual-corona mode and for ids passed in
+               role, ``used_for_surface_coverage``, ``corona_chord_um``,
+               ``globule_diam_um``, ``contact_angle_deg`` and the ``excluded_from_theta``
+               flag (True for interior crater globules and for ids passed in
                ``excluded_theta_particle_ids``),
-            3) summary dictionary of overall Pickering metrics, the used d_ref_um and the
-               contact-angle mode/statistics (theta statistics always skip excluded ids).
+            3) summary dictionary of overall Pickering metrics (interior-only areal
+               coverage / packing density, corona-only theta and rim statistics) with the
+               two population counts, the used d_ref_um and the contact-angle mode.
     """
     per_bubble_columns = [
         "Bubble ID",
         "Bubble Diam (µm)",
         "Bubble Area (µm²)",
-        "Adsorbed Count",
-        "Corona Count",
-        "Corona Valid for θ",
-        "Interior Count",
-        "Excluded from θ",
-        "Adsorbed Area (µm²)",
+        # Interior crater globules → 2D areal crater metrics
+        "Interior Adsorbed Globules",
+        "Interior Adsorbed Area (µm²)",
         "Surface Coverage (%)",
-        "Rim Coverage (%)",
         "Packing Density (glob/µm²)",
+        # Corona rim globules → three-phase contact angle + rim coverage
+        "Corona Globules",
+        "Corona Valid for θ",
+        "Excluded from θ",
+        "Rim Coverage (%)",
         "Mean Contact Angle θ (°)",
         "Mean Corona Chord (µm)",
-        "Mean Ads Globule Diam (µm)",
+        "Mean Corona Globule Diam (µm)",
+        # Combined context (never used as an areal or theta denominator)
+        "Total Adsorbed Globules",
     ]
     ads_columns = [
         "id",
         "parent_bubble_id",
         "is_corona_globule",
+        "used_for_surface_coverage",
         "diameter_um",
         "major_axis_um",
         "globule_diam_um",
@@ -2527,10 +2558,11 @@ def compute_interfacial_adsorption_metrics(
         "contact_angle_protrusion_deg",
     ]
 
-    angle_mode = str(contact_angle_mode or CONTACT_ANGLE_MODE_INDIVIDUAL).strip().lower()
-    if angle_mode not in CONTACT_ANGLE_MODES:
-        angle_mode = CONTACT_ANGLE_MODE_INDIVIDUAL
-    individual_angle_mode = angle_mode == CONTACT_ANGLE_MODE_INDIVIDUAL
+    # v1.8.0 — the theta recipe is locked. ``contact_angle_mode`` is still accepted so an
+    # older script/export can call this function unchanged, but the value is ignored: a
+    # global-D_ref recipe would have to mix interior crater globules into the contact
+    # angle, which is exactly what v1.8.0 removes.
+    angle_mode = CONTACT_ANGLE_MODE_INDIVIDUAL
 
     excluded_theta_ids: set = set()
     for raw_excluded in excluded_theta_particle_ids or ():
@@ -2555,21 +2587,26 @@ def compute_interfacial_adsorption_metrics(
     summary = {
         "Selected Bubbles": 0,
         "Total Bubble Area (µm²)": 0.0,
-        "Total Adsorbed Area (µm²)": 0.0,
+        # --- Interior crater globules (areal crater metrics) -------------------
+        "Interior Adsorbed Globules": 0,
+        "Total Interior Adsorbed Area (µm²)": 0.0,
         "Overall Surface Coverage (%)": 0.0,
         "Mean Packing Density (glob/µm²)": 0.0,
+        "Overall Packing Density (glob/µm²)": 0.0,
+        # --- Corona rim globules (three-phase contact angle + rim coverage) ----
+        "Corona Globules": 0,
+        "Corona Globules (Valid for θ)": 0,
+        "Excluded from θ Globules": 0,
+        "Mean Rim Coverage (%)": 0.0,
         "Mean Contact Angle θ (°)": 0.0,
         "Median Contact Angle θ (°)": 0.0,
         "Contact Angle SD (°)": 0.0,
         "Contact Angle Mode": angle_mode,
-        "Total Adsorbed Globules": 0,
-        "Corona Globules": 0,
-        "Corona Globules (Valid for θ)": 0,
-        "Excluded from θ Globules": 0,
-        "Interior Adsorbed Globules": 0,
-        "Corona Globule Fraction (%)": 0.0,
         "Mean Corona Chord (µm)": 0.0,
         "Mean Corona Globule Diam (µm)": 0.0,
+        # --- Combined context --------------------------------------------------
+        "Total Adsorbed Globules": 0,
+        "Corona Globule Fraction (%)": 0.0,
         "Mean Bubble Perimeter (µm)": 0.0,
         "d_ref_um": float(d_ref) if d_ref is not None else 0.0,
     }
@@ -2789,13 +2826,16 @@ def compute_interfacial_adsorption_metrics(
         # Segmentation gap still accepted as interfacial contact (px).
         contact_reach_px = max(1, min(corona_px, _CONTACT_REACH_MAX_PX))
 
-        # 4) Union of adsorbed particle masks clipped by the bubble mask, plus the
-        #    per-globule contact geometry used by the three-phase contact angle.
-        ads_union_mask = np.zeros(shape, dtype=np.uint8)
-        row_area_sum_um2 = 0.0
+        # 4) Globule-level geometry, collected per population because the two roles feed
+        #    two different surfaces of the freeze-fractured bubble:
+        #      interior globules → areal Surface Coverage / Packing Density,
+        #      corona rim globules → three-phase contact angle + Rim Coverage.
         angles: list[float] = []
-        auto_ids: list[int] = []
-        manual_ids: list[int] = []
+        interior_auto_ids: list[int] = []
+        interior_manual_ids: list[int] = []
+        corona_auto_ids: list[int] = []
+        corona_manual_ids: list[int] = []
+        interior_row_area_um2 = 0.0
         corona_count = 0
         corona_valid_for_theta = 0
         excluded_from_theta_count = 0
@@ -2803,11 +2843,6 @@ def compute_interfacial_adsorption_metrics(
         corona_diams_um: list[float] = []
         for particle in inside:
             p_id = int(particle["id"])
-            if p_id >= 10000:
-                manual_ids.append(p_id)
-            else:
-                auto_ids.append(p_id)
-            row_area_sum_um2 += float(particle["area_um2"])
 
             # --- Individual (own-mask) globule geometry ------------------------
             # A corona globule is cut by the interface, so its own major axis IS its
@@ -2889,41 +2924,37 @@ def compute_interfacial_adsorption_metrics(
                 corona_count += 1
                 corona_chords_um.append(chord_um)
                 corona_diams_um.append(globule_diam_um)
+                (corona_manual_ids if p_id >= 10000 else corona_auto_ids).append(p_id)
+            else:
+                (interior_manual_ids if p_id >= 10000 else interior_auto_ids).append(p_id)
+                interior_row_area_um2 += float(particle["area_um2"])
 
             protrusion_angle, _ = _contact_angle_from_protrusion(
                 centre_to_rim_px, radius_px
             )
 
-            if individual_angle_mode:
-                if is_corona:
-                    theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
-                    protrusion_ratio = (
-                        float(min(chord_um / globule_diam_um, 1.0))
-                        if globule_diam_um > 0
-                        else float("nan")
-                    )
-                    reported_chord_um = chord_um
-                    protrusion_angle_out = protrusion_angle
-                    excluded_from_theta = p_id in excluded_theta_ids
-                else:
-                    # Interior crater globule: only a 2D cap projection is visible,
-                    # so neither a true diameter nor a contact angle exists.
-                    theta_deg = float("nan")
-                    protrusion_ratio = float("nan")
-                    reported_chord_um = float("nan")
-                    protrusion_angle_out = float("nan")
-                    # Interior globules are never valid for theta by construction.
-                    excluded_from_theta = True
-            else:
-                # Legacy v1.7.8 recipe: one global D_ref for every adsorbed globule.
-                l_c = major_axis_val if major_axis_val > 0 else diameter_val
-                protrusion_ratio = float(l_c) / d_ref
-                theta_deg = float(
-                    np.degrees(np.arcsin(np.clip(protrusion_ratio, 0.0, 1.0)))
+            if is_corona:
+                # Corona rim globule: its own cross-section at the interface gives
+                # theta_i = arcsin(L_c,i / D_i) with D_i its own measured diameter.
+                theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
+                protrusion_ratio = (
+                    float(min(chord_um / globule_diam_um, 1.0))
+                    if globule_diam_um > 0
+                    else float("nan")
                 )
                 reported_chord_um = chord_um
-                protrusion_angle_out = protrusion_angle if is_corona else float("nan")
+                protrusion_angle_out = protrusion_angle
                 excluded_from_theta = p_id in excluded_theta_ids
+            else:
+                # Interior crater globule: only a 2D cap projection is visible, so
+                # neither a true diameter nor a contact angle exists. It still counts
+                # for the areal Surface Coverage / Packing Density of the crater floor.
+                theta_deg = float("nan")
+                protrusion_ratio = float("nan")
+                reported_chord_um = float("nan")
+                protrusion_angle_out = float("nan")
+                # Interior globules are never valid for theta by construction.
+                excluded_from_theta = True
 
             if np.isfinite(theta_deg) and not excluded_from_theta:
                 angles.append(float(theta_deg))
@@ -2935,6 +2966,9 @@ def compute_interfacial_adsorption_metrics(
                 "id": p_id,
                 "parent_bubble_id": b_id,
                 "is_corona_globule": is_corona,
+                # Explicit role split: only interior crater globules are inside the
+                # areal Surface Coverage / Packing Density numerators.
+                "used_for_surface_coverage": not is_corona,
                 "diameter_um": diameter_val,
                 "major_axis_um": major_axis_val if major_axis_val > 0 else float("nan"),
                 "globule_diam_um": globule_diam_um,
@@ -2952,43 +2986,65 @@ def compute_interfacial_adsorption_metrics(
                 "contact_angle_protrusion_deg": float(protrusion_angle_out),
             })
 
-        # Automatic globules: vectorized label union restricted to the bubble bbox
+        # 5) Separate union masks, each clipped by the bubble interior mask Ω_b
+        #    (``b_mask``). A corona globule straddles the fractured rim, so clipping its
+        #    mask to Ω_b can never turn it into crater area — and it is excluded from the
+        #    interior union altogether.
         crop_y0, crop_y1 = by0, by1 + 1
         crop_x0, crop_x1 = bx0, bx1 + 1
         bubble_crop = b_mask[crop_y0:crop_y1, crop_x0:crop_x1] > 0
-        if auto_ids:
-            for source in (fat_masks, air_masks):
-                if not isinstance(source, np.ndarray) or source.ndim < 2:
-                    continue
-                src = source.squeeze() if source.ndim == 3 else source
-                if src.shape[:2] != shape:
-                    continue
-                region = src[crop_y0:crop_y1, crop_x0:crop_x1]
-                union_crop = np.isin(region, auto_ids) & bubble_crop
-                ads_union_mask[crop_y0:crop_y1, crop_x0:crop_x1] |= union_crop.astype(
-                    np.uint8
+
+        def _accumulate_union(
+            target: np.ndarray,
+            auto_id_list: list[int],
+            manual_id_list: list[int],
+        ) -> None:
+            """Rasterize one globule population into ``target``, clipped by Ω_b."""
+            if auto_id_list:
+                # Vectorized label union restricted to the bubble bbox.
+                for source in (fat_masks, air_masks):
+                    if not isinstance(source, np.ndarray) or source.ndim < 2:
+                        continue
+                    src = source.squeeze() if source.ndim == 3 else source
+                    if src.shape[:2] != shape:
+                        continue
+                    region = src[crop_y0:crop_y1, crop_x0:crop_x1]
+                    union_crop = np.isin(region, auto_id_list) & bubble_crop
+                    target[crop_y0:crop_y1, crop_x0:crop_x1] |= union_crop.astype(
+                        np.uint8
+                    )
+            for p_id in manual_id_list:
+                # Manual globules: rasterize their contour directly.
+                p_mask = _object_binary_mask(
+                    p_id, shape, manual_polygons, fat_masks, air_masks
                 )
+                if np.any(p_mask):
+                    target |= (p_mask & b_mask)
 
-        # Manual globules: rasterize their contour directly
-        for p_id in manual_ids:
-            p_mask = _object_binary_mask(
-                p_id, shape, manual_polygons, fat_masks, air_masks
-            )
-            if np.any(p_mask):
-                ads_union_mask |= (p_mask & b_mask)
+        interior_union_mask = np.zeros(shape, dtype=np.uint8)
+        corona_union_mask = np.zeros(shape, dtype=np.uint8)
+        _accumulate_union(
+            interior_union_mask, interior_auto_ids, interior_manual_ids
+        )
+        _accumulate_union(corona_union_mask, corona_auto_ids, corona_manual_ids)
 
-        # 5) Pickering stabilization metrics for this bubble
-        union_px = float(np.count_nonzero(ads_union_mask))
-        adsorbed_area_um2 = (
-            union_px * pixel_area_um2 if union_px > 0 else row_area_sum_um2
+        # 6) Interior crater metrics — INTERIOR globules only. Corona rim globules sit on
+        #    the equatorial perimeter cross-section, so they are never part of the crater
+        #    areal coverage or the areal packing density.
+        interior_count = len(inside) - corona_count
+        interior_px = float(np.count_nonzero(interior_union_mask))
+        interior_area_um2 = (
+            interior_px * pixel_area_um2 if interior_px > 0 else interior_row_area_um2
         )
         surface_coverage_pct = min(
             100.0,
-            (adsorbed_area_um2 / max(bubble_area_um2, 1e-6)) * 100.0,
+            (interior_area_um2 / max(bubble_area_um2, 1e-6)) * 100.0,
         )
-        packing_density = len(inside) / max(bubble_area_um2, 1e-6)
+        packing_density = interior_count / max(bubble_area_um2, 1e-6)
 
-        # Perimeter ring of thickness max(3, d_ref) px measured inwards from the edge
+        # Perimeter ring of thickness max(3, d_ref) px measured inwards from the edge.
+        # Rim Coverage (%) is measured on the CORONA union only: the equatorial rim band is
+        # exactly the fractured cross-section those globules sit on.
         rim_thickness_px = max(3, int(round(d_ref / max(ratio, 1e-6))))
         rim_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -3001,7 +3057,7 @@ def compute_interfacial_adsorption_metrics(
         rim_px = float(np.count_nonzero(rim_mask))
         rim_coverage_pct = min(
             100.0,
-            float(np.count_nonzero(rim_mask & (ads_union_mask > 0)))
+            float(np.count_nonzero(rim_mask & (corona_union_mask > 0)))
             / max(rim_px, 1e-6)
             * 100.0,
         )
@@ -3010,38 +3066,43 @@ def compute_interfacial_adsorption_metrics(
         mean_corona_chord = (
             float(np.mean(corona_chords_um)) if corona_chords_um else float("nan")
         )
-        mean_globule_diam = (
-            float(np.mean([p["diameter_um"] for p in inside])) if inside else 0.0
+        mean_corona_diam = (
+            float(np.mean(corona_diams_um)) if corona_diams_um else float("nan")
         )
 
         per_bubble_rows.append({
             "Bubble ID": b_id,
             "Bubble Diam (µm)": bubble_diam_um,
             "Bubble Area (µm²)": bubble_area_um2,
-            "Adsorbed Count": len(inside),
-            "Corona Count": corona_count,
-            "Corona Valid for θ": corona_valid_for_theta,
-            "Interior Count": len(inside) - corona_count,
-            "Excluded from θ": excluded_from_theta_count,
-            "Adsorbed Area (µm²)": adsorbed_area_um2,
+            # Interior crater globules → 2D areal crater metrics
+            "Interior Adsorbed Globules": interior_count,
+            "Interior Adsorbed Area (µm²)": interior_area_um2,
             "Surface Coverage (%)": surface_coverage_pct,
-            "Rim Coverage (%)": rim_coverage_pct,
             "Packing Density (glob/µm²)": packing_density,
+            # Corona rim globules → three-phase contact angle + rim coverage
+            "Corona Globules": corona_count,
+            "Corona Valid for θ": corona_valid_for_theta,
+            "Excluded from θ": excluded_from_theta_count,
+            "Rim Coverage (%)": rim_coverage_pct,
             "Mean Contact Angle θ (°)": mean_theta,
             "Mean Corona Chord (µm)": mean_corona_chord,
-            "Mean Ads Globule Diam (µm)": mean_globule_diam,
+            "Mean Corona Globule Diam (µm)": mean_corona_diam,
+            # Combined context only
+            "Total Adsorbed Globules": len(inside),
         })
 
     per_bubble_df = pd.DataFrame(per_bubble_rows, columns=per_bubble_columns)
     ads_particles_df = pd.DataFrame(ads_rows, columns=ads_columns)
 
     total_bubble_area = float(per_bubble_df["Bubble Area (µm²)"].sum())
-    total_ads_area = float(per_bubble_df["Adsorbed Area (µm²)"].sum())
-    total_ads_count = int(per_bubble_df["Adsorbed Count"].sum())
+    total_interior_area = float(per_bubble_df["Interior Adsorbed Area (µm²)"].sum())
+    total_interior_count = int(per_bubble_df["Interior Adsorbed Globules"].sum())
+    total_ads_count = int(per_bubble_df["Total Adsorbed Globules"].sum())
 
-    # Contact-angle statistics. Interior crater globules carry contact_angle_deg = NaN
-    # in the individual-corona mode, and globules the researcher excluded in the crop
-    # inspector are flagged in excluded_from_theta, so both stay out of every statistic.
+    # Contact-angle statistics. Only corona rim globules can carry a finite theta, and
+    # globules the researcher excluded in the crop inspector are flagged in
+    # excluded_from_theta, so both interior globules (NaN) and exclusions stay out of
+    # every theta statistic.
     theta_all = pd.to_numeric(
         ads_particles_df.get("contact_angle_deg", pd.Series(dtype=float)),
         errors="coerce",
@@ -3082,15 +3143,30 @@ def compute_interfacial_adsorption_metrics(
     summary.update({
         "Selected Bubbles": int(len(per_bubble_df)),
         "Total Bubble Area (µm²)": round(total_bubble_area, 3),
-        "Total Adsorbed Area (µm²)": round(total_ads_area, 3),
+        # --- Interior crater globules (areal crater metrics) -------------------
+        "Interior Adsorbed Globules": int(total_interior_count),
+        "Total Interior Adsorbed Area (µm²)": round(total_interior_area, 3),
         "Overall Surface Coverage (%)": round(
-            min(100.0, total_ads_area / max(total_bubble_area, 1e-6) * 100.0), 3
+            min(100.0, total_interior_area / max(total_bubble_area, 1e-6) * 100.0), 3
         ),
         "Mean Packing Density (glob/µm²)": round(
             float(per_bubble_df["Packing Density (glob/µm²)"].mean())
             if not per_bubble_df.empty
             else 0.0,
             4,
+        ),
+        "Overall Packing Density (glob/µm²)": round(
+            total_interior_count / max(total_bubble_area, 1e-6), 4
+        ),
+        # --- Corona rim globules (three-phase contact angle + rim coverage) ----
+        "Corona Globules": corona_count_total,
+        "Corona Globules (Valid for θ)": int(theta_values.size),
+        "Excluded from θ Globules": excluded_theta_total,
+        "Mean Rim Coverage (%)": round(
+            float(per_bubble_df["Rim Coverage (%)"].mean())
+            if not per_bubble_df.empty
+            else 0.0,
+            3,
         ),
         "Mean Contact Angle θ (°)": (
             round(float(theta_values.mean()), 3) if theta_values.size else 0.0
@@ -3104,16 +3180,6 @@ def compute_interfacial_adsorption_metrics(
             else 0.0
         ),
         "Contact Angle Mode": angle_mode,
-        "Total Adsorbed Globules": total_ads_count,
-        "Corona Globules": corona_count_total,
-        "Corona Globules (Valid for θ)": int(theta_values.size),
-        "Excluded from θ Globules": excluded_theta_total,
-        "Interior Adsorbed Globules": int(total_ads_count - corona_count_total),
-        "Corona Globule Fraction (%)": (
-            round(100.0 * corona_count_total / max(total_ads_count, 1), 2)
-            if total_ads_count
-            else 0.0
-        ),
         "Mean Corona Chord (µm)": (
             round(float(corona_chord_values.mean()), 4)
             if corona_chord_values.size
@@ -3122,6 +3188,13 @@ def compute_interfacial_adsorption_metrics(
         "Mean Corona Globule Diam (µm)": (
             round(float(corona_diam_values.mean()), 4)
             if corona_diam_values.size
+            else 0.0
+        ),
+        # --- Combined context --------------------------------------------------
+        "Total Adsorbed Globules": total_ads_count,
+        "Corona Globule Fraction (%)": (
+            round(100.0 * corona_count_total / max(total_ads_count, 1), 2)
+            if total_ads_count
             else 0.0
         ),
         "Mean Bubble Perimeter (µm)": round(

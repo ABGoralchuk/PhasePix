@@ -30,6 +30,27 @@ PALETTE_COLORS = {
 # micrographs with different particle counts.
 DEFAULT_HIST_BINS = 15
 
+# ---- Interfacial inspection role filter (v1.8.0) --------------------------------
+# A cryo-SEM freeze-fractured bubble carries two physically different globule
+# populations on two different surfaces, so the inspection overlay can be restricted
+# to one of them:
+#   interior crater globules (is_corona_globule == False) -> Surface Coverage (%)
+#   equatorial corona globules (is_corona_globule == True) -> contact angle theta + Rim Coverage
+GLOBULE_ROLE_ALL = "all"
+GLOBULE_ROLE_INTERIOR = "interior"
+GLOBULE_ROLE_CORONA = "corona"
+GLOBULE_ROLE_FILTERS = (
+    GLOBULE_ROLE_ALL,
+    GLOBULE_ROLE_INTERIOR,
+    GLOBULE_ROLE_CORONA,
+)
+
+
+def normalize_globule_role(globule_role: Optional[str]) -> str:
+    """Return a valid ``GLOBULE_ROLE_*`` filter value (unknown -> ``all``)."""
+    role = str(globule_role or GLOBULE_ROLE_ALL).strip().lower()
+    return role if role in GLOBULE_ROLE_FILTERS else GLOBULE_ROLE_ALL
+
 
 def classify_by_size(
     df: pd.DataFrame,
@@ -1030,6 +1051,8 @@ def render_selected_bubbles_inspection_overlay(
     show_labels: bool = True,
     corona_margin_px: int = 0,
     show_particle_ids: bool = False,
+    globule_role: str = GLOBULE_ROLE_ALL,
+    show_globule_ids: bool = False,
 ) -> np.ndarray:
     """
     Build a QA inspection overlay for the user-selected bubbles and their adsorbed fat.
@@ -1048,23 +1071,34 @@ def render_selected_bubbles_inspection_overlay(
         fat_masks: Optional labeled fat/particle mask (0 = background).
         manual_polygons: Optional manual contour dicts ({'id': int, 'points': (N, 2)}).
         ads_particles_df: Optional output of compute_interfacial_adsorption_metrics
-            containing 'id', 'parent_bubble_id' and 'contact_angle_deg'.
-        show_contact_angles: Annotate adsorbed globules with theta when
+            containing 'id', 'parent_bubble_id', 'is_corona_globule' and
+            'contact_angle_deg'.
+        show_contact_angles: Annotate corona globules with theta when
             ads_particles_df is supplied (defaults to True).
-        show_labels: Master switch for every text annotation (theta values and
-            bubble IDs). Set to False for a label-free close-up that shows only the
-            cyan bubble boundary and the gold adsorbed-fat masks, so the adsorption
-            corona can be inspected without text clutter.
+        show_labels: Master switch for every text annotation (theta values,
+            particle IDs and bubble IDs). Set to False for a label-free close-up that
+            shows only the cyan bubble boundary and the gold adsorbed-fat masks, so
+            the adsorption corona can be inspected without text clutter.
         corona_margin_px: Width in pixels of the corona rim band. When > 0 the gold
             adsorbed-fat layer is allowed to extend that far beyond the bubble
             contour, so Pickering globules straddling the interface are drawn in
-            full instead of being clipped at the rim (0 keeps the strict clipping).
-        show_particle_ids: Annotate each globule as ``#<id>: <theta>`` instead of the
-            bare ``<theta>`` so the label on the crop can be matched to a row of the
-            ``Exclude from θ`` data editor. Globules flagged
+            full instead of being clipped at the rim (0 keeps the strict clipping,
+            which is what the areal Surface Coverage definition uses).
+        show_particle_ids: Annotate each corona globule as ``#<id>: <theta>`` instead
+            of the bare ``<theta>`` so the label on the crop can be matched to a row of
+            the ``Exclude from θ`` data editor. Globules flagged
             ``excluded_from_theta`` in ``ads_particles_df`` (freeze-fracture artefacts
-            the researcher removed, or interior crater globules without a valid theta)
-            keep their label but it is drawn in dim grey.
+            the researcher removed) keep their label but it is drawn in dim grey.
+        globule_role: Which globule population is rendered and annotated —
+            ``GLOBULE_ROLE_ALL`` (default, historic behaviour: interior + corona),
+            ``GLOBULE_ROLE_INTERIOR`` (Surface Coverage mode: only
+            ``is_corona_globule == False`` globules on the crater floor, no theta
+            labels) or ``GLOBULE_ROLE_CORONA`` (Contact Angle mode: only
+            ``is_corona_globule == True`` globules on the equatorial rim). Unknown
+            values fall back to ``GLOBULE_ROLE_ALL``.
+        show_globule_ids: Print the bare particle ID of every rendered globule. Used by
+            the Surface Coverage inspection mode, where interior crater globules carry
+            no theta but must stay identifiable on the overlay/crop.
 
     Returns:
         np.ndarray: RGB uint8 inspection overlay.
@@ -1124,6 +1158,36 @@ def render_selected_bubbles_inspection_overlay(
             except (TypeError, ValueError):
                 continue
 
+    # Role filter (v1.8.0): the overlay can be restricted to ONE globule population.
+    # Interior crater globules define the areal Surface Coverage and corona rim globules
+    # define theta + Rim Coverage, so mixing them on one overlay hides the structure the
+    # researcher actually wants to verify. ``role_filter_ids`` is None when no filter is
+    # requested (or when the role column is unavailable, e.g. legacy callers).
+    role_filter = normalize_globule_role(globule_role)
+    role_filter_ids: Optional[set] = None
+    if (
+        role_filter != GLOBULE_ROLE_ALL
+        and isinstance(ads_particles_df, pd.DataFrame)
+        and not ads_particles_df.empty
+        and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+    ):
+        want_corona = role_filter == GLOBULE_ROLE_CORONA
+        corona_flags = (
+            ads_particles_df["is_corona_globule"].fillna(False).astype(bool).to_numpy()
+        )
+        role_particle_ids = (
+            pd.to_numeric(ads_particles_df["id"], errors="coerce")
+            .fillna(-1)
+            .astype(int)
+            .to_numpy()
+        )
+        role_filter_ids = {
+            int(particle_id)
+            for particle_id, is_corona in zip(role_particle_ids, corona_flags)
+            if bool(is_corona) == want_corona
+        }
+        ads_ids &= role_filter_ids
+
     # Build the adsorbed-fat mask (auto labels + manual polygons) inside selected bubbles.
     # fat_masks is authoritative; air_masks is only consulted for ids absent from it, so
     # colliding numeric labels in the two stacks cannot flood a whole bubble.
@@ -1177,10 +1241,12 @@ def render_selected_bubbles_inspection_overlay(
         )
         cv2.drawContours(rgb, bubble_cnts, -1, (0, 210, 255), 2, lineType=cv2.LINE_AA)
 
-    # Compact contact-angle annotations next to each adsorbed globule centroid
+    # Role-aware globule annotations. Only the globules the role filter actually draws
+    # are annotated, so a Surface Coverage overlay never shows a theta and a Contact
+    # Angle overlay never labels an interior crater globule.
     if (
         show_labels
-        and show_contact_angles
+        and (show_contact_angles or show_globule_ids)
         and isinstance(ads_particles_df, pd.DataFrame)
         and not ads_particles_df.empty
         and "id" in ads_particles_df.columns
@@ -1211,6 +1277,10 @@ def render_selected_bubbles_inspection_overlay(
             except (TypeError, ValueError):
                 continue
 
+            # Never annotate a globule that the active role filter hides.
+            if role_filter_ids is not None and particle_id not in role_filter_ids:
+                continue
+
             parent_id = row.get("parent_bubble_id")
             if pd.notna(parent_id):
                 try:
@@ -1237,24 +1307,37 @@ def render_selected_bubbles_inspection_overlay(
             if not ads_region_bool[int(round(cy)), int(round(cx))]:
                 continue
 
-            theta_val = row.get("contact_angle_deg")
-            try:
-                theta = float(theta_val)
-            except (TypeError, ValueError):
-                theta = float("nan")
+            is_corona_flag = row.get("is_corona_globule", False)
+            is_corona = bool(is_corona_flag) if pd.notna(is_corona_flag) else False
             excluded_val = row.get("excluded_from_theta", False)
             excluded = bool(excluded_val) if pd.notna(excluded_val) else False
 
-            if np.isfinite(theta):
-                text = (
-                    f"#{particle_id}: {theta:.0f}°"
-                    if show_particle_ids
-                    else f"{theta:.0f}°"
-                )
-                # Excluded-from-theta globules keep their label for traceability but
-                # are drawn in dim grey so they cannot be mistaken for a valid theta.
-                text_color = (150, 150, 150) if excluded else (255, 255, 255)
+            if is_corona:
+                # Corona rim globule: theta (optionally prefixed with its ID).
+                if not show_contact_angles:
+                    continue
+                theta_val = row.get("contact_angle_deg")
+                try:
+                    theta = float(theta_val)
+                except (TypeError, ValueError):
+                    theta = float("nan")
+                if np.isfinite(theta):
+                    text = (
+                        f"#{particle_id}: {theta:.0f}°"
+                        if show_particle_ids
+                        else f"{theta:.0f}°"
+                    )
+                    # Excluded-from-theta globules keep their label for traceability but
+                    # are drawn in dim grey so they cannot be mistaken for a valid theta.
+                    text_color = (150, 150, 150) if excluded else (255, 255, 255)
+                else:
+                    text = str(particle_id)
+                    text_color = (255, 255, 255)
             else:
+                # Interior crater globule: it never carries a theta, so only its bare
+                # particle ID can be printed (Surface Coverage inspection mode).
+                if not (show_globule_ids or show_contact_angles):
+                    continue
                 text = str(particle_id)
                 text_color = (255, 255, 255)
 
