@@ -2293,6 +2293,234 @@ def _masks_within_dilation(crop_a: dict, crop_b: dict, dilation_px: int) -> bool
     return bool(np.any((canvas_a > 0) & (canvas_b > 0)))
 
 
+# ---------------------------------------------------------------------------
+# Corona globule completion (v1.8.5)
+# ---------------------------------------------------------------------------
+# A Pickering corona globule straddles the freeze-fractured bubble rim, so the fat
+# segmenter frequently captures only the bright protruding cap of the particle: the
+# buried half sits in the shadow of the evacuated crater and is not segmented. The
+# result is a CRESCENT whose colour highlight covers only part of a globule that is
+# clearly a full circle in the micrograph.
+#
+# Such a mask is a *circular segment*: its boundary is one arc of the true globule
+# circle (radius R) closed by the straight interface cut. ``complete_circular_globule_mask``
+# fits that arc with an algebraic (Kasa) least-squares circle and rebuilds the FULL
+# disc, but only when the evidence is unambiguous:
+#
+#   * the visible area is 22-90 % of the fitted disc (a cap, not the whole globule),
+#   * at least 38 % of the boundary points lie on the fitted circle (an arc, not a blob),
+#   * that arc follows the circle to within 11.5 % of R (a real circle, not a strip),
+#   * the fitted radius does not exceed 1.15 x the mask's largest extent (rejects long,
+#     gently-curved rim-wall strips, whose fitted circle is far bigger than the strip).
+#
+# A rim-wall shard (thin curved annulus) has a tiny fill ratio AND a huge fitted radius,
+# so it can never be "completed" into a false globule. The completion is a strict
+# superset of the visible mask and is used for the corona geometry (D_i, L_c,i), for
+# the compactness gates and for every overlay, so the rim-shard rejection keeps working
+# on the completed, physically meaningful particle instead of on a crescent.
+_CIRCLE_FIT_MIN_AREA_PX = 24
+_CIRCLE_FIT_MIN_ARC_FRACTION = 0.38
+_CIRCLE_FIT_MAX_RESIDUAL = 0.115
+_CIRCLE_FIT_MIN_FILL = 0.22
+_CIRCLE_FIT_MAX_FILL = 0.90
+_CIRCLE_FIT_MAX_RADIUS_TO_EXTENT = 1.15
+_CIRCLE_FIT_MIN_ARC_SPAN_DEG = 70.0
+_CIRCLE_FIT_ARC_TOLERANCE = 0.09
+
+
+def _fit_circle_least_squares(
+    points: np.ndarray,
+) -> Optional[Tuple[float, float, float]]:
+    """Algebraic (Kasa) least-squares circle fit of a 2D point cloud.
+
+    Args:
+        points: ``(N, 2)`` array of ``(x, y)`` boundary points.
+
+    Returns:
+        Optional[Tuple[float, float, float]]: ``(cx, cy, radius)`` or ``None`` when the
+        fit is degenerate (collinear points, fewer than three samples).
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] < 3 or not np.all(np.isfinite(pts)):
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    design = np.column_stack([x, y, np.ones_like(x)])
+    rhs = x * x + y * y
+    try:
+        solution, *_ = np.linalg.lstsq(design, rhs, rcond=None)
+    except Exception:
+        return None
+    cx = float(solution[0]) / 2.0
+    cy = float(solution[1]) / 2.0
+    radius_sq = float(solution[2]) + cx * cx + cy * cy
+    if not np.isfinite(radius_sq) or radius_sq <= 0.0:
+        return None
+    return cx, cy, float(math.sqrt(radius_sq))
+
+
+def complete_circular_globule_mask(
+    local_mask: Optional[np.ndarray],
+    x0: int = 0,
+    y0: int = 0,
+    shape: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[np.ndarray, int, int, float]]:
+    """Rebuild the full disc of a globule whose mask is only a visible circular cap.
+
+    A cryo-SEM freeze-fracture usually exposes a rim globule as a full circle in the
+    micrograph while the fat segmenter only captures its bright protruding crescent
+    (the buried part lies in the shadow of the crater). The crescent is a *circular
+    segment*: an arc of the true globule circle closed by the straight interface cut.
+    This helper fits that arc and returns the complete circular particle, so the
+    particle is identified, measured and painted as one whole globule instead of a
+    half-moon.
+
+    Args:
+        local_mask: Single-globule binary mask (any non-zero dtype) cropped to its bbox.
+        x0: Global x offset of the crop origin.
+        y0: Global y offset of the crop origin.
+        shape: Optional full-image ``(height, width)`` used to clip the completed disc.
+
+    Returns:
+        Optional[Tuple[np.ndarray, int, int, float]]:
+        ``(completed_mask, new_x0, new_y0, radius_px)``, or ``None`` when the mask is
+        already a complete globule or cannot be fitted confidently. The returned array is
+        a strict superset of ``local_mask``.
+    """
+    if local_mask is None:
+        return None
+    binary = (np.asarray(local_mask) > 0).astype(np.uint8)
+    if binary.ndim != 2 or int(np.count_nonzero(binary)) < _CIRCLE_FIT_MIN_AREA_PX:
+        return None
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    main = max(contours, key=cv2.contourArea)
+    if len(main) < 8:
+        return None
+    pts = np.asarray(main, dtype=np.float64).reshape(-1, 2)
+    fit = _fit_circle_least_squares(pts)
+    if fit is None:
+        return None
+    # A crescent's straight interface cut pulls a raw least-squares fit towards the
+    # chord (the fitted circle shrinks), so the fit is refined iteratively on the
+    # boundary points that actually lie ON the unknown globule circle.
+    for _ in range(4):
+        cx, cy, radius = fit
+        if not np.isfinite(radius) or radius <= 0.5:
+            return None
+        radii = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+        on_arc = radii >= radius * (1.0 - _CIRCLE_FIT_ARC_TOLERANCE)
+        if np.count_nonzero(on_arc) < 8:
+            break
+        refined = _fit_circle_least_squares(pts[on_arc])
+        if refined is None:
+            break
+        if abs(refined[2] - radius) < 1e-3 and abs(refined[0] - cx) < 1e-3:
+            fit = refined
+            break
+        fit = refined
+    cx, cy, radius = fit
+    if not np.isfinite(radius) or radius <= 0.5:
+        return None
+
+    area_px = float(cv2.contourArea(main))
+    disc_area = float(math.pi * radius * radius)
+    if disc_area <= 0.0:
+        return None
+    fill = area_px / disc_area
+    if not (_CIRCLE_FIT_MIN_FILL <= fill <= _CIRCLE_FIT_MAX_FILL):
+        # Already a full disc (fill >= 0.90) or far too small to be a cap.
+        return None
+
+    radii = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+    on_arc = radii >= radius * (1.0 - _CIRCLE_FIT_ARC_TOLERANCE)
+    arc_points = int(np.count_nonzero(on_arc))
+    if arc_points < 8:
+        return None
+    arc_fraction = float(arc_points) / float(pts.shape[0])
+    if arc_fraction < _CIRCLE_FIT_MIN_ARC_FRACTION:
+        return None
+    residual = float(np.mean(np.abs(radii[on_arc] - radius))) / radius
+    if residual > _CIRCLE_FIT_MAX_RESIDUAL:
+        return None
+
+    # The arc points must form ONE contiguous run along the contour: a circular cap has
+    # a single arc closed by the straight interface cut, while a rectangle or a shard
+    # only touches its fitted circle in a few isolated corners.
+    run_flags = on_arc.astype(np.int8)
+    doubled = np.concatenate([run_flags, run_flags])
+    edges = np.diff(np.concatenate(([0], doubled, [0])))
+    run_starts = np.flatnonzero(edges == 1)
+    run_ends = np.flatnonzero(edges == -1)
+    if run_starts.size == 0:
+        return None
+    longest_run = min(int(pts.shape[0]), int((run_ends - run_starts).max()))
+    if float(longest_run) / float(pts.shape[0]) < _CIRCLE_FIT_MIN_ARC_FRACTION:
+        return None
+
+    # The visible cap must span a contiguous arc: a circular cap of >= 70 deg is a
+    # globule; a handful of scattered arc pixels is noise.
+    angles = np.degrees(np.arctan2(pts[on_arc, 1] - cy, pts[on_arc, 0] - cx))
+    angles.sort()
+    if angles.size >= 3:
+        gaps = np.diff(np.concatenate([angles, angles[:1] + 360.0]))
+        if float(360.0 - gaps.max()) < _CIRCLE_FIT_MIN_ARC_SPAN_DEG:
+            return None
+
+    # A long, gently curved rim strip fits a huge circle: its radius dwarfs the strip.
+    mask_h, mask_w = binary.shape[:2]
+    extent = float(max(mask_w, mask_h))
+    if extent <= 0.0 or radius > _CIRCLE_FIT_MAX_RADIUS_TO_EXTENT * extent:
+        return None
+
+    # The least-squares radius follows the pixel centres and can under-estimate a
+    # discretised arc by a pixel; the median arc radius re-centres the rebuilt disc on
+    # the visible outer edge so no uncoloured rim of the real particle is left over.
+    render_radius = float(max(radius, float(np.median(radii[on_arc]))))
+
+    # Rasterize the full disc in a canvas that contains both the disc and the crop.
+    # ``(cx, cy)`` live in LOCAL crop coordinates, so the canvas is built in GLOBAL
+    # image coordinates before it is clipped to ``shape``.
+    global_cx = cx + float(x0)
+    global_cy = cy + float(y0)
+    canvas_x0 = int(math.floor(global_cx - render_radius)) - 1
+    canvas_y0 = int(math.floor(global_cy - render_radius)) - 1
+    canvas_x1 = int(math.ceil(global_cx + render_radius)) + 2
+    canvas_y1 = int(math.ceil(global_cy + render_radius)) + 2
+    if shape is not None and len(shape) >= 2:
+        height, width = int(shape[0]), int(shape[1])
+        canvas_x0 = max(0, canvas_x0)
+        canvas_y0 = max(0, canvas_y0)
+        canvas_x1 = min(width, canvas_x1)
+        canvas_y1 = min(height, canvas_y1)
+    if canvas_x1 - canvas_x0 <= 0 or canvas_y1 - canvas_y0 <= 0:
+        return None
+
+    completed = np.zeros((canvas_y1 - canvas_y0, canvas_x1 - canvas_x0), dtype=np.uint8)
+    cv2.circle(
+        completed,
+        (int(round(global_cx - canvas_x0)), int(round(global_cy - canvas_y0))),
+        int(round(render_radius)),
+        1,
+        -1,
+        lineType=cv2.LINE_8,
+    )
+    # Union with the original crop so the result can never lose visible pixels.
+    paste_x = int(x0) - canvas_x0
+    paste_y = int(y0) - canvas_y0
+    src_x0 = max(0, -paste_x)
+    src_y0 = max(0, -paste_y)
+    src_x1 = min(binary.shape[1], completed.shape[1] - paste_x)
+    src_y1 = min(binary.shape[0], completed.shape[0] - paste_y)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        completed[
+            paste_y + src_y0:paste_y + src_y1,
+            paste_x + src_x0:paste_x + src_x1,
+        ] |= binary[src_y0:src_y1, src_x0:src_x1]
+    return completed, int(canvas_x0), int(canvas_y0), float(render_radius)
+
+
 def _globule_local_mask(
     particle_id: int,
     shape: Tuple[int, int],
@@ -2929,16 +3157,40 @@ def compute_interfacial_adsorption_metrics(
         band_max_label = int(fat_area_lut.size) - 1 if fat_area_lut is not None else 0
 
         inside: list[dict] = []
+        # Capture reach (px) accepted for an EXPLICIT ``corona_fat`` assignment: the
+        # researcher already decided that this particle sits on the rim, so it may lie
+        # on the interface with a small segmentation gap instead of overlapping the
+        # dilated band. Without this, manually added rim globules that do not touch the
+        # segmented bubble contour were silently dropped from every interfacial metric
+        # and from the inspection overlays.
+        manual_reach_px = max(
+            float(corona_px),
+            float(_CONTACT_REACH_MAX_PX),
+        )
         for particle in particles:
             if particle["id"] == b_id:
                 continue
             ix = int(round(particle["cx"]))
             iy = int(round(particle["cy"]))
+            particle_phase = str(particle.get("phase_class") or "").strip().lower()
+            explicit_corona = particle_phase == "corona_fat"
+            # Explicit corona rows may be captured from up to one own radius beyond the
+            # rim (their mask can sit fully outside the segmented bubble).
+            explicit_margin_px = 0.0
+            if explicit_corona:
+                explicit_axis = particle.get("major_axis_um")
+                explicit_diam = particle.get("diameter_um")
+                explicit_size_um = max(
+                    float(explicit_axis) if _finite_or_none(explicit_axis) else 0.0,
+                    float(explicit_diam) if _finite_or_none(explicit_diam) else 0.0,
+                )
+                explicit_margin_px = explicit_size_um / (2.0 * ratio) + manual_reach_px
+            bbox_margin_px = max(float(corona_px), explicit_margin_px)
             if (
-                ix < bx0 - corona_px
-                or ix > bx1 + corona_px
-                or iy < by0 - corona_px
-                or iy > by1 + corona_px
+                ix < bx0 - bbox_margin_px
+                or ix > bx1 + bbox_margin_px
+                or iy < by0 - bbox_margin_px
+                or iy > by1 + bbox_margin_px
             ):
                 continue
 
@@ -2953,6 +3205,49 @@ def compute_interfacial_adsorption_metrics(
                         captured = (
                             float(band_overlap_lut[p_id]) / float(p_area)
                         ) >= _CORONA_OVERLAP_MIN
+            if not captured and explicit_corona:
+                # Explicit ``corona_fat``: also accept the particle when its own mask
+                # overlaps the rim band or when its centre lies within one own radius
+                # (+ segmentation reach) of the bubble interface.
+                if bubble_contour_xy.size and explicit_margin_px > 0.0:
+                    centre_to_rim_px = float(
+                        np.min(
+                            np.hypot(
+                                bubble_contour_xy[:, 0] - particle["cx"],
+                                bubble_contour_xy[:, 1] - particle["cy"],
+                            )
+                        )
+                    )
+                    if np.isfinite(centre_to_rim_px) and (
+                        centre_to_rim_px <= explicit_margin_px
+                    ):
+                        captured = True
+                if not captured:
+                    manual_local, manual_x0, manual_y0 = _globule_local_mask(
+                        int(particle["id"]),
+                        shape,
+                        fat_source,
+                        fat_slices,
+                        manual_polygons,
+                        fat_masks,
+                        air_masks,
+                    )
+                    if manual_local is not None and manual_local.size:
+                        band_crop = corona_bool[
+                            manual_y0:manual_y0 + manual_local.shape[0],
+                            manual_x0:manual_x0 + manual_local.shape[1],
+                        ]
+                        if band_crop.shape == manual_local.shape:
+                            own_px = float(np.count_nonzero(manual_local))
+                            if own_px > 0:
+                                captured = (
+                                    float(
+                                        np.count_nonzero(
+                                            (manual_local > 0) & band_crop
+                                        )
+                                    )
+                                    / own_px
+                                ) >= _CORONA_OVERLAP_MIN
             if captured:
                 inside.append(particle)
 
@@ -2997,6 +3292,10 @@ def compute_interfacial_adsorption_metrics(
         corona_diams_um: list[float] = []
         for particle in inside:
             p_id = int(particle["id"])
+            # An explicit ``corona_fat`` phase assignment is the researcher's decision and
+            # is authoritative everywhere below (capture, role, gates, θ).
+            _phase_key = str(particle.get("phase_class") or "").strip().lower()
+            _manual_corona = _phase_key == "corona_fat"
 
             # --- Individual (own-mask) globule geometry ------------------------
             # A corona globule is cut by the interface, so its own major axis IS its
@@ -3028,6 +3327,39 @@ def compute_interfacial_adsorption_metrics(
                 p_id, shape, fat_source, fat_slices,
                 manual_polygons, fat_masks, air_masks,
             )
+            # --- v1.8.5: complete a clipped (crescent) globule into its full disc -----
+            # A rim globule is frequently segmented only as its bright protruding cap
+            # while the micrograph clearly shows a full circle. That cap is a circular
+            # segment, so its visible arc is fitted and the whole disc is rebuilt: the
+            # particle is then measured and painted as ONE globule instead of a
+            # half-moon. The completion is a strict superset of the mask and only fires
+            # when the arc evidence is unambiguous (see complete_circular_globule_mask),
+            # so intact globules and rim-wall shards are returned untouched.
+            completed_mask = None
+            if local_mask is not None:
+                cap_area_px = int(np.count_nonzero(local_mask))
+                try:
+                    completed = complete_circular_globule_mask(
+                        local_mask, local_x0, local_y0, shape
+                    )
+                except Exception:
+                    completed = None
+                if completed is not None:
+                    completed_mask, local_x0, local_y0, completed_radius_px = completed
+                    local_mask = completed_mask
+                    completed_diam_um = 2.0 * float(completed_radius_px) * ratio
+                    if completed_diam_um > globule_diam_um:
+                        globule_diam_um = completed_diam_um
+                        radius_px = float(completed_radius_px)
+                    logger.debug(
+                        "Bubble #%s: globule #%s completed from a %d px cap to a "
+                        "%.1f px radius disc (D=%.2f um)",
+                        b_id,
+                        p_id,
+                        cap_area_px,
+                        float(completed_radius_px),
+                        float(globule_diam_um),
+                    )
             # Elongation of THIS globule, used to recognise cleaved half-globules.
             # Priority: measurement table -> fitted major/minor axes -> own mask shape.
             aspect_ratio_val = particle.get("aspect_ratio")
@@ -3062,6 +3394,14 @@ def compute_interfacial_adsorption_metrics(
                 aspect_ratio_val = 1.0
             else:
                 aspect_ratio_val = float(max(aspect_ratio_val, 1.0))
+            if completed_mask is not None:
+                # The completed disc, not the visible crescent, is the particle: its
+                # roundness decides whether the globule is a cleaved half-globule.
+                try:
+                    _, aspect_ratio_val = _mask_shape_descriptors(completed_mask)
+                    aspect_ratio_val = float(max(aspect_ratio_val, 1.0))
+                except Exception:
+                    aspect_ratio_val = 1.0
             strip_fraction = 0.0
             if local_mask is not None:
                 strip_half = int(
@@ -3102,12 +3442,14 @@ def compute_interfacial_adsorption_metrics(
             # its centre lies within one own radius of the interface (plus the
             # segmentation tolerance) or >= 15 % of its own area sits in the strip.
             is_corona = bool(
-                strip_fraction >= _CORONA_OVERLAP_MIN
+                _manual_corona
+                or strip_fraction >= _CORONA_OVERLAP_MIN
                 or (
                     np.isfinite(centre_to_rim_px)
                     and centre_to_rim_px <= radius_px + contact_reach_px
                 )
             )
+            manual_corona_without_chord = False
             if is_corona:
                 # A candidate without a measurable interfacial cross-section has no
                 # three-phase contact angle: theta_i = arcsin(L_c,i / D_i) collapses to
@@ -3116,13 +3458,21 @@ def compute_interfacial_adsorption_metrics(
                 # interior crater globule (contact_angle_deg = NaN) so a non-intersecting
                 # particle can never inject a spurious 0 deg spike into the contact
                 # angle histogram or the mean θ.
+                #
+                # An explicit ``corona_fat`` assignment is the only exception: the
+                # researcher placed this particle on the rim, so it stays in the corona
+                # population (Rim Coverage, counts, θ overlay) with a NaN θ instead of
+                # being silently demoted to an interior crater globule.
                 candidate_theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
                 if (
                     not np.isfinite(candidate_theta_deg)
                     or chord_um <= 0.0
                     or candidate_theta_deg <= 0.0
                 ):
-                    is_corona = False
+                    if _manual_corona:
+                        manual_corona_without_chord = True
+                    else:
+                        is_corona = False
             # --- Compactness gates (v1.8.4): reject rim-wall shards ----------------
             # A genuine corona globule is a compact, roundish, CONVEX fat globule sitting
             # on the fractured equatorial rim. Curved / elongated rim-wall strips
@@ -3131,8 +3481,6 @@ def compute_interfacial_adsorption_metrics(
             # smoothing rounds a thin curved strip — so both descriptors are re-measured
             # on the raw pixel mask and the WORST of the two values is kept. An explicit
             # ``corona_fat`` phase assignment by the researcher always wins.
-            _phase_key = str(particle.get("phase_class") or "").strip().lower()
-            _manual_corona = _phase_key == "corona_fat"
             _particle_circ = float(particle["circularity"])
             _particle_solidity = _safe_float(particle.get("solidity"), 1.0)
             _raw_mask_circ = float("nan")
@@ -3144,15 +3492,26 @@ def compute_interfacial_adsorption_metrics(
                 except Exception:
                     _raw_mask_circ = float("nan")
                     _raw_solidity = float("nan")
+            # A completed (rebuilt) disc is measured on the completed mask only: the
+            # crescent's smoothed table descriptors describe half a particle and must
+            # never re-introduce the rejection the completion just removed.
             eff_circ = (
-                min(_particle_circ, _raw_mask_circ)
-                if np.isfinite(_raw_mask_circ)
-                else _particle_circ
+                _raw_mask_circ
+                if completed_mask is not None and np.isfinite(_raw_mask_circ)
+                else (
+                    min(_particle_circ, _raw_mask_circ)
+                    if np.isfinite(_raw_mask_circ)
+                    else _particle_circ
+                )
             )
             eff_solidity = (
-                min(_particle_solidity, _raw_solidity)
-                if np.isfinite(_raw_solidity)
-                else _particle_solidity
+                _raw_solidity
+                if completed_mask is not None and np.isfinite(_raw_solidity)
+                else (
+                    min(_particle_solidity, _raw_solidity)
+                    if np.isfinite(_raw_solidity)
+                    else _particle_solidity
+                )
             )
             if is_corona and not _manual_corona:
                 # ALL THREE gates must hold: compact (circularity), convex (solidity) and
@@ -3217,6 +3576,11 @@ def compute_interfacial_adsorption_metrics(
                 # Corona rim globule: its own cross-section at the interface gives
                 # theta_i = arcsin(L_c,i / D_i) with D_i its own measured diameter.
                 theta_deg = _contact_angle_from_chord(chord_um, globule_diam_um)
+                if manual_corona_without_chord:
+                    # Explicit ``corona_fat`` with no measurable interface cross-section:
+                    # it stays a corona globule (counts, Rim Coverage, θ-mode overlay)
+                    # but contributes no angle to the θ statistics.
+                    theta_deg = float("nan")
                 protrusion_ratio = (
                     float(min(chord_um / globule_diam_um, 1.0))
                     if globule_diam_um > 0
@@ -3230,10 +3594,12 @@ def compute_interfacial_adsorption_metrics(
                 # stays a corona globule (rim coverage, counts) but its theta is dropped
                 # from the mean / median / SD instead of biasing them. Since v1.8.4 an
                 # auto-detected globule above this ratio never reaches this point (it is
-                # rejected outright by the compactness gate), so this branch now only
-                # fires for an explicit ``corona_fat`` override or a researcher exclusion.
+                # rejected outright by the compactness gate), and since v1.8.5 a clipped
+                # cap is completed into its full disc, so ``aspect_ratio_val`` already
+                # describes the whole particle.
                 excluded_from_theta = bool(
                     p_id in excluded_theta_ids
+                    or manual_corona_without_chord
                     or aspect_ratio_val > _CORONA_MAX_ASPECT_RATIO
                 )
             else:

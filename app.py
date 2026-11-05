@@ -3283,13 +3283,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.4) ----------------
+# ---------------- BUILD IDENTITY (v1.8.5) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.4"
+PHASEPIX_BUILD_VERSION = "v1.8.5"
 PHASEPIX_BUILD_DATE = "2026.11.05"
-PHASEPIX_BUILD_TITLE = "Independent Corona Toggle, Yellow Palette & Rim-Shard Rejection"
+PHASEPIX_BUILD_TITLE = "Full Corona Globules, Manual Corona in Interfacial Analytics & Readable Sidebar"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -4233,7 +4233,18 @@ def _promote_corona_rim_globules(
         return classified_df
 
     corona_flags = ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
-    if "circularity" in ads_particles_df.columns:
+    if (
+        "circularity" in ads_particles_df.columns
+        and "globule_diam_um" not in ads_particles_df.columns
+    ):
+        # Legacy fallback only: as of v1.8.5 the analyzer already applies the circularity
+        # gate (``corona_min_circularity``) to the *completed* globule mask and reports the
+        # surviving role in ``is_corona_globule``. Its ``circularity`` column still
+        # describes the raw, possibly cap-only segmentation, so filtering on it here would
+        # keep a completed (now round) rim globule labelled ``adsorbed_fat`` in
+        # ``2. Phase Classifications`` while the overlay paints it as corona. The extra
+        # filter is therefore applied only for legacy tables that do not carry the
+        # per-globule geometry.
         corona_circ = pd.to_numeric(ads_particles_df["circularity"], errors="coerce")
         corona_flags = corona_flags & corona_circ.ge(float(corona_min_circularity))
 
@@ -6027,24 +6038,21 @@ with st.sidebar:
         z_order = "Fat over Air"
 
     else:
-        col_vis1, col_vis2, col_vis3, col_vis4, col_vis5 = st.columns(5)
+        # Four particle layers are shown for a Whipped Emulsion. Stacking them in one
+        # row squeezed every label into an unreadable caption, so they are laid out in
+        # TWO rows of two columns each (air + matrix fat on top, adsorbed + corona fat
+        # below). "Show Unclassified" keeps its own full-width row, because it is an
+        # underlay rather than a particle population.
+        col_vis1, col_vis2 = st.columns(2)
         with col_vis1:
             show_air = st.checkbox("Show Air Bubbles", value=True)
         with col_vis2:
             show_fat = st.checkbox("Show Fat Particles", value=True)
+
+        col_vis3, col_vis4 = st.columns(2)
         with col_vis3:
             show_adsorbed = st.checkbox("Show Adsorbed Fat (in Bubbles)", value=True)
         with col_vis4:
-            show_unclassified = st.checkbox(
-                "Show Unclassified (Green)",
-                value=True,
-                key="show_unclassified_toggle",
-                help=(
-                    "Toggles the green Unclassified underlay in the dashboard overlay and "
-                    "in the 🎨 Click-to-Reclassify canvas."
-                ),
-            )
-        with col_vis5:
             # 🌕 Pickering corona rim globules: their own phase (corona_fat) and their own
             # pure lemon-yellow tint with a warm golden-amber edge, so they are told apart
             # from the honey-gold interior adsorbed globules at a glance — and can be hidden
@@ -6062,6 +6070,16 @@ with st.sidebar:
                     "(230, 175, 0) tint and stay visible even when this layer is off."
                 ),
             )
+
+        show_unclassified = st.checkbox(
+            "Show Unclassified (Green)",
+            value=True,
+            key="show_unclassified_toggle",
+            help=(
+                "Toggles the green Unclassified underlay in the dashboard overlay and "
+                "in the 🎨 Click-to-Reclassify canvas."
+            ),
+        )
 
         air_opacity = st.slider(
             "Air Bubbles Opacity",
@@ -8856,7 +8874,13 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         # Single-phase Emulsion only allows fat droplets / Unclassified
                         if curr_phase not in ["fat_particles", "Unclassified"]:
                             curr_phase = "fat_particles"
-                    elif curr_phase not in ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]:
+                    elif curr_phase not in [
+                        "air_bubbles",
+                        "fat_particles",
+                        "adsorbed_fat",
+                        "corona_fat",
+                        "Unclassified",
+                    ]:
                         curr_phase = "air_bubbles"
 
                     rows.append({
@@ -8897,10 +8921,21 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             options=(
                                 ["fat_particles", "Unclassified"]
                                 if is_emulsion_ui
-                                else ["air_bubbles", "fat_particles", "adsorbed_fat", "Unclassified"]
+                                else [
+                                    "air_bubbles",
+                                    "fat_particles",
+                                    "adsorbed_fat",
+                                    "corona_fat",
+                                    "Unclassified",
+                                ]
                             ),
                             required=True,
-                            help="Select phase class for this manual object (options depend on the selected Sample Type).",
+                            help=(
+                                "Select phase class for this manual object (options depend "
+                                "on the selected Sample Type). `corona_fat` = equatorial "
+                                "Pickering rim globule (lemon-yellow, feeds the contact "
+                                "angle θ population and every interfacial metric)."
+                            ),
                         ),
                     },
                     disabled=["id", "diameter_um", "area_um2"],
@@ -9903,8 +9938,30 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         detail_table = ads_globules_clean.drop(
                             columns=["Excluded from θ"], errors="ignore"
                         ).copy()
-                        detail_table.insert(2, "Excluded from θ", detail_theta_flags)
-                        detail_table.insert(3, "Action", ADSORBED_DETAIL_ACTION_KEEP)
+                        # ``insert`` with a plain list yields a float64 column when the
+                        # table is EMPTY (pandas infers an empty list as float), which made
+                        # ``st.data_editor`` raise "configured column type checkbox … is not
+                        # compatible for editing ColumnDataKind.FLOAT" and killed the whole
+                        # tab. Both editable columns are therefore inserted with an explicit
+                        # dtype so an empty globule table renders as an empty editor.
+                        detail_table.insert(
+                            2,
+                            "Excluded from θ",
+                            pd.Series(
+                                list(detail_theta_flags),
+                                index=detail_table.index,
+                                dtype=bool,
+                            ),
+                        )
+                        detail_table.insert(
+                            3,
+                            "Action",
+                            pd.Series(
+                                [ADSORBED_DETAIL_ACTION_KEEP] * len(detail_table),
+                                index=detail_table.index,
+                                dtype=object,
+                            ),
+                        )
                         edited_detail_table = st.data_editor(
                             detail_table,
                             use_container_width=True,

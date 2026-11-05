@@ -1147,7 +1147,12 @@ def create_mask_overlay(
     if show_corona and corona_opacity > 0.0 and corona_ids:
         corona_fill_ids = sorted(corona_ids)
         corona_fill_opacity = float(np.clip(corona_opacity, 0.0, 1.0))
-        corona_mask = np.isin(mask_2d, corona_fill_ids)
+        # v1.8.5 — paint the WHOLE globule: a rim globule that the segmenter captured
+        # only as its protruding cap is completed into its full disc before it is
+        # blended, so the lemon-yellow highlight is never a half-moon.
+        corona_mask = _completed_globule_union(
+            mask_2d, corona_fill_ids, manual_polygons
+        )
         if air_masks is not None:
             air_m2d_c = air_masks.squeeze() if air_masks.ndim == 3 else air_masks
             if air_m2d_c.shape == mask_2d.shape:
@@ -1317,6 +1322,136 @@ def _object_binary_mask(
                 if np.any(candidate):
                     return candidate.astype(np.uint8)
     return np.zeros(shape, dtype=np.uint8)
+
+
+def _completed_globule_union(
+    mask_2d: np.ndarray,
+    globule_ids,
+    manual_polygons: Optional[list] = None,
+    allowed_region: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Boolean union of **full** (circle-completed) globule masks for ``globule_ids``.
+
+    A Pickering rim globule is frequently segmented as its bright protruding cap only,
+    while the micrograph shows a complete circle. Painting the raw label therefore turns
+    the particle into a half-moon. Every globule is passed through
+    ``analyzer.complete_circular_globule_mask`` before it is punched into the union, so
+    the overlay shows the same whole particle the interfacial metrics measure.
+
+    The completion is a strict superset of the visible mask and only fires for an
+    unambiguous circular cap, so intact globules and rim-wall shards are untouched.
+
+    Args:
+        mask_2d: Labeled (fat) mask, already padded to the display image shape.
+        globule_ids: Iterable of globule ids. Ids >= 10000 are manual contours and are
+            rasterized from ``manual_polygons``.
+        manual_polygons: Manual contour dicts (``{'id': int, 'points': (N, 2)}``).
+        allowed_region: Optional boolean region. A globule is drawn only when its own
+            *visible* mask touches this region (keeps far-away globules out of a
+            bubble-centred overlay); the globule itself is then drawn in full, so a
+            rim-straddling disc is never clipped into a crescent.
+
+    Returns:
+        np.ndarray: Boolean union mask (``True`` where a globule is drawn).
+    """
+    shape = tuple(mask_2d.shape[:2])
+    union = np.zeros(shape, dtype=bool)
+
+    ids: set = set()
+    for value in globule_ids or ():
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return union
+
+    try:
+        from analyzer import complete_circular_globule_mask
+    except Exception:  # pragma: no cover - analyzer is always importable in the app
+        complete_circular_globule_mask = None
+
+    def _punch(local: np.ndarray, x0: int, y0: int) -> None:
+        """Draw one globule (completed when possible) into ``union``."""
+        visible = local > 0
+        if not np.any(visible):
+            return
+        height, width = visible.shape
+        y0 = max(0, int(y0))
+        x0 = max(0, int(x0))
+        y1 = min(shape[0], y0 + height)
+        x1 = min(shape[1], x0 + width)
+        if y1 <= y0 or x1 <= x0:
+            return
+        visible = visible[: y1 - y0, : x1 - x0]
+        if allowed_region is not None:
+            region_crop = allowed_region[y0:y1, x0:x1]
+            if region_crop.shape != visible.shape or not np.any(visible & region_crop):
+                return
+        completed = None
+        if complete_circular_globule_mask is not None:
+            try:
+                completed = complete_circular_globule_mask(local, x0, y0, shape)
+            except Exception:
+                completed = None
+        if completed is None:
+            union[y0:y1, x0:x1] |= visible
+            return
+        completed_local, comp_x0, comp_y0, _radius = completed
+        comp_y1 = min(shape[0], comp_y0 + completed_local.shape[0])
+        comp_x1 = min(shape[1], comp_x0 + completed_local.shape[1])
+        if comp_y1 > comp_y0 and comp_x1 > comp_x0:
+            union[comp_y0:comp_y1, comp_x0:comp_x1] |= (
+                completed_local[: comp_y1 - comp_y0, : comp_x1 - comp_x0] > 0
+            )
+
+    auto_ids = sorted(pid for pid in ids if pid < 10000)
+    manual_ids = sorted(pid for pid in ids if pid >= 10000)
+
+    if auto_ids:
+        label_slices = None
+        try:
+            from scipy.ndimage import find_objects
+
+            label_slices = find_objects(mask_2d, max(auto_ids))
+        except Exception:
+            label_slices = None
+        for pid in auto_ids:
+            local = None
+            x0 = y0 = 0
+            if label_slices is not None:
+                # scipy >= 1.18 indexes by (label - 1), older releases by the label.
+                for index in (pid - 1, pid):
+                    if 0 <= index < len(label_slices):
+                        window = label_slices[index]
+                        if window is None:
+                            continue
+                        candidate = mask_2d[window] == pid
+                        if np.any(candidate):
+                            local = candidate.astype(np.uint8)
+                            x0, y0 = int(window[1].start), int(window[0].start)
+                            break
+            if local is None:
+                # Fast path when the label is absent (it may live in the air stack).
+                local = (mask_2d == pid).astype(np.uint8)
+                ys, xs = np.nonzero(local)
+                if xs.size == 0:
+                    continue
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                local = local[y0:y1, x0:x1]
+            _punch(local, x0, y0)
+
+    for pid in manual_ids:
+        full = _rasterize_manual_object(manual_polygons, pid, shape)
+        ys, xs = np.nonzero(full)
+        if xs.size == 0:
+            continue
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        _punch(full[y0:y1, x0:x1], x0, y0)
+
+    return union
 
 
 def _apply_color_overlay(
@@ -1503,16 +1638,26 @@ def render_selected_bubbles_inspection_overlay(
     ).clip(0, 255).astype(np.uint8)
 
 
-    # Collect adsorbed-fat ids from the classified table and/or the adsorption results
+    # Collect adsorbed-fat ids from the classified table and/or the adsorption results.
+    # ``corona_fat`` rows are collected as well: an explicitly classified (e.g. manually
+    # drawn) corona globule must be painted even when the interfacial analysis could not
+    # attach it to a bubble, otherwise a manual corona particle silently disappears from
+    # the inspection overlay and the crop inspector.
     ads_ids: set = set()
+    corona_phase_ids: set = set()
     if isinstance(df, pd.DataFrame) and not df.empty and "id" in df.columns:
         if "phase_class" in df.columns:
             phase_norm = df["phase_class"].astype(str).str.lower()
-            for value in df.loc[phase_norm == "adsorbed_fat", "id"].tolist():
-                try:
-                    ads_ids.add(int(value))
-                except (TypeError, ValueError):
-                    continue
+            for phase_key, target in (
+                ("adsorbed_fat", ads_ids),
+                ("corona_fat", corona_phase_ids),
+            ):
+                for value in df.loc[phase_norm == phase_key, "id"].tolist():
+                    try:
+                        target.add(int(value))
+                    except (TypeError, ValueError):
+                        continue
+            ads_ids |= corona_phase_ids
     if (
         isinstance(ads_particles_df, pd.DataFrame)
         and not ads_particles_df.empty
@@ -1531,28 +1676,40 @@ def render_selected_bubbles_inspection_overlay(
     # requested (or when the role column is unavailable, e.g. legacy callers).
     role_filter = normalize_globule_role(globule_role)
     role_filter_ids: Optional[set] = None
-    if (
-        role_filter != GLOBULE_ROLE_ALL
-        and isinstance(ads_particles_df, pd.DataFrame)
-        and not ads_particles_df.empty
-        and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
-    ):
-        want_corona = role_filter == GLOBULE_ROLE_CORONA
-        corona_flags = (
-            ads_particles_df["is_corona_globule"].fillna(False).astype(bool).to_numpy()
-        )
-        role_particle_ids = (
-            pd.to_numeric(ads_particles_df["id"], errors="coerce")
-            .fillna(-1)
-            .astype(int)
-            .to_numpy()
-        )
-        role_filter_ids = {
-            int(particle_id)
-            for particle_id, is_corona in zip(role_particle_ids, corona_flags)
-            if bool(is_corona) == want_corona
-        }
-        ads_ids &= role_filter_ids
+    if role_filter != GLOBULE_ROLE_ALL:
+        if (
+            isinstance(ads_particles_df, pd.DataFrame)
+            and not ads_particles_df.empty
+            and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+        ):
+            want_corona = role_filter == GLOBULE_ROLE_CORONA
+            corona_flags = (
+                ads_particles_df["is_corona_globule"].fillna(False).astype(bool).to_numpy()
+            )
+            role_particle_ids = (
+                pd.to_numeric(ads_particles_df["id"], errors="coerce")
+                .fillna(-1)
+                .astype(int)
+                .to_numpy()
+            )
+            role_filter_ids = {
+                int(particle_id)
+                for particle_id, is_corona in zip(role_particle_ids, corona_flags)
+                if bool(is_corona) == want_corona
+            }
+        if role_filter == GLOBULE_ROLE_CORONA:
+            # An explicit ``corona_fat`` phase is authoritative: keep the particle in the
+            # θ population even when the interfacial table does not list it (manual rim
+            # globules, or a globule whose chord could not be measured).
+            if role_filter_ids is None:
+                role_filter_ids = set()
+            role_filter_ids |= corona_phase_ids
+        elif role_filter == GLOBULE_ROLE_INTERIOR:
+            # Surface Coverage mode must never paint an explicit ``corona_fat`` globule,
+            # even when the interfacial table is empty (manual rim globules).
+            ads_ids -= corona_phase_ids
+        if role_filter_ids is not None:
+            ads_ids &= role_filter_ids
 
     # Build the adsorbed-fat mask (auto labels + manual polygons) inside selected bubbles.
     # fat_masks is authoritative; air_masks is only consulted for ids absent from it, so
@@ -1593,6 +1750,67 @@ def render_selected_bubbles_inspection_overlay(
         )
 
     ads_union = (ads_union > 0) & ads_region_bool
+
+    # v1.8.5 — corona globules are painted as WHOLE particles: the circular completion
+    # rebuilds a cap-only segmentation into its full disc, and the rim band clip is not
+    # applied to them (a globule straddling the interface is not a crater globule, so
+    # clipping it to Ω_b used to shave its outer half into a crescent).
+    corona_draw_ids = (
+        [pid for pid in ads_ids if pid in corona_phase_ids]
+        if role_filter != GLOBULE_ROLE_INTERIOR
+        else []
+    )
+    if (
+        role_filter != GLOBULE_ROLE_INTERIOR
+        and isinstance(ads_particles_df, pd.DataFrame)
+        and not ads_particles_df.empty
+        and {"id", "is_corona_globule"}.issubset(ads_particles_df.columns)
+    ):
+        corona_flag_series = (
+            ads_particles_df["is_corona_globule"].fillna(False).astype(bool)
+        )
+        for value in ads_particles_df.loc[corona_flag_series, "id"].tolist():
+            try:
+                corona_draw_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+    if corona_draw_ids:
+        fat_display = np.zeros(shape, dtype=np.int32)
+        auto_corona_ids = {pid for pid in corona_draw_ids if pid < 10000}
+        fat_present_ids: set = set()
+        if isinstance(fat_masks, np.ndarray) and fat_masks.ndim >= 2:
+            fat_candidate = fat_masks.squeeze() if fat_masks.ndim == 3 else fat_masks
+            if fat_candidate.shape[:2] == shape:
+                fat_display = fat_candidate
+                if auto_corona_ids:
+                    # Only labels that really exist in the fat stack count as "present":
+                    # a numeric collision with a bubble label must never make the globule
+                    # lookup fall back to the air mask (which would paint a whole bubble).
+                    fat_present_ids = {
+                        int(value)
+                        for value in np.unique(fat_display)
+                        if int(value) in auto_corona_ids
+                    }
+        corona_full_union = _completed_globule_union(
+            fat_display,
+            set(corona_draw_ids),
+            manual_polygons,
+            allowed_region=ads_region_bool,
+        )
+        air_fallback_ids = auto_corona_ids - fat_present_ids
+        if air_fallback_ids and isinstance(air_masks, np.ndarray):
+            air_2d_c = air_masks.squeeze() if air_masks.ndim == 3 else air_masks
+            if air_2d_c.shape[:2] == shape:
+                corona_full_union |= _completed_globule_union(
+                    air_2d_c,
+                    air_fallback_ids,
+                    manual_polygons,
+                    allowed_region=ads_region_bool,
+                )
+        # Only globules that touch the rim band are selected (inside the helper); once
+        # selected, the WHOLE completed disc is painted, never a clipped crescent.
+        ads_union = ads_union | corona_full_union
+
     _apply_color_overlay(rgb, ads_union, (255, 215, 0), 0.50)
     if np.any(ads_union):
         ads_cnts, _ = cv2.findContours(
