@@ -1800,8 +1800,361 @@ def _radial_rim_mask(
     return rim_mask
 
 
+def _merge_pass_labels(
+    combined: np.ndarray,
+    occupied: np.ndarray,
+    masks: np.ndarray,
+    next_id: int,
+    min_area_px: int = 12,
+    max_overlap: float = 0.25,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Merge one Cellpose label array into the running multi-scale mask.
+
+    Because ``masks`` is a single label array, two of its labels can never share a
+    pixel, so the per-label overlap with ``occupied`` is exactly
+    ``bincount(masks[occupied])`` - one gather instead of N boolean scans.  For the
+    same reason accepted masks must not be folded into ``occupied`` (they cannot
+    overlap each other), which keeps the histogram exact.
+
+    Args:
+        combined: Running output label mask (native resolution).
+        occupied: Running footprint canvas of the accepted objects.
+        masks: Label array returned by one Cellpose pass.
+        next_id: Label id the next accepted object receives.
+        min_area_px: Smallest accepted object area, in pixels.
+        max_overlap: Rejection threshold on the overlap fraction with ``occupied``.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, int, int]: (combined, occupied, next_id, added).
+    """
+    if masks is None or masks.size == 0:
+        return combined, occupied, next_id, 0
+    n_labels = int(masks.max())
+    if n_labels <= 0:
+        return combined, occupied, next_id, 0
+
+    label_area = np.bincount(masks.ravel(), minlength=n_labels + 1)
+    occupied_any = bool(occupied.any())
+    if occupied_any:
+        overlap_area = np.bincount(masks[occupied], minlength=n_labels + 1)
+    else:
+        overlap_area = np.zeros(n_labels + 1, dtype=np.int64)
+    area_f = label_area.astype(np.float64)
+    keep = (
+        (label_area >= int(min_area_px))
+        & ((label_area - overlap_area) >= int(min_area_px))
+        & (overlap_area / np.maximum(area_f, 1.0) < float(max_overlap))
+    )
+    keep[0] = False
+    added = 0
+    if not keep.any():
+        return combined, occupied, next_id, 0
+
+    for lbl, sl in enumerate(ndi.find_objects(masks), start=1):
+        if sl is None or not keep[lbl]:
+            continue
+        clean = masks[sl] == lbl
+        if occupied_any:
+            # Reject internal crystal shards touching an accepted large globule
+            clean &= ~occupied[sl]
+        combined[sl][clean] = next_id
+        next_id += 1
+        added += 1
+    return combined, occupied, next_id, added
+
+
+# ---------------- SMALL-DROPLET DARK-RIM RECOVERY (v1.8.7) ----------------
+# Wide-field Light Microscopy (e.g. 10x with a 100 um scale bar) renders small
+# droplets as a *dark refractive ring with a bright core*.  Two things used to hide
+# them: (1) ``smooth_internal_crystals()`` blurs an 8-22 px droplet away before the
+# fine Cellpose pass sees it, and (2) a ring-shaped object is not a blob, so the
+# network needs the inverted polarity to grow a mask over it.  The fine pass is
+# therefore run on a lightly denoised *inverted* copy, and whatever it still misses
+# is caught by the morphological dark-ring detector below.
+FINE_PASS_DIAMETER_RANGE_PX = (14.0, 22.0)
+FINE_PASS_DIAMETER_FRACTION = 0.45
+FINE_PASS_CELLPROB = -1.5
+
+DARK_RING_MIN_DIAM_PX = 6.0
+DARK_RING_MAX_DIAM_FRACTION = 0.85
+DARK_RING_MIN_CIRCULARITY = 0.62
+DARK_RING_MIN_SOLIDITY = 0.80
+DARK_RING_MAX_OVERLAP = 0.20
+# A black-hat response below this many grey levels is sensor noise, not a ring.
+DARK_RING_MIN_RESPONSE = 6
+# A real brightfield droplet is a dark rim around a *bright* core: the enclosed core
+# must be at least this many grey levels brighter than the rim it sits in.
+DARK_RING_MIN_CONTRAST = 6
+# ... and it must fill at least this fraction of the droplet disc (a solid blob, i.e. a
+# crystal shard or a noise peak, has no enclosed core at all).
+DARK_RING_MIN_CORE_FRACTION = 0.08
+DARK_RING_MAX_KERNEL_PX = 61
+DARK_RING_MIN_AREA_PX = 12
+
+
+def _light_denoise(image: np.ndarray) -> np.ndarray:
+    """
+    Mild denoise that keeps 8-22 px droplet rims intact.
+
+    The crystal smoother in :func:`smooth_internal_crystals` uses a median kernel of
+    ``2 * strength + 1`` px precisely to erase internal striations; at strength 3 that
+    is a 7x7 kernel, which is wider than a 8-12 px droplet.  The fine pass therefore
+    only removes single-pixel sensor noise (3x3 median) and does a light bilateral
+    pass, so small dark rims survive as rims.
+
+    Args:
+        image: 2D grayscale image (uint8 or any numeric dtype).
+
+    Returns:
+        np.ndarray: uint8 lightly denoised 2D image with the input shape.
+    """
+    img_2d = image.squeeze() if image.ndim == 3 else image
+    if img_2d.dtype != np.uint8:
+        min_v, max_v = float(img_2d.min()), float(img_2d.max())
+        img_u8 = np.clip(
+            ((img_2d - min_v) / max(max_v - min_v, 1e-6)) * 255.0, 0, 255
+        ).astype(np.uint8)
+    else:
+        img_u8 = img_2d
+    return cv2.bilateralFilter(
+        cv2.medianBlur(img_u8, 3), d=5, sigmaColor=20, sigmaSpace=4
+    )
+
+
+def _is_round_droplet(
+    region: np.ndarray,
+    min_circularity: float = DARK_RING_MIN_CIRCULARITY,
+    min_solidity: float = DARK_RING_MIN_SOLIDITY,
+) -> bool:
+    """Return True when a binary patch is a compact round droplet (circ + solidity)."""
+    region_u8 = region.astype(np.uint8, copy=False)
+    if not np.any(region_u8):
+        return False
+    contours, _ = cv2.findContours(
+        region_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return False
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area <= 0.0:
+        return False
+    perimeter = float(cv2.arcLength(contour, True))
+    circularity = (
+        (4.0 * math.pi * area) / (perimeter ** 2) if perimeter > 0.0 else 0.0
+    )
+    hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+    solidity = area / hull_area if hull_area > 0.0 else 0.0
+    return circularity >= min_circularity and solidity >= min_solidity
+
+
+def _split_touching_droplets(region: np.ndarray, min_diam_px: float) -> list:
+    """
+    Split one merged pair of touching droplets with a distance-transform partition.
+
+    A single round droplet has exactly one distance-transform maximum, so the patch is
+    returned untouched; only patches with two or more well separated maxima are cut
+    into a nearest-peak (Voronoi) partition.  Everything runs on the candidate's own
+    bounding box, so the cost is bounded by the droplet size, not the frame size.
+
+    Args:
+        region: Binary patch holding one candidate component (bbox sized).
+        min_diam_px: Smallest droplet diameter of interest (peak separation scale).
+
+    Returns:
+        list: One binary patch per droplet (``[region]`` when nothing was split).
+    """
+    if int(np.count_nonzero(region)) < 4 * max(1.0, float(min_diam_px)):
+        return [region]
+    dist = cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 3)
+    size = max(3, int(round(float(min_diam_px))))
+    peaks = (dist > 0.0) & (dist >= ndi.maximum_filter(dist, size=size))
+    peak_labels, n_peaks = ndi.label(peaks)
+    if n_peaks < 2:
+        return [region]
+    _, (iy, ix) = ndi.distance_transform_edt(~peaks, return_indices=True)
+    nearest = peak_labels[iy, ix]
+    parts = []
+    for peak_id in np.unique(nearest[region]):
+        part = region & (nearest == peak_id)
+        if part.any():
+            parts.append(part)
+    return parts if len(parts) > 1 else [region]
+
+def _recover_dark_rim_droplets(
+    image: np.ndarray,
+    base_diameter_px: float,
+    mask: np.ndarray,
+    min_diam_px: float = DARK_RING_MIN_DIAM_PX,
+    max_diam_fraction: float = DARK_RING_MAX_DIAM_FRACTION,
+    max_overlap: float = DARK_RING_MAX_OVERLAP,
+) -> Tuple[np.ndarray, int]:
+    """
+    Fast morphological catcher for the small dark-rimmed droplets Cellpose misses.
+
+    Runs entirely on the background the AI passes left unclaimed and finishes in a few
+    tens of milliseconds on a multi-megapixel frame:
+
+    1. A ``MORPH_BLACKHAT`` (closing - source) with a square kernel sized for the
+       largest droplet of interest isolates *dark structures smaller than the kernel*,
+       i.e. the refractive rings, while the bright matrix and the already accepted
+       globules contribute nothing.  A square kernel is used on purpose: OpenCV
+       evaluates it in O(1) per pixel (separable), where an ellipse costs 3x-6x more.
+    2. A 3x3 median kills salt noise and a fixed grey-level floor rejects the rest.
+    3. ``connectedComponentsWithStats`` gives area and bounding box for every blob in
+       one C pass; only blobs in the ``6 px .. 0.85 * base_diameter_px`` equivalent
+       diameter window are kept.
+    4. Each candidate is hole-filled on its own bounding box (a bright core inside a
+       dark ring becomes a full disc), touching pairs are cut with a distance-transform
+       Voronoi partition, and a droplet is accepted only when it is compact
+       (``circularity >= 0.62``, ``solidity >= 0.80``) and overlaps the existing mask by
+       at most ``max_overlap``.
+
+    Args:
+        image: 2D grayscale Light Microscopy frame (uint8 or any numeric dtype).
+        base_diameter_px: Typical droplet diameter in pixels (from the sidebar scale).
+        mask: Label mask produced by the AI passes (``0`` = background). Written in
+            place when it is a writable array.
+        min_diam_px: Smallest equivalent diameter accepted, in pixels.
+        max_diam_fraction: Largest accepted diameter as a fraction of
+            ``base_diameter_px``.
+        max_overlap: Rejection threshold on the overlap fraction with ``mask > 0``.
+
+    Returns:
+        Tuple[np.ndarray, int]: the mask with the recovered droplets appended using
+        unique label ids, and the number of droplets that were added.
+    """
+    if mask is None or image is None:
+        return mask, 0
+    img_2d = image.squeeze() if image.ndim == 3 else image
+    if img_2d.ndim != 2 or img_2d.size == 0 or mask.shape[:2] != img_2d.shape[:2]:
+        return mask, 0
+
+    if img_2d.dtype != np.uint8:
+        min_v, max_v = float(img_2d.min()), float(img_2d.max())
+        img_u8 = np.clip(
+            ((img_2d - min_v) / max(max_v - min_v, 1e-6)) * 255.0, 0, 255
+        ).astype(np.uint8)
+    else:
+        img_u8 = img_2d
+
+    max_diam = float(
+        np.clip(
+            max(float(max_diam_fraction) * float(base_diameter_px), float(min_diam_px) + 2.0),
+            float(min_diam_px) + 2.0,
+            400.0,
+        )
+    )
+    # A dark rim is only 1-2 px thick, so the size gates are applied to the *bounding
+    # box* first (which equals the droplet diameter) and to the hole-filled area later.
+    min_area = max(DARK_RING_MIN_AREA_PX, math.pi * ((float(min_diam_px) - 1.0) ** 2) / 4.0)
+    max_area = math.pi * (max_diam ** 2) / 4.0
+
+    # 1.-3. Black-hat rings -> adaptive threshold -> one C-pass statistics table.
+    ksize = int(np.clip(round(min(max_diam, DARK_RING_MAX_KERNEL_PX - 2)) + 2, 15,
+                        DARK_RING_MAX_KERNEL_PX)) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+    response = cv2.morphologyEx(img_u8, cv2.MORPH_BLACKHAT, kernel)
+    # A 3x3 *Gaussian* (not median!) suppresses single-pixel noise while keeping the
+    # 1-2 px rim itself: a 3x3 median would erase a thin ring completely.
+    response = cv2.GaussianBlur(response, (3, 3), 0)
+    # Adaptive threshold, i.e. the rim must stand DARK_RING_MIN_RESPONSE grey levels
+    # above its *own* neighbourhood.  A global floor cannot work here: the closing of a
+    # large kernel sits a few grey levels above the local mean, and on a noisy matrix
+    # that offset alone lifts every background pixel over a fixed threshold.
+    block = int(np.clip((ksize // 2) | 1, 15, DARK_RING_MAX_KERNEL_PX)) | 1
+    ring_u8 = cv2.adaptiveThreshold(
+        response,
+        255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY,
+        block,
+        -float(DARK_RING_MIN_RESPONSE),
+    )
+    ring_binary = (ring_u8 > 0) & (response >= DARK_RING_MIN_RESPONSE)
+    del response, ring_u8, kernel
+
+    occupied = mask > 0
+    ring_binary &= ~occupied
+
+    n_blobs, labels, stats, _ = cv2.connectedComponentsWithStats(
+        ring_binary.view(np.uint8), connectivity=8
+    )
+    if n_blobs <= 1:
+        return mask, 0
+    areas = stats[:, cv2.CC_STAT_AREA]
+    spans = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    keep = (
+        (areas >= 8)
+        & (spans >= max(4, int(round(float(min_diam_px))) - 2))
+        & (spans <= int(round(max_diam)) + 2)
+    )
+    keep[0] = False
+    candidates = np.flatnonzero(keep)
+    if candidates.size == 0:
+        return mask, 0
+
+    out = mask if getattr(mask.flags, "writeable", True) else mask.copy()
+    next_id = int(out.max()) + 1 if out.size else 1
+    if next_id < 1:
+        next_id = 1
+    added = 0
+
+    for blob_id in candidates:
+        left = int(stats[blob_id, cv2.CC_STAT_LEFT])
+        top = int(stats[blob_id, cv2.CC_STAT_TOP])
+        width = int(stats[blob_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[blob_id, cv2.CC_STAT_HEIGHT])
+        sl = (slice(top, top + height), slice(left, left + width))
+
+        # 4. Ring signature: a brightfield droplet is a dark rim around a bright core,
+        #    so the enclosed core must exist and be brighter than the rim.  Without this
+        #    test a crystal striation fragment or a noise peak (a *solid* blob) would be
+        #    accepted as soon as it happens to be roughly round.
+        component = labels[sl] == blob_id
+        if not component.any():
+            continue
+        ring_area = int(np.count_nonzero(component))
+        filled = ndi.binary_fill_holes(component)
+        filled_area = int(np.count_nonzero(filled))
+        core = filled & ~component
+        core_area = filled_area - ring_area
+        if core_area < max(2, int(DARK_RING_MIN_CORE_FRACTION * filled_area)):
+            continue
+        image_sub = img_u8[sl]
+        core_contrast = float(image_sub[core].mean()) - float(image_sub[component].mean())
+        if core_contrast < DARK_RING_MIN_CONTRAST:
+            continue
+
+        component = filled
+        occupied_sub = occupied[sl]
+        combine_sub = out[sl]
+
+        for part in _split_touching_droplets(component, min_diam_px):
+            part_area = int(np.count_nonzero(part))
+            if part_area < min_area or part_area > max_area:
+                continue
+            overlap = int(np.count_nonzero(part & occupied_sub)) / float(part_area)
+            if overlap > float(max_overlap):
+                continue
+            if not _is_round_droplet(part):
+                continue
+            combine_sub[part] = next_id
+            next_id += 1
+            added += 1
+
+    if added:
+        logger.info(
+            "Dark-rim recovery appended %d small droplet(s) (diam %.1f-%.1f px)",
+            added, float(min_diam_px), max_diam,
+        )
+    return out, added
+
+
 @st.cache_data(show_spinner="❄️ Running Multi-Scale Crystallized Globule AI segmentation...")
 def cached_segment_crystallized_multiscale(
+
     image: np.ndarray,
     base_diameter_px: float,
     model_name: str = "cyto2",
@@ -1847,7 +2200,7 @@ def cached_segment_crystallized_multiscale(
         enable_clahe=enable_clahe,
     )
 
-    # Pass B: Standard/small globules (1.0x diameter)
+    # Pass B: Standard/medium globules (1.0x diameter, crystal-smoothed)
     img_small = smooth_internal_crystals(img_2d, strength=max(int(smooth_strength), 1)) if smooth_strength > 0 else img_2d.copy()
     if invert_brightfield:
         img_small = cv2.bitwise_not(img_small)
@@ -1860,6 +2213,33 @@ def cached_segment_crystallized_multiscale(
         cellprob_threshold=cellprob_threshold,
         enable_clahe=enable_clahe,
     )
+
+    # Pass C (v1.8.7): small 8-22 px droplets.
+    # Two fixes versus running the same pass again on the crystal-smoothed image:
+    #   * only a LIGHT denoise (3x3 median + tiny bilateral), because the 7x7 median of
+    #     ``smooth_internal_crystals(strength=3)`` is wider than the droplet itself;
+    #   * the polarity is inverted, so the dark refractive ring of a brightfield
+    #     droplet becomes a bright ring the network can grow a mask over.
+    img_fine = _light_denoise(img_2d)
+    if not invert_brightfield:
+        img_fine = cv2.bitwise_not(img_fine)
+    d_fine = float(
+        np.clip(
+            float(base_diameter_px) * FINE_PASS_DIAMETER_FRACTION,
+            FINE_PASS_DIAMETER_RANGE_PX[0],
+            FINE_PASS_DIAMETER_RANGE_PX[1],
+        )
+    )
+    fine_cellprob = min(float(cellprob_threshold), FINE_PASS_CELLPROB)
+    masks_fine = run_inference(
+        model=model,
+        image=img_fine,
+        diameter=d_fine,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=fine_cellprob,
+        enable_clahe=enable_clahe,
+    )
+    del img_fine, img_small, img_large
 
     # Merge: keep all hole-filled large globules with solidity >= 0.78 first, then add non-overlapping small globules
     # v1.8.6 - fully vectorised merge.  Per-object work is confined to the tight
@@ -1897,37 +2277,26 @@ def cached_segment_crystallized_multiscale(
             occupied[sl] |= filled_bool
             next_id += 1
 
-    # ---- Fine pass: add the small globules the coarse pass did not claim --------
-    # Because ``masks_small`` is a single label array, two of its labels can never
-    # share a pixel, so the per-label overlap with ``occupied`` is exactly
-    # ``bincount(masks_small[occupied])`` - one gather instead of N boolean scans.
-    # For the same reason accepted small masks must not be folded into ``occupied``
-    # (they cannot overlap each other), which keeps the histogram exact.
-    n_small = int(masks_small.max()) if masks_small.size else 0
-    if n_small > 0:
-        small_area = np.bincount(masks_small.ravel(), minlength=n_small + 1)
-        occupied_any = bool(occupied.any())
-        if occupied_any:
-            small_overlap = np.bincount(masks_small[occupied], minlength=n_small + 1)
-        else:
-            small_overlap = np.zeros(n_small + 1, dtype=np.int64)
-        area_f = small_area.astype(np.float64)
-        keep = (
-            (small_area >= 12)
-            & ((small_area - small_overlap) >= 12)
-            & (small_overlap / np.maximum(area_f, 1.0) < 0.25)
-        )
-        keep[0] = False
-        if keep.any():
-            for lbl, sl in enumerate(ndi.find_objects(masks_small), start=1):
-                if sl is None or not keep[lbl]:
-                    continue
-                clean = masks_small[sl] == lbl
-                if occupied_any:
-                    # Reject internal crystal shards touching an accepted large globule
-                    clean &= ~occupied[sl]
-                combined[sl][clean] = next_id
-                next_id += 1
+    # ---- Medium + fine passes: add the globules the coarse pass did not claim ----
+    combined, occupied, next_id, n_medium = _merge_pass_labels(
+        combined, occupied, masks_small, next_id
+    )
+    combined, occupied, next_id, n_fine = _merge_pass_labels(
+        combined, occupied, masks_fine, next_id
+    )
+
+    # ---- Residual morphological dark-ring catcher (v1.8.7) ----------------------
+    # Anything the three AI passes still left in the background: small dark-rimmed
+    # brightfield droplets that are too small for the network's receptive field.
+    ring_source = cv2.bitwise_not(img_2d) if invert_brightfield else img_2d
+    combined, n_recovered = _recover_dark_rim_droplets(
+        ring_source, base_diameter_px, combined
+    )
+    logger.info(
+        "Multi-scale merge: %d coarse + %d medium + %d fine + %d dark-ring = %d objects",
+        (next_id - 1) - n_medium - n_fine, n_medium, n_fine, n_recovered,
+        (next_id - 1) + n_recovered,
+    )
 
     return combined
 

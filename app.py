@@ -3283,13 +3283,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.6) ----------------
+# ---------------- BUILD IDENTITY (v1.8.7) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.6"
+PHASEPIX_BUILD_VERSION = "v1.8.7"
 PHASEPIX_BUILD_DATE = "2026.11.06"
-PHASEPIX_BUILD_TITLE = "Fast Light Microscopy Multi-Scale & Vectorized Pruning"
+PHASEPIX_BUILD_TITLE = "Small-Droplet Dark-Rim Recovery & Fast Light Mode"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -3604,6 +3604,68 @@ def _lut_label_filter(
             accepted[label] = keep
 
     return np.where(accepted[mask_2d], mask_2d, 0).astype(mask_2d.dtype, copy=False)
+
+
+# ---------------- SMALL-DROPLET PIXEL-GRID TOLERANCE (v1.8.7) ----------------
+# On a wide-field 10x frame (100 um scale bar) an 8-22 px droplet is only a few dozen
+# pixels, so rasterisation alone costs it a measurable amount of roundness: the
+# discretised boundary of a perfectly round 10 px disc scores ~0.62-0.72 circularity
+# and ~0.80-0.88 solidity, i.e. right on the Step-4 gates.  Small discrete droplets
+# therefore get a fixed relief so genuine round droplets are kept as fat_particles
+# instead of being thrown away by the discretisation.
+SMALL_DROPLET_GRID_PX = 20.0
+SMALL_DROPLET_GRID_TOLERANCE = 0.08
+SMALL_DROPLET_MIN_CIRCULARITY = 0.50
+SMALL_DROPLET_MIN_SOLIDITY = 0.68
+
+
+def small_droplet_shape_gates(
+    diameters_um: "pd.Series",
+    pixel_to_um_ratio: float,
+    min_circularity: float,
+    min_solidity: float,
+    is_light_mode: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Per-object circularity / solidity thresholds with the pixel-grid relief.
+
+    Light Microscopy at low magnification renders small droplets as a handful of
+    pixels, and polygon discretisation alone lowers their measured circularity and
+    solidity below the sidebar gates.  Every object whose pixel diameter is below
+    ``SMALL_DROPLET_GRID_PX`` therefore gets ``SMALL_DROPLET_GRID_TOLERANCE`` of
+    relief on both gates, floored so the filter can never become permissive:
+    circularity never drops under 0.50 and solidity never under 0.68.
+
+    Args:
+        diameters_um: Equivalent circular diameters in micrometres.
+        pixel_to_um_ratio: Spatial calibration (um / px).
+        min_circularity: Sidebar ``Fat Min Circularity`` gate.
+        min_solidity: Sidebar ``Fat Min Solidity`` gate.
+        is_light_mode: When False the gates are returned unchanged (SEM untouched).
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: (circularity threshold, solidity threshold)
+        arrays aligned with ``diameters_um``.
+    """
+    diameters = np.asarray(diameters_um, dtype=float).ravel()
+    base_circ = np.full(diameters.shape, float(min_circularity), dtype=float)
+    base_solid = np.full(diameters.shape, float(min_solidity), dtype=float)
+    if not is_light_mode or diameters.size == 0:
+        return base_circ, base_solid
+
+    ratio = max(float(pixel_to_um_ratio), 1e-6)
+    diam_px = diameters / ratio
+    small = np.isfinite(diam_px) & (diam_px < SMALL_DROPLET_GRID_PX)
+    if not small.any():
+        return base_circ, base_solid
+
+    base_circ[small] = max(
+        SMALL_DROPLET_MIN_CIRCULARITY, float(min_circularity) - SMALL_DROPLET_GRID_TOLERANCE
+    )
+    base_solid[small] = max(
+        SMALL_DROPLET_MIN_SOLIDITY, float(min_solidity) - SMALL_DROPLET_GRID_TOLERANCE
+    )
+    return base_circ, base_solid
 
 
 def _parse_particle_id_filter(raw_text: str) -> Optional[set]:
@@ -6729,10 +6791,20 @@ else:
         # Outside bubbles: standard shape filtering by circularity threshold.
         # Light Microscopy additionally enforces a convexity (solidity) gate for
         # fat-range objects, which rejects crescent shards and inter-droplet wedges.
+        # v1.8.7: small discrete droplets (< 20 px) get a pixel-grid relief on both
+        # gates, because rasterising a round 8-22 px droplet already costs it several
+        # hundredths of circularity/solidity (see ``small_droplet_shape_gates``).
+        circ_gate, solidity_gate = small_droplet_shape_gates(
+            raw_df["diameter_um"] if "diameter_um" in raw_df.columns else pd.Series(dtype=float),
+            pixel_to_um_ratio,
+            fat_min_circularity,
+            fat_min_solidity,
+            is_light_mode,
+        )
         if is_light_mode and float(fat_min_solidity) > 0 and "solidity" in raw_df.columns:
             solidity_ok = np.where(
                 in_fat_size_range,
-                raw_df["solidity"] >= float(fat_min_solidity),
+                raw_df["solidity"].to_numpy() >= solidity_gate,
                 True,
             )
         else:
@@ -6740,11 +6812,11 @@ else:
 
         circ_ok_outside = np.where(
             in_fat_size_range,
-            (raw_df["circularity"] >= float(fat_min_circularity)) & solidity_ok,
+            (raw_df["circularity"].to_numpy() >= circ_gate) & solidity_ok,
             np.where(
                 in_air_size_range,
                 raw_df["circularity"] >= float(air_min_circularity),
-                raw_df["circularity"] >= float(fat_min_circularity),
+                raw_df["circularity"].to_numpy() >= circ_gate,
             ),
         )
 
