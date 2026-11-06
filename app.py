@@ -3283,13 +3283,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.7) ----------------
+# ---------------- BUILD IDENTITY (v1.8.8) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.7"
+PHASEPIX_BUILD_VERSION = "v1.8.8"
 PHASEPIX_BUILD_DATE = "2026.11.06"
-PHASEPIX_BUILD_TITLE = "Small-Droplet Dark-Rim Recovery & Fast Light Mode"
+PHASEPIX_BUILD_TITLE = "Fix SEM Bubble Detection & Sub-3s Light Mode Scaling"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -3301,6 +3301,7 @@ def cached_segmentation(
     flow_threshold: float = 0.7,
     cellprob_threshold: float = -1.0,
     enable_clahe: bool = True,
+    allow_downscale: bool = False,
 ) -> np.ndarray:
     """
     Run and cache Cellpose segmentation on cropped analysis image array.
@@ -3316,6 +3317,12 @@ def cached_segmentation(
         flow_threshold: Flow error threshold for detection.
         cellprob_threshold: Cell probability threshold for detection.
         enable_clahe: Whether to apply CLAHE preprocessing for low-contrast pores.
+        allow_downscale: Forwarded to ``run_inference`` (v1.8.8).  ``True`` for Light
+            Microscopy, where the "Typical Droplet Diameter for AI (µm)" slider can
+            produce 7-220 px requests: the diameter is clamped to 28-45 px and the frame
+            capped at 1024 px, so one pass always costs ~1-1.3 Mpx (single-digit seconds).
+            ``False`` (SEM)
+            leaves inference byte-identical to v1.8.5.
 
     Returns:
         np.ndarray: 2D integer array of segmented object masks.
@@ -3328,6 +3335,7 @@ def cached_segmentation(
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
         enable_clahe=enable_clahe,
+        allow_downscale=allow_downscale,
     )
     return masks
 
@@ -6588,6 +6596,11 @@ else:
                     flow_threshold=float(flow_threshold),
                     cellprob_threshold=float(cellprob_threshold),
                     enable_clahe=enable_clahe,
+                    # v1.8.8: Light Microscopy requests span 7-220 px, so the diameter is
+                    # clamped to 28-45 px (no Cellpose upscaling) and the frame capped at
+                    # 1024 px -- one pass stays at ~1 Mpx (single-digit seconds).  SEM
+                    # keeps v1.8.5.
+                    allow_downscale=bool(is_light_mode),
                 )
         _air_df_pass = pd.DataFrame()
         air_masks = None
@@ -6868,6 +6881,13 @@ else:
         filtered_air_masks = None
 
     # 6. Track classification-parameter changes to clear sticky data_editor / overrides
+    #    v1.8.8: the AI segmentation parameters are part of this tuple too.  Changing
+    #    "🎯 Typical Droplet Diameter for AI (µm)" (or the crystal smoothing / multi-scale
+    #    toggles) produces a mask with *different object ids*, so the sticky
+    #    ``particle_data_editor*`` state and the stale ``manual_phase_overrides`` pointed
+    #    at ids that no longer exist -- the yellow/orange droplet overlay silently
+    #    disappeared until a browser refresh.  Listing them here forces that exact run to
+    #    rebuild the editor state and re-seed the overlays.
     current_class_params = (
         sample_type,
         float(min_air_size),
@@ -6876,6 +6896,9 @@ else:
         float(max_fat_size),
         str(overlap_priority),
         str(out_of_range_handling),
+        round(float(eff_diameter), 1) if eff_diameter else 0.0,
+        int(crystal_smooth_strength),
+        bool(enable_multiscale_crystal),
     )
     if st.session_state.get("last_class_params") != current_class_params or st.session_state.pop("force_class_refresh", False):
         st.session_state["last_class_params"] = current_class_params

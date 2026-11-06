@@ -346,6 +346,26 @@ def apply_clahe(
 CELLPOSE_FAST_DIAMETER_TRIGGER_PX = 45.0
 CELLPOSE_FAST_DIAMETER_PX = 35.0
 
+# ``CellposeModel.eval`` also rescales *upward* whenever the requested diameter is
+# BELOW its 30 px receptive field (``diam_mean``).  A 5-9 um target on a 10x objective
+# (0.72 um/px) is only 7-14 px, so ``eval`` resampled the whole micrograph 2.1x-4.3x
+# per axis -- 4.5x-18x the pixel budget, with dozens of overlapping tiles -- and one
+# pass took ~60 s (174 s for the v1.8.7 three-pass Light Microscopy run).  Requests are
+# therefore never handed to the network below ``CELLPOSE_MIN_INFERENCE_DIAMETER_PX``
+# (28 px < 30 px, i.e. at most 1.07x per axis) and the frame itself is capped at
+# ``CELLPOSE_MAX_INFERENCE_SIDE_PX``, which pins one pass at ~1-1.3 Mpx of network
+# budget -- single-digit seconds on the reference Mac (the whole two-pass Light
+# Microscopy run measured 174 s -> 9.5 s on the 1808x1808 10x fixture at the worst-case
+# 5-9 um setting) -- no matter what the "Typical Droplet Diameter for AI" slider says.
+#
+# Both clamps are OPT-IN (``run_inference(..., allow_downscale=True)``): the SEM paths,
+# and ``segment_air_bubbles_auto`` above all, already own their multi-scale resizing
+# (``scale_factor``), so touching them again in ``run_inference`` double-downscales the
+# micrograph and destroys large air-bubble craters.  SEM therefore stays byte-identical
+# to v1.8.5.
+CELLPOSE_MIN_INFERENCE_DIAMETER_PX = 28.0
+CELLPOSE_MAX_INFERENCE_SIDE_PX = 1024
+
 # ``cv2.medianBlur`` and ``cv2.bilateralFilter`` both cost O(k^2) *per pixel*, so the
 # crystal smoothing of a 2048-4096 px Light Microscopy frame runs on a half-size
 # copy (4x less work) and the sharp droplet walls are restored afterwards.
@@ -689,6 +709,7 @@ def run_inference(
     enable_clahe: bool = True,
     clahe_clip_limit: float = 2.0,
     clahe_tile_grid_size: Tuple[int, int] = (8, 8),
+    allow_downscale: bool = False,
 ) -> np.ndarray:
     """
     Perform direct inference on a 2D grayscale image using a loaded Cellpose model.
@@ -699,12 +720,20 @@ def run_inference(
         diameter: Average diameter of objects in pixels.  Values above
             ``CELLPOSE_FAST_DIAMETER_TRIGGER_PX`` (45 px) are answered at
             ``CELLPOSE_FAST_DIAMETER_PX`` (35 px) on a proportionally downscaled
-            frame, because Cellpose's receptive field is only ~30 px wide (v1.8.6).
+            frame, because Cellpose's receptive field is only ~30 px wide.  Values
+            below ``CELLPOSE_MIN_INFERENCE_DIAMETER_PX`` (28 px) are raised to that
+            floor, because ``CellposeModel.eval`` would otherwise *upscale* the whole
+            frame (v1.8.6/v1.8.8).
         flow_threshold: Flow error threshold (default 0.7).
         cellprob_threshold: Cell probability threshold (default -1.0).
         enable_clahe: Apply CLAHE contrast enhancement prior to model feeding.
         clahe_clip_limit: Contrast clip limit for CLAHE.
         clahe_tile_grid_size: Grid size for CLAHE tiles.
+        allow_downscale: Opt in to the diameter/frame-side clamps above (Light
+            Microscopy AI passes only).  Default ``False`` keeps SEM inference
+            byte-identical to v1.8.5: ``segment_air_bubbles_auto`` manages its own
+            multi-scale resizing, so a second downscale here would destroy large
+            air-bubble craters (v1.8.8).
 
     Returns:
         np.ndarray: 2D numpy array of integer labels (0=background, 1, 2, ...=objects)
@@ -736,32 +765,60 @@ def run_inference(
     else:
         input_for_model = img_2d
 
-    # ── Downscale-for-inference (v1.8.6) ─────────────────────────────────────
-    # ``CellposeModel.eval`` rescales the frame by ``diameter / diam_mean``, so a
-    # 120-220 px Light Microscopy request makes the network process a frame 4x-7x
-    # larger *per axis* than the one we hand it.  Answering such a request at
-    # ``CELLPOSE_FAST_DIAMETER_PX`` on a proportionally smaller frame keeps the
-    # same physical objects in the same receptive field for ~20x-40x less network
-    # work; the label mask is then mapped back with INTER_NEAREST so every id and
-    # every boundary pixel is preserved exactly.
+    # ── Opt-in downscale-for-inference (v1.8.6, gated in v1.8.8) ──────────────
+    # ``CellposeModel.eval`` rescales the frame by ``diameter / diam_mean`` (30 px for
+    # cyto2/cyto3), i.e. the requested diameter *is* a resampling factor:
+    #   * above 45 px  -> the network processes a frame several times larger per axis
+    #     than the one handed in (a 210 px Light Microscopy request = 7x7 more pixels);
+    #   * below 28 px  -> the network *upscales* the frame (a 12 px request = 2.5x per
+    #     axis, 6.25x the pixel budget), which is what froze Light Microscopy for 174 s
+    #     once the "Typical Droplet Diameter for AI (µm)" slider reached 5-9 µm.
+    # Both directions are clamped here and the frame itself is capped at
+    # ``CELLPOSE_MAX_INFERENCE_SIDE_PX``, so one pass costs ~1-1.3 Mpx of network budget
+    # (single-digit seconds) for ANY slider value.  The integer label mask is mapped back
+    # with INTER_NEAREST, so every id and every boundary pixel is preserved exactly.
+    #
+    # This is strictly opt-in: ``segment_air_bubbles_auto`` already downscales its own
+    # passes with ``scale_factor`` (42 px target), so a second clamp/downscale here made
+    # it run SEM frames at a fraction of the intended resolution and destroyed the large
+    # air-bubble craters (v1.8.6 regression).  SEM callers keep ``allow_downscale=False``
+    # and therefore get the untouched v1.8.5 behaviour.
     pass_diameter = diameter
     downscale = 1.0
     orig_h, orig_w = img_2d.shape[:2]
-    if diameter is not None and float(diameter) > CELLPOSE_FAST_DIAMETER_TRIGGER_PX:
-        downscale = CELLPOSE_FAST_DIAMETER_PX / float(diameter)
-        small_size = (
-            max(1, int(round(orig_w * downscale))),
-            max(1, int(round(orig_h * downscale))),
+    if allow_downscale:
+        eff_cp_diam = (
+            max(float(diameter), CELLPOSE_MIN_INFERENCE_DIAMETER_PX)
+            if diameter is not None
+            else None
         )
-        input_for_model = cv2.resize(
-            np.asarray(input_for_model), small_size, interpolation=cv2.INTER_AREA
-        )
-        pass_diameter = float(diameter) * downscale
-        logger.info(
-            "Downscale-for-inference: scale %.3f (%dx%d -> %dx%d), diameter %.1f -> %.1f px",
-            downscale, orig_w, orig_h, small_size[0], small_size[1],
-            float(diameter), pass_diameter,
-        )
+        if eff_cp_diam is not None and eff_cp_diam > CELLPOSE_FAST_DIAMETER_TRIGGER_PX:
+            downscale = CELLPOSE_FAST_DIAMETER_PX / eff_cp_diam
+        max_side = float(max(orig_h, orig_w))
+        if max_side > 0 and max_side * downscale > float(CELLPOSE_MAX_INFERENCE_SIDE_PX):
+            downscale = float(CELLPOSE_MAX_INFERENCE_SIDE_PX) / max_side
+        if downscale < 1.0:
+            small_size = (
+                max(1, int(round(orig_w * downscale))),
+                max(1, int(round(orig_h * downscale))),
+            )
+            input_for_model = cv2.resize(
+                np.asarray(input_for_model), small_size, interpolation=cv2.INTER_AREA
+            )
+        if eff_cp_diam is not None:
+            # Never hand Cellpose a diameter below its receptive field: that request
+            # alone would make ``eval`` resample the frame upward (v1.8.8).
+            pass_diameter = max(
+                eff_cp_diam * downscale, CELLPOSE_MIN_INFERENCE_DIAMETER_PX
+            )
+        if downscale < 1.0 or pass_diameter != diameter:
+            logger.info(
+                "Downscale-for-inference: scale %.3f (%dx%d -> %dx%d), diameter %s -> %s px",
+                downscale, orig_w, orig_h, input_for_model.shape[1],
+                input_for_model.shape[0],
+                f"{float(diameter):.1f}" if diameter is not None else "auto",
+                f"{pass_diameter:.1f}" if pass_diameter is not None else "auto",
+            )
 
     try:
         # For grayscale images in Cellpose, channels=[0, 0] denotes single-channel / grayscale
@@ -1866,16 +1923,14 @@ def _merge_pass_labels(
 
 # ---------------- SMALL-DROPLET DARK-RIM RECOVERY (v1.8.7) ----------------
 # Wide-field Light Microscopy (e.g. 10x with a 100 um scale bar) renders small
-# droplets as a *dark refractive ring with a bright core*.  Two things used to hide
-# them: (1) ``smooth_internal_crystals()`` blurs an 8-22 px droplet away before the
-# fine Cellpose pass sees it, and (2) a ring-shaped object is not a blob, so the
-# network needs the inverted polarity to grow a mask over it.  The fine pass is
-# therefore run on a lightly denoised *inverted* copy, and whatever it still misses
-# is caught by the morphological dark-ring detector below.
-FINE_PASS_DIAMETER_RANGE_PX = (14.0, 22.0)
-FINE_PASS_DIAMETER_FRACTION = 0.45
-FINE_PASS_CELLPROB = -1.5
-
+# droplets as a *dark refractive ring with a bright core*.  ``smooth_internal_crystals()``
+# blurs an 8-22 px droplet away before Cellpose sees it, and a ring-shaped object is not
+# a blob at all, so the network cannot grow a mask over it.  v1.8.7 answered that with a
+# third ("fine") Cellpose pass on a lightly denoised *inverted* copy; v1.8.8 removed that
+# pass again -- asking for 14-22 px, i.e. below Cellpose's 30 px receptive field, made
+# ``eval`` upsample every frame and cost 174 s per slider change.  The purely
+# morphological dark-ring detector below is what recovers these droplets now: ~25 ms, at
+# native resolution, with no neural network involved.
 DARK_RING_MIN_DIAM_PX = 6.0
 DARK_RING_MAX_DIAM_FRACTION = 0.85
 DARK_RING_MIN_CIRCULARITY = 0.62
@@ -1891,35 +1946,6 @@ DARK_RING_MIN_CONTRAST = 6
 DARK_RING_MIN_CORE_FRACTION = 0.08
 DARK_RING_MAX_KERNEL_PX = 61
 DARK_RING_MIN_AREA_PX = 12
-
-
-def _light_denoise(image: np.ndarray) -> np.ndarray:
-    """
-    Mild denoise that keeps 8-22 px droplet rims intact.
-
-    The crystal smoother in :func:`smooth_internal_crystals` uses a median kernel of
-    ``2 * strength + 1`` px precisely to erase internal striations; at strength 3 that
-    is a 7x7 kernel, which is wider than a 8-12 px droplet.  The fine pass therefore
-    only removes single-pixel sensor noise (3x3 median) and does a light bilateral
-    pass, so small dark rims survive as rims.
-
-    Args:
-        image: 2D grayscale image (uint8 or any numeric dtype).
-
-    Returns:
-        np.ndarray: uint8 lightly denoised 2D image with the input shape.
-    """
-    img_2d = image.squeeze() if image.ndim == 3 else image
-    if img_2d.dtype != np.uint8:
-        min_v, max_v = float(img_2d.min()), float(img_2d.max())
-        img_u8 = np.clip(
-            ((img_2d - min_v) / max(max_v - min_v, 1e-6)) * 255.0, 0, 255
-        ).astype(np.uint8)
-    else:
-        img_u8 = img_2d
-    return cv2.bilateralFilter(
-        cv2.medianBlur(img_u8, 3), d=5, sigmaColor=20, sigmaSpace=4
-    )
 
 
 def _is_round_droplet(
@@ -2171,7 +2197,9 @@ def cached_segment_crystallized_multiscale(
        globules intact without splitting along internal crystal needles.
     2. Standard Pass (1.0x diameter): captures medium/small globules in the remaining matrix.
     3. Merges both passes: large globules take priority; small detections overlapping >25%
-       with an accepted large globule are discarded as internal crystal shards.
+       with an accepted large globule are discarded as internal crystal shards, and the
+       morphological dark-ring catcher appends the tiny dark-rimmed droplets the network
+       cannot resolve.
 
     v1.8.6 - Light Microscopy scale handling:
         ``base_diameter_px`` reaches 80-220 px at 40x/63x/100x, so the coarse pass asks
@@ -2181,6 +2209,21 @@ def cached_segment_crystallized_multiscale(
         still returned at native resolution, and the merge below is vectorised with
         ``scipy.ndimage.find_objects`` + ``np.bincount`` so the number of full-frame
         scans no longer grows with the droplet count.
+
+    v1.8.8 - two passes only, and never outside [28, 45] px:
+        The v1.8.7 third "fine" pass is gone.  It was asked for 14-22 px, i.e. *below*
+        Cellpose's 30 px receptive field, so ``eval`` upscaled every axis 1.4x-2.1x on
+        top of the two macro passes -- three heavily upsampled network runs that took
+        174 s on a 10x frame.  Both remaining passes are now clamped to
+        ``CELLPOSE_MIN_INFERENCE_DIAMETER_PX`` (28 px) and mapped by
+        ``run_inference(..., allow_downscale=True)`` onto a frame of at most
+        ``CELLPOSE_MAX_INFERENCE_SIDE_PX`` (1024 px) at a 28-45 px network scale, so each
+        pass costs ~1-1.3 Mpx of network work (single-digit seconds; measured 174 s ->
+        9.5 s end-to-end at the worst-case 5-9 um slider value) for ANY "Typical Droplet
+        Diameter for AI" value.  The
+        small dark-rimmed droplets the fine pass used to find are recovered instead by
+        the purely morphological :func:`_recover_dark_rim_droplets` (~25 ms, native
+        resolution, no neural network).
     """
     model = get_cellpose_model(model_type=model_name, custom_model_path=custom_model_path)
     img_2d = image.squeeze() if image.ndim == 3 else image
@@ -2190,7 +2233,9 @@ def cached_segment_crystallized_multiscale(
     img_large = smooth_internal_crystals(img_2d, strength=s_large)
     if invert_brightfield:
         img_large = cv2.bitwise_not(img_large)
-    d_large = float(np.clip(base_diameter_px * 1.75, 30.0, 240.0))
+    d_large = float(
+        np.clip(base_diameter_px * 1.75, CELLPOSE_MIN_INFERENCE_DIAMETER_PX, 240.0)
+    )
     masks_large = run_inference(
         model=model,
         image=img_large,
@@ -2198,13 +2243,19 @@ def cached_segment_crystallized_multiscale(
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
         enable_clahe=enable_clahe,
+        allow_downscale=True,
     )
 
     # Pass B: Standard/medium globules (1.0x diameter, crystal-smoothed)
     img_small = smooth_internal_crystals(img_2d, strength=max(int(smooth_strength), 1)) if smooth_strength > 0 else img_2d.copy()
     if invert_brightfield:
         img_small = cv2.bitwise_not(img_small)
-    d_small = float(np.clip(base_diameter_px, 14.0, 180.0))
+    # v1.8.8: the floor is ``CELLPOSE_MIN_INFERENCE_DIAMETER_PX`` (28 px), never 14 px.
+    # A 5-9 um target on a 10x frame (0.72 um/px) is only 12-14 px, and handing that to
+    # ``CellposeModel.eval`` upscales the whole frame 2.5x per axis (6.25x the pixels).
+    d_small = float(
+        np.clip(base_diameter_px, CELLPOSE_MIN_INFERENCE_DIAMETER_PX, 180.0)
+    )
     masks_small = run_inference(
         model=model,
         image=img_small,
@@ -2212,34 +2263,15 @@ def cached_segment_crystallized_multiscale(
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
         enable_clahe=enable_clahe,
+        allow_downscale=True,
     )
+    del img_small, img_large
 
-    # Pass C (v1.8.7): small 8-22 px droplets.
-    # Two fixes versus running the same pass again on the crystal-smoothed image:
-    #   * only a LIGHT denoise (3x3 median + tiny bilateral), because the 7x7 median of
-    #     ``smooth_internal_crystals(strength=3)`` is wider than the droplet itself;
-    #   * the polarity is inverted, so the dark refractive ring of a brightfield
-    #     droplet becomes a bright ring the network can grow a mask over.
-    img_fine = _light_denoise(img_2d)
-    if not invert_brightfield:
-        img_fine = cv2.bitwise_not(img_fine)
-    d_fine = float(
-        np.clip(
-            float(base_diameter_px) * FINE_PASS_DIAMETER_FRACTION,
-            FINE_PASS_DIAMETER_RANGE_PX[0],
-            FINE_PASS_DIAMETER_RANGE_PX[1],
-        )
-    )
-    fine_cellprob = min(float(cellprob_threshold), FINE_PASS_CELLPROB)
-    masks_fine = run_inference(
-        model=model,
-        image=img_fine,
-        diameter=d_fine,
-        flow_threshold=flow_threshold,
-        cellprob_threshold=fine_cellprob,
-        enable_clahe=enable_clahe,
-    )
-    del img_fine, img_small, img_large
+    # NOTE (v1.8.8): the v1.8.7 third Cellpose pass ("fine_pass" at 14-22 px on a lightly
+    # denoised inverted copy) is intentionally REMOVED.  Below Cellpose's 30 px receptive
+    # field that request made ``eval`` upsample the frame 1.4x-2.1x per axis, and three
+    # such passes per slider change cost 174 s.  Everything it recovered is now handled by
+    # the morphological dark-ring catcher below (~25 ms, native resolution).
 
     # Merge: keep all hole-filled large globules with solidity >= 0.78 first, then add non-overlapping small globules
     # v1.8.6 - fully vectorised merge.  Per-object work is confined to the tight
@@ -2277,24 +2309,22 @@ def cached_segment_crystallized_multiscale(
             occupied[sl] |= filled_bool
             next_id += 1
 
-    # ---- Medium + fine passes: add the globules the coarse pass did not claim ----
+    # ---- Medium pass: add the globules the coarse pass did not claim ----
     combined, occupied, next_id, n_medium = _merge_pass_labels(
         combined, occupied, masks_small, next_id
     )
-    combined, occupied, next_id, n_fine = _merge_pass_labels(
-        combined, occupied, masks_fine, next_id
-    )
 
-    # ---- Residual morphological dark-ring catcher (v1.8.7) ----------------------
-    # Anything the three AI passes still left in the background: small dark-rimmed
-    # brightfield droplets that are too small for the network's receptive field.
+    # ---- Residual morphological dark-ring catcher (v1.8.7, now the ONLY small-object
+    #      detector since the v1.8.8 removal of the third neural-network pass) --------
+    # Anything the two AI passes left in the background: small dark-rimmed brightfield
+    # droplets that are too small for the network's receptive field.
     ring_source = cv2.bitwise_not(img_2d) if invert_brightfield else img_2d
     combined, n_recovered = _recover_dark_rim_droplets(
         ring_source, base_diameter_px, combined
     )
     logger.info(
-        "Multi-scale merge: %d coarse + %d medium + %d fine + %d dark-ring = %d objects",
-        (next_id - 1) - n_medium - n_fine, n_medium, n_fine, n_recovered,
+        "Multi-scale merge: %d coarse + %d medium + %d dark-ring = %d objects",
+        (next_id - 1) - n_medium, n_medium, n_recovered,
         (next_id - 1) + n_recovered,
     )
 
