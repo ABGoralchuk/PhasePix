@@ -41,7 +41,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.ndimage import find_objects
+from scipy.ndimage import binary_fill_holes, find_objects
 
 # Internal application modules
 from cellpose_model import get_cellpose_model, run_inference, get_device, detect_hardware, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, smooth_internal_crystals
@@ -3283,13 +3283,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.5) ----------------
+# ---------------- BUILD IDENTITY (v1.8.6) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.5"
-PHASEPIX_BUILD_DATE = "2026.11.05"
-PHASEPIX_BUILD_TITLE = "Full Corona Globules, Manual Corona in Interfacial Analytics & Readable Sidebar"
+PHASEPIX_BUILD_VERSION = "v1.8.6"
+PHASEPIX_BUILD_DATE = "2026.11.06"
+PHASEPIX_BUILD_TITLE = "Fast Light Microscopy Multi-Scale & Vectorized Pruning"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -4548,10 +4548,26 @@ def cached_prune_nested_auto_objects(
     own area inside that canvas are detection artifacts and are dropped.  Manual
     objects (id >= 10000) are always preserved.
 
-    The bookkeeping (``cv2.findContours`` + ``cv2.drawContours`` per particle, plus
-    ``find_objects`` slicing) is the single most expensive Python-level loop in the
-    analysis, so the whole pass is memoised on ``(df, mask, threshold)``: changing an
-    opacity slider, a size range or a tab must never re-run it.
+    v1.8.6 - vectorised, contour-free fast path:
+        A single 2D label array can never hold two different ids on one pixel, so an
+        object can only ever be "nested" inside a *hole* of a bigger one.  Therefore:
+          * the row loop uses ``itertuples(index=False)`` instead of ``iterrows()``;
+          * ``np.any(occupied_canvas[sl])`` gates the overlap arithmetic, and an
+            object whose bounding box holds only itself records its raw mask - no
+            contour work at all (no ``cv2.findContours`` / ``cv2.drawContours``);
+          * **phase 1**: a matryoshka parent must have a foreign label inside its
+            bounding box, i.e. two bounding boxes must overlap.  A coarse
+            difference-array sweep over the bbox rectangles proves the pass is a
+            no-op when no two boxes are within ~6 px (the usual well dispersed
+            Light Microscopy emulsion), and returns after that single sweep without
+            ever allocating the canvas.  Small tables (< 200 objects) skip it.
+          * ``scipy.ndimage.binary_fill_holes`` - C, bbox-sized - provides the hole
+            fill that keeps the historical matryoshka detection intact.
+
+    The bookkeeping (``find_objects`` slicing + one histogram per object) is the
+    single most expensive Python-level loop in the analysis, so the whole pass is
+    memoised on ``(df, mask, threshold)``: changing an opacity slider, a size range
+    or a tab must never re-run it.
 
     Args:
         df_in: Metrics DataFrame with 'id' and 'area_um2'/'diameter_um'.
@@ -4564,7 +4580,6 @@ def cached_prune_nested_auto_objects(
     """
     auto_df = df_in[df_in["id"] < 10000].sort_values(by="area_um2", ascending=False)
     valid_auto_ids = []
-    occupied_canvas = np.zeros(mask_arr.shape, dtype=bool)
     masks_int = (
         mask_arr
         if np.issubdtype(mask_arr.dtype, np.integer)
@@ -4576,8 +4591,76 @@ def cached_prune_nested_auto_objects(
     except Exception:
         label_slices = None
 
-    for _, row in auto_df.iterrows():
-        obj_id = int(row["id"])
+    # Phase 1 (v1.8.6): a nested detection can only sit inside a *hole* of a bigger
+    # object, so the parent's bounding box must also hold a foreign label - i.e. two
+    # objects must have overlapping bounding boxes.  A coarse difference-array sweep
+    # over the bbox rectangles answers that without touching a single image pixel,
+    # and when no two boxes are within ~4 px the pass is a proven no-op (the usual
+    # situation for a well dispersed Light Microscopy emulsion).  It is skipped for
+    # small tables, where the fixed grid cost would exceed the whole prune pass.
+    nesting_possible = True
+    present = None
+    if label_slices is not None and len(auto_df) >= 200:
+        cell = 4
+        grid_h = (masks_int.shape[0] + cell - 1) // cell
+        grid_w = (masks_int.shape[1] + cell - 1) // cell
+        present = np.zeros(len(label_slices) + 1, dtype=bool)
+        rows0, cols0, rows1, cols1 = [], [], [], []
+        for idx, sl in enumerate(label_slices, start=1):
+            if sl is None:
+                continue
+            present[idx] = True
+            rows0.append(sl[0].start // cell)
+            rows1.append(min(grid_h, (sl[0].stop + cell - 1) // cell))
+            cols0.append(sl[1].start // cell)
+            cols1.append(min(grid_w, (sl[1].stop + cell - 1) // cell))
+        if len(rows0) < 2:
+            nesting_possible = False
+        else:
+            rows0 = np.asarray(rows0, dtype=np.intp)
+            rows1 = np.asarray(rows1, dtype=np.intp)
+            cols0 = np.asarray(cols0, dtype=np.intp)
+            cols1 = np.asarray(cols1, dtype=np.intp)
+            stride = grid_w + 2
+            flat = np.concatenate(
+                [
+                    rows0 * stride + cols0,
+                    rows0 * stride + cols1,
+                    rows1 * stride + cols0,
+                    rows1 * stride + cols1,
+                ]
+            )
+            signs = np.concatenate(
+                [
+                    np.ones(rows0.size),
+                    -np.ones(rows0.size),
+                    -np.ones(rows0.size),
+                    np.ones(rows0.size),
+                ]
+            )
+            coverage = np.bincount(
+                flat, weights=signs, minlength=(grid_h + 2) * stride
+            ).reshape(grid_h + 2, stride)
+            coverage = coverage.cumsum(axis=0).cumsum(axis=1)[:grid_h, :grid_w]
+            nesting_possible = bool(coverage.max(initial=0.0) > 1.5)
+
+        if not nesting_possible:
+            # An auto id with no pixels in the mask is dropped by the full loop, so
+            # the no-op shortcut must not wave it through.
+            auto_ids = np.asarray(auto_df["id"].to_numpy(), dtype=np.int64)
+            in_range = (auto_ids > 0) & (auto_ids < present.size)
+            if not bool(in_range.all()) or not bool(np.all(present[auto_ids[in_range]])):
+                nesting_possible = True
+
+    if not nesting_possible:
+        valid_all_ids = {int(v) for v in df_in["id"].tolist()}
+        df_out = df_in[df_in["id"].isin(valid_all_ids)].copy().reset_index(drop=True)
+        return df_out, _lut_label_filter(mask_arr, valid_all_ids, keep=True)
+
+    occupied_canvas = np.zeros(masks_int.shape[:2], dtype=bool)
+
+    for row in auto_df.itertuples(index=False):
+        obj_id = int(row.id)
         sl = None
         if label_slices is not None and 0 < obj_id <= len(label_slices):
             sl = label_slices[obj_id - 1]
@@ -4590,24 +4673,32 @@ def cached_prune_nested_auto_objects(
                 slice(int(ys.min()), int(ys.max()) + 1),
                 slice(int(xs.min()), int(xs.max()) + 1),
             )
-        obj_mask = masks_int[sl] == obj_id
+        obj_sub = masks_int[sl]
+        # Fast path: two different labels can never share a pixel, so a droplet
+        # whose box holds no accepted footprint is provably un-nested.  It used to
+        # pay a cv2.findContours + cv2.drawContours round-trip anyway; it now skips
+        # both calls entirely.
+        occupied_sub = occupied_canvas[sl]
+        obj_mask = obj_sub == obj_id
         obj_area = float(np.count_nonzero(obj_mask))
         if obj_area <= 0:
             continue
-        overlap_area = float(np.count_nonzero(obj_mask & occupied_canvas[sl]))
-        # If the object lies more than 60% inside an already accepted bigger object,
-        # it is a "matryoshka" detection artifact and is skipped.
-        if overlap_area / obj_area < float(overlap_thresh):
-            valid_auto_ids.append(obj_id)
-            filled = np.zeros(obj_mask.shape, dtype=np.uint8)
-            contours, _ = cv2.findContours(
-                obj_mask.astype(np.uint8),
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,
-            )
-            if contours:
-                cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
-            occupied_canvas[sl] |= filled.astype(bool)
+        if occupied_sub.any():
+            overlap_area = float(np.count_nonzero(obj_mask & occupied_sub))
+            # If the object lies more than 60% inside an already accepted bigger
+            # object, it is a "matryoshka" detection artifact and is skipped.
+            if overlap_area / obj_area >= float(overlap_thresh):
+                continue
+        valid_auto_ids.append(obj_id)
+        # Record the footprint the *next* (smaller) candidates are tested against.
+        # A hole can only ever be shared with another label, and the label mask is
+        # already complete, so an object whose box contains nothing but itself is
+        # recorded as-is; only genuine enclosures need the (bbox-sized, contour
+        # free) hole fill that keeps the historical matryoshka detection intact.
+        if int(np.count_nonzero(obj_sub)) != int(obj_area):
+            occupied_sub |= binary_fill_holes(obj_mask)
+        else:
+            occupied_sub |= obj_mask
 
     # Keep valid auto objects and all manual objects (id >= 10000)
     valid_all_ids = set(valid_auto_ids) | set(

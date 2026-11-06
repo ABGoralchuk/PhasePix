@@ -177,43 +177,57 @@ def extract_metrics(
         return pd.DataFrame(columns=columns)
 
     pixel_area_scale = pixel_to_um_ratio ** 2
-    records = []
+    four_pi = 4.0 * math.pi
+
+    # v1.8.6 - column-oriented accumulation.
+    # One list per output column (instead of one dict per row) lets pandas build a
+    # single block per dtype, which is what keeps a 1000+ droplet Light Microscopy
+    # table cheap.  Nothing here re-derives a contour, a Fourier harmonic fit or a
+    # convex hull: every number is the exact Cython property of ``regionprops``
+    # (area, perimeter, solidity, axis lengths, intensity_mean, centroid), and each
+    # of those already works on the object's bounding-box crop - so small / standard
+    # droplets pay exactly the same per-pixel cost as before, never a full-frame one.
+    data = {name: [] for name in columns}
 
     for prop in props:
-        obj_id = int(prop.label)
-        # 1) Calculate area in micrometers squared
+        # 1) Area in square micrometres plus the pixel area every shape factor uses
         area_px = float(prop.area)
         area_um2 = area_px * pixel_area_scale
 
-        # 2) Calculate mean intensity of object on original image
-        # Support both intensity_mean (skimage >= 0.26) and mean_intensity (earlier versions)
-        if hasattr(prop, "intensity_mean") and prop.intensity_mean is not None:
-            mean_intensity = float(prop.intensity_mean)
-        else:
-            mean_intensity = float(prop.mean_intensity)
+        # 2) Mean intensity of the object on the original image.
+        #    ``intensity_mean`` (skimage >= 0.26) replaced ``mean_intensity``; reading
+        #    it exactly once also removes the two extra recomputations the previous
+        #    ``hasattr(...) and ... is not None`` chain triggered per object.
+        intensity_mean = getattr(prop, "intensity_mean", None)
+        if intensity_mean is None:
+            intensity_mean = prop.mean_intensity
 
-        # 3) Calculate equivalent diameter using sqrt(4 * area / pi)
-        diameter_um = math.sqrt(4.0 * area_um2 / math.pi)
-
-        # 4) Calculate perimeter and centroid coordinates (row, col)
+        # 3) Equivalent diameter from the circle area: sqrt(4 * A / pi)
+        #    (A already in um^2, so the result is in um).
+        # 4) Perimeter (exact marching-squares walk) -> circularity 4*pi*A / P^2
         perimeter = float(prop.perimeter)
-        row, col = prop.centroid
-        centroid_y = float(row)
-        centroid_x = float(col)
-
-        # 5) Calculate circularity: (4 * pi * area_px) / (perimeter ** 2) if perimeter > 0 else 0
         circularity = (
-            (4.0 * math.pi * area_px) / (perimeter ** 2)
+            (four_pi * area_px) / (perimeter ** 2)
             if perimeter > 0.0
             else 0.0
         )
 
-        # 6) Major axis of the fitted ellipse in micrometers (chord length for partial globules)
-        major_axis_um = float(prop.major_axis_length) * pixel_to_um_ratio
+        # 5) Spatial centroid (row, col) of the binary mask
+        row, col = prop.centroid
 
-        # 7) Minor axis + convexity/elongation descriptors used for coalescence
-        #    and apparent contact angle analysis.
-        minor_axis_um = float(getattr(prop, "minor_axis_length", 0.0)) * pixel_to_um_ratio
+        # 6) Fitted-ellipse axes in micrometres.  ``axis_*_length`` is the current
+        #    spelling of ``*_axis_length`` (identical value, no deprecation shim).
+        major_axis_px = getattr(prop, "axis_major_length", None)
+        if major_axis_px is None:
+            major_axis_px = prop.major_axis_length
+        minor_axis_px = getattr(prop, "axis_minor_length", None)
+        if minor_axis_px is None:
+            minor_axis_px = getattr(prop, "minor_axis_length", 0.0)
+        major_axis_um = float(major_axis_px) * pixel_to_um_ratio
+        minor_axis_um = float(minor_axis_px) * pixel_to_um_ratio
+
+        # 7) Convexity / elongation descriptors used for coalescence and the
+        #    apparent contact angle analysis.
         solidity = float(getattr(prop, "solidity", 1.0))
         aspect_ratio = (
             float(major_axis_um / max(minor_axis_um, 1e-6))
@@ -221,22 +235,19 @@ def extract_metrics(
             else 1.0
         )
 
-        records.append({
-            "id": obj_id,
-            "area_um2": area_um2,
-            "diameter_um": diameter_um,
-            "major_axis_um": major_axis_um,
-            "minor_axis_um": minor_axis_um,
-            "solidity": solidity,
-            "aspect_ratio": aspect_ratio,
-            "mean_intensity": mean_intensity,
-            "circularity": circularity,
-            "centroid_x": centroid_x,
-            "centroid_y": centroid_y,
-        })
+        data["id"].append(int(prop.label))
+        data["area_um2"].append(area_um2)
+        data["diameter_um"].append(math.sqrt(4.0 * area_um2 / math.pi))
+        data["major_axis_um"].append(major_axis_um)
+        data["minor_axis_um"].append(minor_axis_um)
+        data["solidity"].append(solidity)
+        data["aspect_ratio"].append(aspect_ratio)
+        data["mean_intensity"].append(float(intensity_mean))
+        data["circularity"].append(circularity)
+        data["centroid_x"].append(float(col))
+        data["centroid_y"].append(float(row))
 
-    df = pd.DataFrame(records, columns=columns)
-    return df
+    return pd.DataFrame(data, columns=columns)
 
 
 def _compute_granulometry_dict(diameters: np.ndarray) -> dict:
