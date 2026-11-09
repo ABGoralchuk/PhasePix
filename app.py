@@ -261,6 +261,16 @@ CLSM_DISPERSED_SYSTEM = "🟣 Colloidal Microspheres & Aggregates (Silica)"
 # 20x CLSM frames are dominated by 5-10 µm silica spheres, so the AI target scale
 # defaults to 8 µm (≈ 10 px at 0.799 µm/px) instead of the old 14 µm.
 CLSM_DEFAULT_MICROSPHERE_UM = 8.0
+# Dedicated dispersed phase for Confocal Fluorescence.  Everything downstream
+# (tables, charts, manual correction, manifest) keys off this single name, so a
+# CLSM session can never be mistaken for a fat/emulsion analysis.
+CLSM_PHASE_KEY = "silica"
+CLSM_PHASE_LABEL = "Silica"
+CLSM_PHASE_COLOR = (255, 175, 0)        # warm amber-gold fill
+CLSM_PHASE_EDGE_COLOR = (255, 245, 120)  # crisp yellow-white per-particle edges
+# Bright cyan replaces the SEM lime-green Unclassified: a CLSM composite has a
+# bright GREEN matrix, so green highlights are invisible there.
+CLSM_UNCLASSIFIED_COLOR = (0, 229, 255)  # #00E5FF
 
 
 def load_clsm_presets() -> dict:
@@ -3531,11 +3541,14 @@ def encode_image_data_url(
         pil_image = pil_image.resize(new_size, resample)
 
     buffer = io.BytesIO()
+    # ``optimize=True`` makes Pillow mis-estimate libjpeg's output buffer, which
+    # raises ``OSError: broken data stream when writing image file`` for
+    # high-entropy canvases (e.g. sharp overlay edges). The optimisation saves only
+    # a few percent, so it is disabled - encoding must never fail.
     pil_image.save(
         buffer,
         format="JPEG",
         quality=int(quality),
-        optimize=True,
         subsampling=0,
     )
     data_url = (
@@ -4818,6 +4831,7 @@ def _canvas_phase_visibility(
         return {
             "air_bubbles": True,
             "fat_particles": True,
+            CLSM_PHASE_KEY: True,
             "adsorbed_fat": True,
             "corona_fat": True,
             "unclassified": True,
@@ -4826,6 +4840,7 @@ def _canvas_phase_visibility(
     visible = {
         "air_bubbles": bool(show_air),
         "fat_particles": bool(show_fat),
+        CLSM_PHASE_KEY: bool(show_fat),
         "adsorbed_fat": bool(show_adsorbed),
         "corona_fat": bool(show_corona),
         "unclassified": bool(show_unclassified),
@@ -4833,6 +4848,7 @@ def _canvas_phase_visibility(
     if isolate_unclassified:
         visible["air_bubbles"] = False
         visible["fat_particles"] = False
+        visible[CLSM_PHASE_KEY] = False
         visible["adsorbed_fat"] = False
         visible["corona_fat"] = False
     return visible
@@ -6905,24 +6921,36 @@ with st.sidebar:
 
     elif sample_type == "Emulsion":
         show_air = False
-        show_fat = st.checkbox("Show Fat Particles", value=True)
+        show_fat = st.checkbox(
+            "Show Silica" if is_clsm_mode else "Show Fat Particles", value=True
+        )
         show_adsorbed = False
         show_corona = False
         show_unclassified = st.checkbox(
-            "Show Unclassified (Green)",
+            "Show Unclassified (Cyan)" if is_clsm_mode else "Show Unclassified (Green)",
             value=True,
             key="show_unclassified_toggle",
-            help="Toggles the green Unclassified underlay in the overlay and the 🎨 canvas.",
+            help=(
+                "Toggles the cyan (#00E5FF) Unclassified underlay in the overlay and "
+                "the 🎨 canvas — cyan stays visible on the bright green CLSM matrix."
+                if is_clsm_mode
+                else "Toggles the green Unclassified underlay in the overlay and the 🎨 canvas."
+            ),
         )
         adsorbed_opacity = 0.0
         air_opacity = 0.0
         fat_opacity = st.slider(
-            "Fat Particles Opacity",
+            "Silica Opacity" if is_clsm_mode else "Fat Particles Opacity",
             min_value=0.0,
             max_value=1.0,
             value=0.3,
             step=0.05,
-            help="Transparency level for fat particles overlay layer (0.0=fully transparent, 1.0=fully opaque).",
+            help=(
+                "Transparency level for the amber-gold silica microsphere overlay "
+                "layer (0.0=fully transparent, 1.0=fully opaque)."
+                if is_clsm_mode
+                else "Transparency level for fat particles overlay layer (0.0=fully transparent, 1.0=fully opaque)."
+            ),
         )
         z_order = "Fat over Air"
 
@@ -7688,6 +7716,10 @@ else:
         st.session_state["particle_editor_rev"] = int(st.session_state.get("particle_editor_rev", 0)) + 1
 
     # 7. Classify objects into phases based on Sample Type & Size Ranges
+    # CLSM analyses a single dispersed silica phase, so its in-range label is
+    # ``"silica"`` - never ``"fat_particles"`` - and out-of-range objects stay
+    # ``"Unclassified"``.
+    _dispersed_phase = CLSM_PHASE_KEY if is_clsm_mode else "fat_particles"
     if sample_type == "Emulsion":
         classified_df = filtered_df.copy()
         if not classified_df.empty:
@@ -7696,8 +7728,13 @@ else:
                 & (classified_df["diameter_um"] <= float(max_fat_size))
             )
             oor = str(out_of_range_handling).lower()
-            oor_label = "fat_particles" if "fat" in oor else "Unclassified"
-            classified_df["phase_class"] = np.where(in_fat, "fat_particles", oor_label)
+            if is_clsm_mode:
+                # A silica dispersion has no "fat" out-of-range policy: objects
+                # outside the microsphere size window are simply Unclassified.
+                oor_label = "Unclassified"
+            else:
+                oor_label = "fat_particles" if "fat" in oor else "Unclassified"
+            classified_df["phase_class"] = np.where(in_fat, _dispersed_phase, oor_label)
         else:
             classified_df["phase_class"] = pd.Series(dtype=str)
 
@@ -7934,10 +7971,18 @@ else:
                         ~_air_df_pass["id"].isin(rejected_air_ids)
                     ].copy()
 
-    # High-level statistics
+    # High-level statistics.  In CLSM the single dispersed phase is ``"silica"``;
+    # it is counted through the same ``fat_count`` slot so every KPI card, PSD path
+    # and export keeps working, while the label says "Silica Microspheres".
     total_objects = len(classified_df)
     air_count = int((classified_df["phase_class"] == "air_bubbles").sum()) if not classified_df.empty else 0
-    fat_count = int((classified_df["phase_class"] == "fat_particles").sum()) if not classified_df.empty else 0
+    if not classified_df.empty:
+        _phase_series = classified_df["phase_class"].astype(str).str.lower()
+        fat_count = int(_phase_series.isin(["fat_particles", CLSM_PHASE_KEY]).sum())
+        silica_count = int(_phase_series.eq(CLSM_PHASE_KEY).sum())
+    else:
+        fat_count = 0
+        silica_count = 0
     adsorbed_fat_count = int((classified_df["phase_class"] == "adsorbed_fat").sum()) if not classified_df.empty else 0
     unclass_count = int(classified_df["phase_class"].astype(str).str.lower().eq("unclassified").sum()) if not classified_df.empty else 0
 
@@ -8075,6 +8120,7 @@ else:
             manual_polygons=active_manual_polygons,
             show_labels=bool(show_labels),
             ads_particles_df=ads_particles_df_global,
+            is_clsm_mode=bool(is_clsm_mode),
         )
     except TypeError:
         import importlib
@@ -8097,6 +8143,7 @@ else:
             manual_polygons=active_manual_polygons,
             show_labels=bool(show_labels),
             ads_particles_df=ads_particles_df_global,
+            is_clsm_mode=bool(is_clsm_mode),
         )
 
     # Apply burn-in scale bar if requested
@@ -8144,7 +8191,7 @@ else:
 
     show_mean_diam = sample_type in ("Emulsion", "Foam")
     if sample_type == "Emulsion":
-        avg_diam = _phase_mean_diameter("fat_particles")
+        avg_diam = _phase_mean_diameter(CLSM_PHASE_KEY if is_clsm_mode else "fat_particles")
     elif sample_type == "Foam":
         avg_diam = _phase_mean_diameter("air_bubbles")
     else:
@@ -8221,6 +8268,7 @@ else:
         _proposal_matches_image = (
             _autotune_proposal.get("image_name") == image_name
             and bool(_autotune_proposal.get("is_light_mode")) == bool(is_light_mode)
+            and bool(_autotune_proposal.get("is_clsm_mode")) == bool(is_clsm_mode)
             # Recommendations are scoped to the Sample Type they were computed for,
             # so switching the mode invalidates the card instead of applying
             # parameters that belong to a different phase recipe.
@@ -8244,7 +8292,9 @@ else:
                     "Review the physical evidence below before applying — no sidebar "
                     "parameter has been changed yet."
                 )
-                if not bool(_autotune_proposal.get("is_light_mode")):
+                if not bool(_autotune_proposal.get("is_light_mode")) and not bool(
+                    _autotune_proposal.get("is_clsm_mode")
+                ):
                     st.info(
                         "ℹ️ **Reminder:** Please ensure the correct **Sample Type** "
                         "(Emulsion, Whipped Emulsion, or Foam) is selected in **Section 4** "
@@ -8551,7 +8601,10 @@ else:
                 editor_df.insert(0, "Excluded", False)
 
                 # Single-phase modes only expose their physically possible phases
-                if is_emulsion_ui:
+                if is_clsm_mode:
+                    # CLSM: the dispersed phase is silica, never fat.
+                    phase_class_options = [CLSM_PHASE_KEY, "Unclassified"]
+                elif is_emulsion_ui:
                     phase_class_options = ["fat_particles", "Unclassified"]
                 elif sample_type == "Foam":
                     phase_class_options = ["air_bubbles", "Unclassified"]
@@ -8611,11 +8664,13 @@ else:
                         min_circ_by_phase={
                             "air_bubbles": float(air_min_circularity),
                             "fat_particles": float(fat_min_circularity),
+                            CLSM_PHASE_KEY: float(fat_min_circularity),
                             "adsorbed_fat": float(ads_min_circularity),
                         },
                         size_bounds_by_phase={
                             "air_bubbles": (float(min_air_size), float(max_air_size)),
                             "fat_particles": (float(min_fat_size), float(max_fat_size)),
+                            CLSM_PHASE_KEY: (float(min_fat_size), float(max_fat_size)),
                             "adsorbed_fat": (float(min_fat_size), float(max_fat_size)),
                         },
                     )
@@ -8726,7 +8781,38 @@ else:
                         st.session_state["_pending_manual_mode"] = MANUAL_MODE_RECLASSIFY
                         st.session_state["_pending_navigation_tab"] = "🖌️ Manual Correction"
                         st.rerun()
-                    if is_emulsion_ui:
+                    if is_clsm_mode:
+                        # CLSM: single silica phase - no air/adsorbed phases exist.
+                        c_col1, c_col2 = st.columns(2)
+                        with c_col1:
+                            if st.button(
+                                f"🟣 Assign All Unclassified ({unclass_count}) → Silica",
+                                use_container_width=True,
+                                help="Reclassifies every Unclassified object as a silica microsphere.",
+                            ):
+                                if "manual_phase_overrides" not in st.session_state:
+                                    st.session_state["manual_phase_overrides"] = {}
+                                for u_id in unclass_df["id"]:
+                                    st.session_state["manual_phase_overrides"][int(u_id)] = CLSM_PHASE_KEY
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
+                        with c_col2:
+                            if st.button(
+                                f"🗑️ Delete All Unclassified ({unclass_count})",
+                                use_container_width=True,
+                                help="Removes all Unclassified particles as artifacts.",
+                            ):
+                                unclass_ids = set(unclass_df["id"].tolist())
+                                if "interactive_excluded_ids" not in st.session_state:
+                                    st.session_state["interactive_excluded_ids"] = set()
+                                st.session_state["interactive_excluded_ids"].update(unclass_ids)
+                                editor_keys = [k for k in list(st.session_state.keys()) if str(k).startswith("particle_data_editor")]
+                                for k in editor_keys:
+                                    del st.session_state[k]
+                                st.rerun()
+                    elif is_emulsion_ui:
                         # Single-phase Emulsion: no air/adsorbed phases exist
                         e_col1, e_col2 = st.columns(2)
                         with e_col1:
@@ -8952,9 +9038,14 @@ else:
         # bar heights (% of that phase) stay directly comparable between micrographs with
         # very different particle counts (e.g. n = 3176 fat particles).
         if sample_type == "Emulsion":
-            # Single-phase: only the fat histogram exists — no unused air column
+            # Single-phase: only one histogram exists — no unused air column.
+            # CLSM labels it as silica (the dispersed phase actually measured).
             fat_bin_width = st.select_slider(
-                "🟧 Fat Histogram Step (∆µm)",
+                (
+                    "🟣 Silica Histogram Step (∆µm)"
+                    if is_clsm_mode
+                    else "🟧 Fat Histogram Step (∆µm)"
+                ),
                 options=[
                     0.2, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
                     5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
@@ -8962,8 +9053,16 @@ else:
                 value=0.5,
                 key=f"fat_bin_width_{clean_stem}",
                 help=(
-                    "Width of each fat-particle histogram bar. 0.5 µm resolves fine emulsion "
-                    "globules while keeping every bar comparable (all bars sum to 100%)."
+                    (
+                        "Width of each silica-microsphere histogram bar. 0.5 µm resolves "
+                        "the 3–30 µm sphere population while keeping every bar comparable "
+                        "(all bars sum to 100%)."
+                    )
+                    if is_clsm_mode
+                    else (
+                        "Width of each fat-particle histogram bar. 0.5 µm resolves fine emulsion "
+                        "globules while keeping every bar comparable (all bars sum to 100%)."
+                    )
                 ),
             )
             air_bin_width = 10.0
@@ -8997,7 +9096,10 @@ else:
 
         def _render_phase_distribution(phase_key: str, title: str, png_name: str, dl_prefix: str):
             """Render one phase PSD and export exactly the data behind the bars."""
-            bin_width = float(fat_bin_width if phase_key == "fat_particles" else air_bin_width)
+            _fat_slot_phases = ("fat_particles", CLSM_PHASE_KEY)
+            bin_width = float(
+                fat_bin_width if phase_key in _fat_slot_phases else air_bin_width
+            )
             # 👑 Fat PSD source: optionally pooled with the intact corona globules.
             psd_df = classified_df
             if phase_key == "fat_particles" and include_corona_in_fat_psd:
@@ -9094,10 +9196,10 @@ else:
         elif sample_type == "Emulsion":
             if is_clsm_mode:
                 _render_phase_distribution(
-                    "fat_particles",
-                    "Silica Microspheres Size Distribution",
-                    f"phasepix_silica_microspheres_distribution_{clean_stem}.png",
-                    "Silica Microspheres",
+                    CLSM_PHASE_KEY,
+                    "Silica Size Distribution",
+                    f"phasepix_silica_distribution_{clean_stem}.png",
+                    "Silica",
                 )
             else:
                 _render_phase_distribution(
@@ -9218,10 +9320,16 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             with t_row2_col1:
                 if assist_mode.startswith("🎨"):
                     # Group Click Mode: pick what the clicked EXISTING particles become.
-                    click_phase_options = (
-                        ["fat_particles", "Unclassified", "🗑️ Delete (Exclude)"]
-                        if is_emulsion_ui
-                        else [
+                    if is_clsm_mode:
+                        click_phase_options = [
+                            CLSM_PHASE_KEY,
+                            "Unclassified",
+                            "🗑️ Delete (Exclude)",
+                        ]
+                    elif is_emulsion_ui:
+                        click_phase_options = ["fat_particles", "Unclassified", "🗑️ Delete (Exclude)"]
+                    else:
+                        click_phase_options = [
                             "adsorbed_fat",
                             "corona_fat",
                             "fat_particles",
@@ -9229,7 +9337,6 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                             "Unclassified",
                             "🗑️ Delete (Exclude)",
                         ]
-                    )
                     click_target_phase = st.radio(
                         "Assign Clicked Particles As",
                         options=click_phase_options,
@@ -9237,14 +9344,31 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         horizontal=True,
                         help=(
                             "Choose the target phase, then click directly on as many existing "
-                            "particles as you want (one click each). Green particles are the AI's "
-                            "Unclassified detections, orange are matrix fat, gold adsorbed fat and "
-                            "blue air bubbles. Every dot is drawn in the target colour; press "
+                            "particles as you want (one click each). Cyan particles are the AI's "
+                            "Unclassified detections, amber-gold are silica microspheres, orange "
+                            "are matrix fat, gold adsorbed fat and blue air bubbles. Every dot is "
+                            "drawn in the target colour; press "
                             "'✅ Apply Phase to Clicked Particles' to commit. "
                             "'🗑️ Delete (Exclude)' removes the clicked particles from the analysis."
                         ),
                     )
-                    default_manual_phase = "fat_particles" if is_emulsion_ui else "air_bubbles"
+                    default_manual_phase = (
+                        CLSM_PHASE_KEY
+                        if is_clsm_mode
+                        else ("fat_particles" if is_emulsion_ui else "air_bubbles")
+                    )
+                elif is_clsm_mode:
+                    default_manual_phase = st.radio(
+                        "Assign New Manual Objects As",
+                        options=[CLSM_PHASE_KEY, "Auto (by Min/Max Size)"],
+                        index=0,
+                        horizontal=True,
+                        help=(
+                            "Confocal Fluorescence: manually added objects are silica "
+                            "microspheres, or classified automatically by the Min/Max "
+                            "Microsphere size range."
+                        ),
+                    )
                 elif is_emulsion_ui:
                     default_manual_phase = st.radio(
                         "Assign New Manual Objects As",
@@ -9282,9 +9406,15 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 elif assist_mode.startswith("📦 AI Smart Box"):
                     btn_add_label = "➕ Detect & Add from Box(es)"
                 elif assist_mode.startswith("🪄 1-Click"):
-                    btn_add_label = "➕ Add Droplet" if is_emulsion_ui else "➕ Add Bubble"
+                    if is_clsm_mode:
+                        btn_add_label = "➕ Add Silica"
+                    else:
+                        btn_add_label = "➕ Add Droplet" if is_emulsion_ui else "➕ Add Bubble"
                 else:
-                    btn_add_label = "➕ Add Manual Droplet" if is_emulsion_ui else "➕ Add Manual Bubble"
+                    if is_clsm_mode:
+                        btn_add_label = "➕ Add Manual Silica"
+                    else:
+                        btn_add_label = "➕ Add Manual Droplet" if is_emulsion_ui else "➕ Add Manual Bubble"
 
                 col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.0, 1.0])
                 with col_btn1:
@@ -9313,17 +9443,34 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 vis_col1, vis_col2, vis_col3, vis_col4, vis_col5 = st.columns(5)
                 with vis_col1:
                     canvas_show_unclassified = st.checkbox(
-                        "🟢 Show Unclassified",
+                        (
+                            "🟦 Show Unclassified"
+                            if is_clsm_mode
+                            else "🟢 Show Unclassified"
+                        ),
                         value=bool(show_unclassified),
                         key="canvas_show_unclassified",
-                        help="Paint the green Unclassified particles onto the canvas.",
+                        help=(
+                            "Paint the cyan Unclassified particles onto the canvas."
+                            if is_clsm_mode
+                            else "Paint the green Unclassified particles onto the canvas."
+                        ),
                     )
                 with vis_col2:
                     canvas_show_fat = st.checkbox(
-                        "🟧 Show Matrix Fat",
+                        (
+                            "🟣 Show Silica"
+                            if is_clsm_mode
+                            else "🟧 Show Matrix Fat"
+                        ),
                         value=bool(show_fat),
                         key="canvas_show_fat",
-                        help="Paint the orange matrix-fat particles (synced with Sidebar → Section 6).",
+                        help=(
+                            "Paint the amber-gold silica microspheres (synced with "
+                            "Sidebar → Section 6)."
+                            if is_clsm_mode
+                            else "Paint the orange matrix-fat particles (synced with Sidebar → Section 6)."
+                        ),
                     )
                 with vis_col3:
                     canvas_show_adsorbed = st.checkbox(
@@ -9469,9 +9616,13 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             _phase_palette = {
                 "air_bubbles": (0, 191, 255),
                 "fat_particles": (255, 165, 0),
+                CLSM_PHASE_KEY: CLSM_PHASE_COLOR,
                 "adsorbed_fat": (230, 175, 0),
                 "corona_fat": CORONA_FAT_RGB,
-                "unclassified": (50, 205, 50),
+                # CLSM: cyan instead of lime green - the composite matrix is green.
+                "unclassified": (
+                    CLSM_UNCLASSIFIED_COLOR if is_clsm_mode else (50, 205, 50)
+                ),
             }
             _phase_norm = classified_df["phase_class"].astype(str).str.lower()
             for _phase_key, _color in _phase_palette.items():
@@ -9526,9 +9677,21 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
         ):
             canvas_bg_data_url = _bg_cache[1]
         else:
-            canvas_bg_data_url, _, _ = encode_image_data_url(
-                canvas_bg_np, max_width=0, quality=93
-            )
+            try:
+                canvas_bg_data_url, _, _ = encode_image_data_url(
+                    canvas_bg_np, max_width=0, quality=93
+                )
+            except OSError:
+                # JPEG encoding can reject pathological buffers; a native-resolution
+                # canvas is small, so PNG is a safe, lossless fallback.
+                _png_buffer = io.BytesIO()
+                Image.fromarray(np.asarray(canvas_bg_np)).convert("RGB").save(
+                    _png_buffer, format="PNG", compress_level=1
+                )
+                canvas_bg_data_url = (
+                    "data:image/png;base64,"
+                    + base64.b64encode(_png_buffer.getvalue()).decode("ascii")
+                )
             st.session_state["_manual_canvas_bg_data_url"] = (
                 _bg_digest,
                 canvas_bg_data_url,
@@ -9578,18 +9741,27 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             elif click_target_phase == "fat_particles":
                 canvas_fill_color = "rgba(255, 165, 0, 0.45)"
                 canvas_stroke_color = "#FFA500"
+            elif click_target_phase == CLSM_PHASE_KEY:
+                canvas_fill_color = "rgba(255, 175, 0, 0.45)"
+                canvas_stroke_color = "#FFAF00"
             elif click_target_phase == "air_bubbles":
                 canvas_fill_color = "rgba(0, 191, 255, 0.45)"
                 canvas_stroke_color = "#00BFFF"
             elif "Delete" in str(click_target_phase):
                 canvas_fill_color = "rgba(255, 75, 75, 0.55)"
                 canvas_stroke_color = "#FF4B4B"
+            elif is_clsm_mode:
+                canvas_fill_color = "rgba(0, 229, 255, 0.45)"
+                canvas_stroke_color = "#00E5FF"
             else:
                 canvas_fill_color = "rgba(50, 205, 50, 0.45)"
                 canvas_stroke_color = "#32CD32"
         elif default_manual_phase == "fat_particles":
             canvas_fill_color = "rgba(255, 165, 0, 0.4)"
             canvas_stroke_color = "#FFA500"
+        elif default_manual_phase == CLSM_PHASE_KEY:
+            canvas_fill_color = "rgba(255, 175, 0, 0.4)"
+            canvas_stroke_color = "#FFAF00"
         elif default_manual_phase == "adsorbed_fat":
             canvas_fill_color = "rgba(230, 175, 0, 0.4)"
             canvas_stroke_color = "#E6AF00"
@@ -9597,8 +9769,12 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             canvas_fill_color = "rgba(255, 242, 32, 0.4)"
             canvas_stroke_color = "#FFF220"
         elif default_manual_phase == "Unclassified":
-            canvas_fill_color = "rgba(50, 205, 50, 0.4)"
-            canvas_stroke_color = "#32CD32"
+            if is_clsm_mode:
+                canvas_fill_color = "rgba(0, 229, 255, 0.4)"
+                canvas_stroke_color = "#00E5FF"
+            else:
+                canvas_fill_color = "rgba(50, 205, 50, 0.4)"
+                canvas_stroke_color = "#32CD32"
         else:
             canvas_fill_color = "rgba(0, 191, 255, 0.4)"
             canvas_stroke_color = "#00BFFF"
@@ -9854,11 +10030,20 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     curr_phase = cf_lookup.get(obj_id, {}).get(
                         "phase_class",
                         st.session_state.get("manual_phase_overrides", {}).get(
-                            obj_id, "fat_particles" if is_emulsion_ui else "air_bubbles"
+                            obj_id,
+                            (
+                                CLSM_PHASE_KEY
+                                if is_clsm_mode
+                                else ("fat_particles" if is_emulsion_ui else "air_bubbles")
+                            ),
                         ),
                     )
                     if str(curr_phase).lower() == "unclassified":
                         curr_phase = "Unclassified"
+                    elif is_clsm_mode:
+                        # Confocal Fluorescence only allows silica / Unclassified.
+                        if curr_phase not in [CLSM_PHASE_KEY, "Unclassified"]:
+                            curr_phase = CLSM_PHASE_KEY
                     elif is_emulsion_ui:
                         # Single-phase Emulsion only allows fat droplets / Unclassified
                         if curr_phase not in ["fat_particles", "Unclassified"]:
@@ -9908,15 +10093,19 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         "phase_class": st.column_config.SelectboxColumn(
                             "Phase Class",
                             options=(
-                                ["fat_particles", "Unclassified"]
-                                if is_emulsion_ui
-                                else [
-                                    "air_bubbles",
-                                    "fat_particles",
-                                    "adsorbed_fat",
-                                    "corona_fat",
-                                    "Unclassified",
-                                ]
+                                [CLSM_PHASE_KEY, "Unclassified"]
+                                if is_clsm_mode
+                                else (
+                                    ["fat_particles", "Unclassified"]
+                                    if is_emulsion_ui
+                                    else [
+                                        "air_bubbles",
+                                        "fat_particles",
+                                        "adsorbed_fat",
+                                        "corona_fat",
+                                        "Unclassified",
+                                    ]
+                                )
                             ),
                             required=True,
                             help=(
@@ -11438,6 +11627,58 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Adsorbed Fat Count": adsorbed_fat_count,
             "Unclassified Count": unclass_count,
         }
+
+        if is_clsm_mode:
+            # ── CLSM manifest cleanup (v2.0.0) ───────────────────────────────
+            # A silica dispersion has no air bubbles, fat globules, emulsion
+            # profile, crystal smoothing, brightfield inversion or detected scale
+            # bar, so those SEM / Light entries are dropped instead of being
+            # reported as "N/A" or, worse, as misleading defaults.
+            for _sem_light_key in (
+                "Objective Preset",
+                "Scale Bar Detected (px)",
+                "Scale Bar Nominal (µm)",
+                "Auto Scale Used",
+                "Sample Type",
+                "Air Bubble Size Range (µm)",
+                "Fat Particle Size Range (µm)",
+                "Overlap Priority",
+                "Air Bubbles Min Circularity",
+                "Matrix Fat Min Circularity",
+                "Matrix Fat Min Solidity",
+                "Emulsion Droplet Profile",
+                "CLSM Channel / Optical Mode",
+                "Typical Droplet Diameter for AI (µm)",
+                "Multi-Scale Globule Detection",
+                "Internal Crystal Smoothing",
+                "Adsorbed Fat Min Circularity",
+                "Show Air Bubbles",
+                "Show Fat Particles",
+                "Air Bubbles Opacity",
+                "Fat Particles Opacity",
+                "Brightfield Inversion",
+                "Air Bubbles Count",
+                "Fat Particles Count",
+                "Adsorbed Fat Count",
+            ):
+                session_meta.pop(_sem_light_key, None)
+            session_meta.update({
+                "Dispersed System Type": str(clsm_dispersed_system),
+                "CLSM Objective Preset": selected_objective or "N/A",
+                "CLSM Channel / Optical Mode": str(clsm_channel_mode),
+                "Min Silica Size (µm)": float(min_fat_size),
+                "Max Silica Size (µm)": float(max_fat_size),
+                "Target Microsphere Diameter (µm)": (
+                    float(expected_droplet_um)
+                    if expected_droplet_um is not None
+                    else float(CLSM_DEFAULT_MICROSPHERE_UM)
+                ),
+                "Silica Min Circularity": float(fat_min_circularity),
+                "Silica Size Range (µm)": f"{min_fat_size:.2f} - {max_fat_size:.2f}",
+                "Silica Count": silica_count,
+                "Show Silica": bool(show_fat),
+                "Silica Opacity": float(fat_opacity),
+            })
 
         # Генерація гарно відформатованого тексту для експорту
         manifest_text = "PhasePix Analysis Session Manifest\n"

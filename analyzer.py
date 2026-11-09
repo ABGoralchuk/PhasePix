@@ -317,6 +317,8 @@ def calculate_granulometry_metrics(
     _ADSORBED_PHASES = ("adsorbed_fat", "corona_fat")
     canonical_phases = [
         ("fat_particles", "Fat Particles"),
+        # Confocal Fluorescence (CLSM) single dispersed phase: silica microspheres.
+        ("silica", "Silica"),
         ("air_bubbles", "Air Bubbles"),
         ("unclassified", "Unclassified"),
     ]
@@ -3938,10 +3940,12 @@ def compute_matrix_coalescence_metrics(
     pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict, pd.DataFrame
 ]:
     """
-    Quantify partial coalescence of matrix fat globules through a contact network (RAG).
+    Quantify aggregation / partial coalescence through a contact network (RAG).
 
-    Only globules classified as ``phase_class == 'fat_particles'`` (free matrix fat outside
-    the bubbles) are considered. Two globules are linked when their masks are separated by
+    Only objects of the dispersed particle population are considered:
+    ``phase_class == 'fat_particles'`` (free matrix fat outside the bubbles in SEM /
+    Light) or ``phase_class == 'silica'`` (the single phase of a Confocal
+    Fluorescence silica dispersion). Two particles are linked when their masks are separated by
     at most ``contact_dilation_px`` pixels (physical neck / contact) or when their centroid
     distance satisfies ``d <= 0.55 * (d_i + d_j) + contact_dilation_px * pixel_to_um_ratio``.
     Connected components of this graph are the coalescence clusters; the per-globule degree
@@ -4056,8 +4060,14 @@ def compute_matrix_coalescence_metrics(
 
     work = df.copy()
     if "phase_class" in work.columns:
+        # The dispersed particle population is ``fat_particles`` in SEM / Light and
+        # ``silica`` in Confocal Fluorescence, so both labels feed the same
+        # contact-network analytics.
         work = work[
-            work["phase_class"].astype(str).str.lower() == "fat_particles"
+            work["phase_class"]
+            .astype(str)
+            .str.lower()
+            .isin(["fat_particles", "silica"])
         ].copy()
     work["id"] = pd.to_numeric(work["id"], errors="coerce")
     work = work[work["id"].notna()].copy()

@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 PALETTE_COLORS = {
     "air_bubbles": "#1f77b4",   # Blue for air bubbles (dark pores in SEM)
     "fat_particles": "#ff7f0e",  # Orange for fat particles (bright features in SEM)
+    # Confocal Fluorescence: single silica-microsphere phase. Warm amber-gold, a
+    # hue that never occurs in a green-matrix / magenta-shell CLSM composite.
+    "silica": "#FFAF00",
     "adsorbed_fat": "#E6AF00",   # Warm honey-gold for interior crater adsorbed fat globules
     # Pure bright lemon-yellow (golden-amber edge) for equatorial Pickering corona
     # globules: unmistakably yellow, so it can never clash with the lime-green
@@ -857,6 +860,37 @@ def apply_footer_dimming(
     return rgb
 
 
+def _inter_label_boundary(labels: np.ndarray) -> np.ndarray:
+    """
+    Return a crisp 1-px boundary between touching particles of the same phase.
+
+    ``cv2.findContours(..., cv2.RETR_EXTERNAL, ...)`` only traces the OUTER
+    perimeter of a cluster, so ten touching silica microspheres look like one
+    merged blob. A pixel is an inter-particle boundary pixel when it belongs to a
+    particle (``labels > 0``) and any of its 4-neighbours is a DIFFERENT non-zero
+    label - i.e. exactly where two particles touch.
+
+    Args:
+        labels: 2D label image where every particle owns a unique positive id and
+            0 marks background / other phases.
+
+    Returns:
+        np.ndarray: Boolean mask of the inter-particle boundary pixels (1 px wide).
+    """
+    labels = np.asarray(labels)
+    boundary = np.zeros(labels.shape[:2], dtype=bool)
+    if labels.ndim != 2 or labels.size == 0:
+        return boundary
+    core = labels > 0
+    if labels.shape[1] > 1:
+        right = core[:, :-1] & core[:, 1:] & (labels[:, :-1] != labels[:, 1:])
+        boundary[:, :-1] |= right
+    if labels.shape[0] > 1:
+        down = core[:-1, :] & core[1:, :] & (labels[:-1, :] != labels[1:, :])
+        boundary[:-1, :] |= down
+    return boundary
+
+
 def create_mask_overlay(
     image: np.ndarray,
     masks: np.ndarray,
@@ -877,6 +911,7 @@ def create_mask_overlay(
     air_masks: Optional[np.ndarray] = None,
     show_labels: bool = True,
     ads_particles_df: Optional[pd.DataFrame] = None,
+    is_clsm_mode: bool = False,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -884,6 +919,12 @@ def create_mask_overlay(
 
     Color coding (RGB):
     - 'fat_particles': Orange (RGB: 255, 165, 0)
+    - 'silica': Warm amber-gold (RGB: 255, 175, 0) fill with crisp yellow-white
+      (255, 245, 120) per-particle rims and 1-px (255, 240, 100) inter-particle
+      rings, so every individual microsphere inside a touching cluster is visible.
+      Confocal Fluorescence (is_clsm_mode=True or 'silica' present in the data)
+      switches the Unclassified underlay to bright cyan (0, 229, 255) instead of
+      lime green, because a CLSM composite has a bright green matrix.
     - 'air_bubbles': Deep Sky Blue (RGB: 0, 191, 255)
     - 'adsorbed_fat': Warm honey-gold (RGB: 230, 175, 0) — interior crater globules only
     - 'corona_fat' / ``is_corona_globule == True``: Pure lemon-yellow
@@ -920,9 +961,13 @@ def create_mask_overlay(
             clash with the lime-green Unclassified underlay (RGB 50, 205, 50).
         corona_opacity: Opacity for the lemon-yellow corona_fat overlay layer (0.0 to 1.0,
             defaults to 0.50).
-        show_unclassified: Whether to render and number green Unclassified particles
+        show_unclassified: Whether to render and number Unclassified particles
             (defaults to True). Turning it off keeps the overlay focused on the
             explicitly classified phases.
+        is_clsm_mode: Confocal Fluorescence mode. Renders the ``silica`` phase in
+            amber-gold with per-particle boundaries and paints ``Unclassified`` in
+            bright cyan (0, 229, 255) instead of lime green. Also auto-enabled when
+            the supplied table already contains ``phase_class == 'silica'``.
         z_order: Layer rendering sequence ('Fat over Air' or 'Air over Fat'). Defaults to 'Fat over Air'.
         mask: Optional alias for masks (for backward compatibility).
         manual_polygons: Optional list of manual contour dicts ({'id': int, 'points': np.ndarray}).
@@ -970,9 +1015,25 @@ def create_mask_overlay(
     blended = rgb.copy()
 
     # Phase color definitions (RGB format)
+    # CLSM: the single dispersed phase is ``silica`` and the Unclassified underlay
+    # must be bright CYAN - a lime-green highlight is invisible on the bright green
+    # composite matrix.
+    _phase_lower = (
+        df["phase_class"].astype(str).str.lower()
+        if (df is not None and not df.empty and "phase_class" in df.columns)
+        else None
+    )
+    _has_silica = bool(_phase_lower.eq("silica").any()) if _phase_lower is not None else False
+    silica_active = bool(is_clsm_mode or _has_silica)
+
     FAT_COLOR = (255, 165, 0)        # Orange for fat particles
     AIR_COLOR = (0, 191, 255)        # Deep sky blue for air bubbles
-    UNCLASS_COLOR = (50, 205, 50)    # Lime Green for unclassified particles (RGB 50, 205, 50)
+    UNCLASS_COLOR = (
+        (0, 229, 255) if silica_active else (50, 205, 50)  # #00E5FF cyan / lime green
+    )
+    SILICA_COLOR = (255, 175, 0)         # Warm amber-gold fill for silica microspheres
+    SILICA_EDGE_COLOR = (255, 245, 120)  # Crisp yellow-white outer per-particle rim
+    SILICA_INTER_EDGE_COLOR = (255, 240, 100)  # 1-px ring between touching spheres
     ADSORBED_COLOR = (230, 175, 0)   # Warm honey-gold for interior crater adsorbed globules
     CORONA_COLOR = (255, 242, 32)    # Pure lemon-yellow for equatorial corona globules
     CORONA_EDGE_COLOR = (255, 190, 0)  # Warm golden-amber outline around corona globules
@@ -1047,6 +1108,10 @@ def create_mask_overlay(
     else:
         # Default: "Fat over Air" (fat rendered over air)
         phase_sequence = ["air_bubbles", "fat_particles"]
+    if silica_active:
+        # CLSM has no air/fat layers in practice, but keeping them in the sequence
+        # costs nothing and lets a mixed session render deterministically.
+        phase_sequence = phase_sequence + ["silica"]
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.38
@@ -1082,10 +1147,17 @@ def create_mask_overlay(
                 continue
             phase_opacity = float(np.clip(fat_opacity, 0.0, 1.0))
             phase_color = FAT_COLOR
+        elif phase == "silica":
+            # Silica shares the "fat" slot of the shared UI (Show Silica /
+            # Silica Opacity) but gets its own amber-gold tint.
+            if not show_fat or fat_opacity <= 0.0:
+                continue
+            phase_opacity = float(np.clip(fat_opacity, 0.0, 1.0))
+            phase_color = SILICA_COLOR
         else:
             continue
 
-        phase_ids = df.loc[df["phase_class"] == phase, "id"].tolist()
+        phase_ids = df.loc[_phase_lower == phase, "id"].tolist()
         if phase_ids:
             phase_mask = np.isin(mask_2d, phase_ids)
             if air_masks is not None:
@@ -1100,6 +1172,30 @@ def create_mask_overlay(
                 blended[phase_mask].astype(np.float32) * (1.0 - phase_opacity)
                 + np.array(phase_color, dtype=np.float32) * phase_opacity
             ).clip(0, 255).astype(np.uint8)
+
+            # CLSM silica: every individual sphere needs its own visible ring.
+            # findContours(RETR_EXTERNAL) only traces the perimeter of a whole
+            # cluster, so the inter-label boundary (where two touching spheres meet)
+            # is painted separately - otherwise 10 spheres look like one blob.
+            if phase == "silica":
+                silica_labels = np.where(phase_mask, mask_2d, 0).astype(np.int32)
+                silica_cnts, _ = cv2.findContours(
+                    phase_mask.astype(np.uint8),
+                    cv2.RETR_LIST,
+                    cv2.CHAIN_APPROX_NONE,
+                )
+                if silica_cnts:
+                    cv2.drawContours(
+                        blended,
+                        silica_cnts,
+                        -1,
+                        SILICA_EDGE_COLOR,
+                        1,
+                        lineType=cv2.LINE_AA,
+                    )
+                inter_edges = _inter_label_boundary(silica_labels)
+                if np.any(inter_edges):
+                    blended[inter_edges] = SILICA_INTER_EDGE_COLOR
 
             # Highlight fat particles with a crisp 1 px outline in Fat over Air mode
             if phase == "fat_particles" and z_order == "Fat over Air":
