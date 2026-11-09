@@ -39,6 +39,7 @@ import numpy as np  # noqa: E402  (must follow the threading guard)
 import scipy.ndimage as ndi  # noqa: E402
 import torch  # noqa: E402  (must follow the threading guard)
 import streamlit as st  # noqa: E402
+from skimage.segmentation import watershed as skimage_watershed  # noqa: E402
 
 # PyTorch sizes its intra-op pool through its own API, not through OMP_*.
 # Called after ``import torch`` so the CUDA decision uses the authoritative
@@ -298,6 +299,56 @@ def ensure_cellpose_weights(model_type: str = "cyto2") -> Optional[Path]:
     return None
 
 
+def to_grayscale_2d(image: np.ndarray) -> np.ndarray:
+    """
+    Collapse an image array to the single intensity plane PhasePix analyses on.
+
+    Confocal laser scanning microscopy (CLSM) acquisitions are usually stored as
+    multi-channel stacks (``(H, W, 3)`` RGB or ``(H, W, 4)`` RGBA), while Cellpose
+    inference, CLAHE preprocessing and every morphological metric operate on one
+    2D plane. Those colour stacks are therefore projected onto the OpenCV
+    luminance plane, which weighs the channels by perceived brightness and keeps
+    the visible contrast of a mixed multi-channel overlay.
+
+    Args:
+        image: ``(H, W)`` grayscale, ``(H, W, 1)`` single-channel, ``(H, W, 3)``
+            RGB or ``(H, W, 4)`` RGBA array. Stacks with more than 4 channels are
+            reduced by a channel mean projection.
+
+    Returns:
+        np.ndarray: 2D array. Grayscale / single-channel input is returned
+        unchanged (no copy), colour input is converted with
+        ``cv2.COLOR_RGB2GRAY`` / ``cv2.COLOR_RGBA2GRAY`` while preserving dtype.
+
+    Raises:
+        TypeError: If ``image`` is not a numpy array.
+        ValueError: If the array is not 2D or 3D.
+    """
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"Expected numpy.ndarray, got {type(image).__name__}")
+
+    if image.ndim == 2:
+        return image
+    if image.ndim != 3:
+        raise ValueError(
+            f"Expected a 2D image or an (H, W, C) stack, but got shape {image.shape}"
+        )
+
+    n_channels = image.shape[2]
+    if n_channels == 1:
+        return image[:, :, 0]
+    if n_channels == 3:
+        return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    if n_channels == 4:
+        return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+
+    # Hyperstacks (>4 channels, e.g. unmixed spectral CLSM): mean projection.
+    mean_projection = image.astype(np.float32).mean(axis=2)
+    if np.issubdtype(image.dtype, np.integer):
+        return np.rint(mean_projection).astype(image.dtype)
+    return mean_projection
+
+
 def apply_clahe(
     image: np.ndarray,
     clip_limit: float = 2.0,
@@ -309,7 +360,9 @@ def apply_clahe(
     in SEM micrographs without over-amplifying background noise.
 
     Args:
-        image: 2D numpy array (grayscale).
+        image: 2D numpy array (grayscale) or an ``(H, W, C)`` stack, which is
+            first projected to its luminance plane by ``to_grayscale_2d`` so
+            multi-channel CLSM frames can be preprocessed as well.
         clip_limit: Threshold for contrast limiting. Default is 2.0.
         tile_grid_size: Size of grid for histogram equalization (e.g., (8, 8)).
 
@@ -319,7 +372,7 @@ def apply_clahe(
     if not isinstance(image, np.ndarray):
         raise TypeError("Input image must be a numpy array.")
 
-    img_2d = image.squeeze() if image.ndim == 3 else image
+    img_2d = to_grayscale_2d(image)
     if img_2d.dtype != np.uint8:
         # Normalize to uint8 [0, 255]
         min_val, max_val = float(img_2d.min()), float(img_2d.max())
@@ -678,7 +731,8 @@ def segment_image_cached(
     contrast or visual styling sliders) does not re-trigger expensive deep learning inference.
 
     Args:
-        image: 2D grayscale image as a numpy array.
+        image: 2D grayscale image as a numpy array, or a multi-channel
+            ``(H, W, 3)`` CLSM stack (projected to luminance before inference).
         model_type: Model name ('cyto2', 'nuclei', or 'Custom Model File...').
         custom_model_path: Optional filesystem path to custom trained weights.
         diameter: Estimated average particle/cell diameter in pixels. None for auto-estimation.
@@ -716,7 +770,10 @@ def run_inference(
 
     Args:
         model: An initialized CellposeModel.
-        image: 2D numpy array (grayscale image) or single-channel 3D array (H, W, 1).
+        image: 2D numpy array (grayscale image), a single-channel 3D array
+            (H, W, 1) or a multi-channel CLSM stack (H, W, 3) / (H, W, 4), which
+            is projected to its luminance plane by ``to_grayscale_2d`` before the
+            network sees it.
         diameter: Average diameter of objects in pixels.  Values above
             ``CELLPOSE_FAST_DIAMETER_TRIGGER_PX`` (45 px) are answered at
             ``CELLPOSE_FAST_DIAMETER_PX`` (35 px) on a proportionally downscaled
@@ -742,14 +799,10 @@ def run_inference(
     if not isinstance(image, np.ndarray):
         raise TypeError(f"Expected numpy.ndarray, got {type(image).__name__}")
 
-    if image.ndim == 3 and image.shape[2] == 1:
-        img_2d = image[:, :, 0]
-    elif image.ndim == 2:
-        img_2d = image
-    else:
-        raise ValueError(
-            f"Expected a 2D grayscale image or (H, W, 1), but got shape {image.shape}"
-        )
+    # v2.0 CLSM: multi-channel (H, W, 3) / (H, W, 4) confocal stacks are reduced
+    # to their luminance plane; grayscale and (H, W, 1) input pass through
+    # unchanged, so SEM / Light inference behaviour is untouched.
+    img_2d = to_grayscale_2d(image)
 
     # Validate non-empty dimensions
     if img_2d.size == 0 or img_2d.shape[0] == 0 or img_2d.shape[1] == 0:
@@ -2329,6 +2382,448 @@ def cached_segment_crystallized_multiscale(
     )
 
     return combined
+
+# ---------------- CLSM SILICA MICROSPHERE SEGMENTATION (v2.0) ----------------
+# Confocal laser scanning microscopy (CLSM) of colloidal silica arrives in three
+# file flavours, and all three must present the spheres to Cellpose as *solid,
+# round, bright discs* on a dark background:
+#
+#   1. Composite RGB  (``Snap-22.tif``) - green continuous matrix + magenta
+#      fluorescent shell.  The silica core is the *negative* (dark) stain inside
+#      the green matrix, so ``core_inv = 255 - G`` turns every sphere into a
+#      solid bright disc, and the magenta/red shell (``max(R, B)``) sharpens the
+#      inter-particle boundaries inside dense clusters.
+#   2. Channel c1 - negative-contrast matrix (dark spheres on a bright
+#      background), i.e. the stored channel of the very same acquisition.  A
+#      plain inversion converts it into bright discs.
+#   3. Channel c0 - fluorescent shell / rim only (bright rings on black).  A ring
+#      is not a blob, so the enclosed dark core is hole-filled and a
+#      distance-transform dome is painted inside it: every hollow ring becomes a
+#      solid disc that Cellpose (and the watershed catcher) can measure.
+#
+# ``CLSM_CHANNEL_*`` are the canonical tokens; the sidebar passes its own labels
+# and :func:`resolve_clsm_channel_mode` maps them by keyword, so UI wording can be
+# reworded without invalidating the ``@st.cache_data`` entry point.
+CLSM_CHANNEL_AUTO = "auto"
+CLSM_CHANNEL_COMPOSITE = "composite"
+CLSM_CHANNEL_C1 = "c1"
+CLSM_CHANNEL_C0 = "c0"
+
+# ``median > 90`` grey levels = bright background (c1 negative contrast matrix);
+# ``median <= 90`` = dark background (c0 fluorescent shells on black).
+CLSM_AUTO_BRIGHT_BACKGROUND_MEDIAN = 90.0
+# Residual catcher band: 5 px up to 0.8 x the Cellpose target diameter.
+CLSM_MIN_MICROSPHERE_DIAM_PX = 5.0
+CLSM_RESIDUAL_DIAM_FRACTION = 0.80
+CLSM_RESIDUAL_MIN_CIRCULARITY = 0.55
+CLSM_RESIDUAL_MIN_SOLIDITY = 0.70
+CLSM_RESIDUAL_MAX_OVERLAP = 0.25
+# Anything smaller than this is sensor noise / a diffraction speck, not a sphere.
+CLSM_MAIN_MIN_AREA_PX = 9
+
+
+def resolve_clsm_channel_mode(channel_mode: str, image: np.ndarray) -> str:
+    """
+    Resolve the CLSM channel / optical mode for one frame.
+
+    Accepts the sidebar label (``"🎨 Composite RGB (Green Matrix + Magenta
+    Shell)"``), a short token (``"composite"``/``"c1"``/``"c0"``) or anything
+    containing ``"auto"``.  Auto-detection follows the acquisition physics:
+
+    * a 3-channel stack is the RGB composite (green matrix + magenta shell);
+    * a single plane whose median exceeds ``CLSM_AUTO_BRIGHT_BACKGROUND_MEDIAN``
+      (90 grey levels) is the bright-matrix c1 negative contrast channel;
+    * anything darker is the c0 fluorescent-shell channel on black.
+
+    Args:
+        channel_mode: Sidebar label, token, or ``"auto"``.
+        image: Frame as decoded (``(H, W)`` or ``(H, W, 3)`` uint8).
+
+    Returns:
+        str: One of ``CLSM_CHANNEL_COMPOSITE``, ``CLSM_CHANNEL_C1``,
+        ``CLSM_CHANNEL_C0``.
+
+    Raises:
+        TypeError: If ``image`` is not a numpy array.
+    """
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"Expected numpy.ndarray, got {type(image).__name__}")
+
+    label = str(channel_mode or "").strip().lower()
+    if label and "auto" not in label:
+        # "Composite" must be tested before "shell": its own label contains
+        # "Magenta Shell" as well.
+        if "composite" in label or "rgb" in label:
+            return CLSM_CHANNEL_COMPOSITE
+        if "c1" in label or "negative" in label:
+            return CLSM_CHANNEL_C1
+        if "c0" in label or "shell" in label or "ring" in label or "rim" in label:
+            return CLSM_CHANNEL_C0
+
+    if image.ndim == 3 and image.shape[2] >= 3:
+        return CLSM_CHANNEL_COMPOSITE
+    gray = to_grayscale_2d(image)
+    median_value = float(np.median(gray)) if gray.size else 0.0
+    if median_value > CLSM_AUTO_BRIGHT_BACKGROUND_MEDIAN:
+        return CLSM_CHANNEL_C1
+    return CLSM_CHANNEL_C0
+
+
+
+def _otsu_foreground(image_u8: np.ndarray) -> np.ndarray:
+    """
+    Otsu-threshold one plane into a boolean foreground mask.
+
+    A one-grey-level floor protects the degenerate "all black" / "all white"
+    cases where OpenCV reports a threshold of 0 and the comparison would either
+    select nothing or the entire frame.
+
+    Args:
+        image_u8: 2D uint8 intensity plane.
+
+    Returns:
+        np.ndarray: Boolean mask, True where the plane is above the Otsu value.
+    """
+    if image_u8.size == 0:
+        return np.zeros(image_u8.shape, dtype=bool)
+    otsu_value, _ = cv2.threshold(
+        image_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    return image_u8 > max(float(otsu_value), 1.0)
+
+
+def _clsm_segmentation_planes(
+    image: np.ndarray,
+    resolved_mode: str,
+    base_diameter_px: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build the Cellpose input plane and the residual-catcher source for one mode.
+
+    Args:
+        image: Decoded frame, ``(H, W)`` grayscale or ``(H, W, 3)`` RGB.
+        resolved_mode: One of the ``CLSM_CHANNEL_*`` tokens.
+        base_diameter_px: Sidebar "Typical Microsphere Diameter for AI" in pixels
+            (scales the c0 distance-transform dome so small rings stay visible).
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: ``(cellpose_plane, residual_source)``,
+        both 2D uint8, where dark silica cores / bright fluorescent shells are
+        represented as bright solid discs.
+    """
+    if resolved_mode == CLSM_CHANNEL_COMPOSITE:
+        if image.ndim == 3 and image.shape[2] >= 3:
+            green = image[:, :, 1].astype(np.float32)
+            # Magenta = red + blue; the shell rim is the brightest of the two.
+            shell = np.maximum(image[:, :, 0], image[:, :, 2]).astype(np.float32)
+        else:
+            # Grayscale fallback: the single plane plays both roles, which is
+            # still exact for a negative-contrast acquisition.
+            green = to_grayscale_2d(image).astype(np.float32)
+            shell = green
+        core_inv = 255.0 - green
+        blended = np.clip(0.80 * core_inv + 0.35 * shell, 0.0, 255.0).astype(np.uint8)
+        return blended, core_inv.astype(np.uint8)
+
+    gray = to_grayscale_2d(image)
+
+    if resolved_mode == CLSM_CHANNEL_C1:
+        # Negative contrast matrix: 255 - gray turns the dark spheres into bright,
+        # solid discs (no hole filling needed - the core is already solid).
+        inverted = cv2.bitwise_not(gray)
+        return inverted, inverted
+
+    # c0: bright fluorescent shells on a black background.  A ring is not a blob,
+    # so the enclosed dark core is hole-filled and a distance-transform dome is
+    # painted inside it - hollow rings become solid discs.
+    rings_u8 = cv2.morphologyEx(
+        _otsu_foreground(gray).astype(np.uint8),
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    solid = ndi.binary_fill_holes(rings_u8.astype(bool))
+    if not solid.any():
+        return gray, gray
+    dist = cv2.distanceTransform(solid.astype(np.uint8), cv2.DIST_L2, 5)
+    # A sphere of the sidebar target diameter reaches full brightness, so small
+    # rings keep a usable dome instead of being normalised away by the largest one.
+    dome_scale = 255.0 / max(2.0, 0.5 * float(base_diameter_px))
+    dome = np.clip(dist * dome_scale, 0.0, 255.0).astype(np.uint8)
+    return cv2.max(gray, dome), dome
+
+
+def _watershed_split_microspheres(mask: np.ndarray, min_diam_px: float) -> np.ndarray:
+    """
+    Split touching microspheres with a distance-transform marker watershed.
+
+    Colloidal silica beds are densely packed, so thresholded clusters of small
+    spheres arrive as one merged blob.  A marker watershed on the **inverted
+    distance transform** cuts that blob along the ridges between its distance
+    maxima, i.e. exactly between the sphere centres, and returns one label per
+    particle instead of one label per cluster.  The 1-px watershed lines are
+    handed back to their nearest label afterwards, so a 5-10 px sphere does not
+    lose the rim pixels that its circularity is measured on.
+
+    Args:
+        mask: Boolean candidate mask (any number of disjoint clusters).
+        min_diam_px: Smallest sphere diameter of interest; also the local-maxima
+            window size, so a single sphere never produces two peaks.
+
+    Returns:
+        np.ndarray: int32 label image (0 = background, 1..N = particles).
+    """
+    mask = np.asarray(mask, dtype=bool)
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    if not mask.any():
+        return labels
+
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    if float(dist.max()) <= 0.0:
+        return labels
+
+    peak_size = max(3, int(round(float(min_diam_px))))
+    local_max = ndi.maximum_filter(dist, size=peak_size)
+    peaks = (dist >= local_max - 1e-6) & (dist > 0.0)
+    peak_labels, n_peaks = ndi.label(peaks)
+    if n_peaks <= 1:
+        # A single blob with a single distance maximum: nothing to split.
+        return ndi.label(mask)[0].astype(np.int32)
+
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    markers[peaks] = peak_labels[peaks]
+    # Inverted distance transform = topographic surface: the markers are basins
+    # and the watershed floods the ridges (saddles) between touching spheres.
+    # ``skimage.segmentation.watershed`` is used instead of ``cv2.watershed``
+    # because OpenCV's variant floods on the *image gradient*, which is flat
+    # inside a distance-transform plateau and produced wildly unbalanced splits
+    # (one sphere absorbing most of its neighbour).
+    labels = skimage_watershed(
+        -dist.astype(np.float32),
+        markers=markers,
+        mask=mask,
+    ).astype(np.int32)
+
+    # Watershed lines (-1/0) inside the mask are handed back to their nearest
+    # label, so a 5-10 px sphere does not lose the rim pixels its circularity is
+    # measured on.
+    boundary = mask & (labels <= 0)
+    if boundary.any():
+        _, (iy, ix) = ndi.distance_transform_edt(labels <= 0, return_indices=True)
+        nearest = labels[iy, ix]
+        labels = np.where(boundary & (nearest > 0), nearest, labels).astype(np.int32)
+    labels = np.maximum(labels, 0)
+    if int(labels.max()) <= 0:
+        return ndi.label(mask)[0].astype(np.int32)
+
+    # Seam fragments: where three or more discs overlap, the watershed can carve a
+    # few-pixel pocket that gets its own peak.  Such a pocket is far thinner than
+    # a real sphere, so a label survives only when its inradius (``dist`` maximum)
+    # reaches 40 % of the smallest sphere diameter of interest.
+    n_labels_found = int(labels.max())
+    if n_labels_found > 0:
+        label_ids = np.arange(1, n_labels_found + 1)
+        max_inradius = np.asarray(
+            ndi.maximum(dist, labels, index=label_ids), dtype=float
+        )
+        label_areas = np.bincount(labels.ravel(), minlength=n_labels_found + 1)
+        keep = np.zeros(n_labels_found + 1, dtype=bool)
+        keep[1:] = (max_inradius >= 0.40 * float(min_diam_px)) & (
+            label_areas[1:] >= 4
+        )
+        labels = np.where(keep[labels], labels, 0).astype(np.int32)
+    if int(labels.max()) <= 0:
+        return ndi.label(mask)[0].astype(np.int32)
+    return labels
+
+
+def _recover_clsm_residual_microspheres(
+    source_u8: np.ndarray,
+    base_diameter_px: float,
+    combined: np.ndarray,
+    occupied: np.ndarray,
+    next_id: int,
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Append the small microspheres Cellpose's receptive field cannot resolve.
+
+    The residual "catcher" runs purely on morphology (Otsu + distance-transform
+    watershed, no neural network), so it costs milliseconds at native resolution.
+    It only looks at the band ``5 px .. 0.8 x base_diameter_px``; anything the
+    main Cellpose pass already claimed is rejected by the overlap gate.
+
+    Args:
+        source_u8: Residual source plane from ``_clsm_segmentation_planes``
+            (dark cores / bright shells already turned into bright discs).
+        base_diameter_px: Cellpose target diameter in pixels.
+        combined: Running output label mask (modified in place).
+        occupied: Running footprint canvas of the accepted objects.
+        next_id: Label id the next accepted sphere receives.
+
+    Returns:
+        Tuple[np.ndarray, int, int]: (combined, next_id, added).
+    """
+    min_diam = float(CLSM_MIN_MICROSPHERE_DIAM_PX)
+    max_diam = max(min_diam + 1.0, CLSM_RESIDUAL_DIAM_FRACTION * float(base_diameter_px))
+    min_area = max(
+        CLSM_MAIN_MIN_AREA_PX, int(round(math.pi * (min_diam / 2.0) ** 2 * 0.5))
+    )
+
+    candidates = cv2.morphologyEx(
+        _otsu_foreground(source_u8).astype(np.uint8),
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    if not candidates.any():
+        return combined, next_id, 0
+
+    labels = _watershed_split_microspheres(candidates.astype(bool), min_diam)
+    added = 0
+    area_lookup = np.bincount(labels.ravel(), minlength=int(labels.max()) + 1)
+    for lbl, sl in enumerate(ndi.find_objects(labels), start=1):
+        if sl is None or int(area_lookup[lbl]) < min_area:
+            continue
+        region = labels[sl] == lbl
+        area = int(np.count_nonzero(region))
+        if area <= 0:
+            continue
+        equiv_diam = 2.0 * math.sqrt(area / math.pi)
+        if equiv_diam < min_diam or equiv_diam > max_diam:
+            continue
+        if not _is_round_droplet(
+            region, CLSM_RESIDUAL_MIN_CIRCULARITY, CLSM_RESIDUAL_MIN_SOLIDITY
+        ):
+            continue
+        overlap = int(np.count_nonzero(region & occupied[sl])) / float(area)
+        if overlap > CLSM_RESIDUAL_MAX_OVERLAP:
+            continue
+        combined[sl][region] = next_id
+        next_id += 1
+        added += 1
+    if added:
+        logger.info(
+            "CLSM residual catcher appended %d small microsphere(s) (diam %.1f-%.1f px)",
+            added, min_diam, max_diam,
+        )
+    return combined, next_id, added
+
+
+
+@st.cache_data(show_spinner="Running CLSM Confocal Microsphere Segmentation...")
+def cached_segment_clsm_microspheres(
+    image: np.ndarray,
+    base_diameter_px: float,
+    channel_mode: str = CLSM_CHANNEL_AUTO,
+    model_name: str = "cyto2",
+    custom_model_path: Optional[str] = None,
+    flow_threshold: float = 0.7,
+    cellprob_threshold: float = -1.0,
+    enable_clahe: bool = False,
+) -> np.ndarray:
+    """
+    Segment silica microspheres in confocal (CLSM) micrographs - all 3 file types.
+
+    Pipeline:
+        1. ``resolve_clsm_channel_mode`` maps the sidebar label / token to the
+           concrete optical mode (``auto`` inspects the channel count and the
+           median grey level: RGB -> composite, ``median > 90`` -> c1 bright
+           matrix, ``median <= 90`` -> c0 dark-background shells).
+        2. ``_clsm_segmentation_planes`` builds the Cellpose input: the negative
+           stain core ``255 - G`` blended with the magenta shell for the RGB
+           composite, a plain inversion for c1, and hole-filling + a
+           distance-transform dome for hollow c0 rings.
+        3. One Cellpose pass at ``base_diameter_px`` (clamped into Cellpose's
+           28-45 px comfort zone by ``run_inference(allow_downscale=True)``, so a
+           1024x1024 confocal frame costs ~1 Mpx of network work).  Every mask is
+           hole-filled and compacted to consecutive label ids.
+        4. ``_recover_clsm_residual_microspheres`` appends the 5 px -
+           ``0.8 x base_diameter_px`` spheres the network cannot resolve, split
+           apart by a distance-transform watershed instead of being merged into
+           one blob.
+
+    Args:
+        image: Analysis frame - ``(H, W, 3)`` RGB (``Snap-22.tif``) or
+            ``(H, W)`` single channel (c1 / c0 exports).
+        base_diameter_px: Typical microsphere diameter in pixels (sidebar
+            "Typical Microsphere Diameter for AI" converted with the active
+            objective calibration).
+        channel_mode: Sidebar label, ``"composite"``/``"c1"``/``"c0"``, or
+            ``"auto"``.
+        model_name: Cellpose model name ('cyto2', 'cyto3', 'nuclei', ...).
+        custom_model_path: Optional path to custom Cellpose weights.
+        flow_threshold: Cellpose flow error threshold.
+        cellprob_threshold: Cellpose cell-probability threshold.
+        enable_clahe: Apply CLAHE contrast enhancement before inference.
+
+    Returns:
+        np.ndarray: int32 label mask (0 = background, 1..N = individual
+        microspheres) at the input spatial resolution.
+    """
+    model = get_cellpose_model(model_type=model_name, custom_model_path=custom_model_path)
+
+    resolved_mode = resolve_clsm_channel_mode(channel_mode, image)
+    base_diameter = max(float(base_diameter_px), CLSM_MIN_MICROSPHERE_DIAM_PX)
+    seg_img, residual_source = _clsm_segmentation_planes(
+        image, resolved_mode, base_diameter
+    )
+
+    masks_main = run_inference(
+        model=model,
+        image=seg_img,
+        diameter=float(
+            np.clip(base_diameter, CELLPOSE_MIN_INFERENCE_DIAMETER_PX, 240.0)
+        ),
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        enable_clahe=enable_clahe,
+        allow_downscale=True,
+    )
+
+    combined = np.zeros(seg_img.shape[:2], dtype=np.int32)
+    occupied = np.zeros(seg_img.shape[:2], dtype=bool)
+    next_id = 1
+
+    # ---- Cellpose pass: hole-filled spheres, compacted label ids ---------------
+    n_labels = int(masks_main.max()) if masks_main.size else 0
+    if n_labels > 0:
+        label_area = np.bincount(masks_main.ravel(), minlength=n_labels + 1)
+        for lbl, sl in enumerate(ndi.find_objects(masks_main), start=1):
+            if sl is None or int(label_area[lbl]) < CLSM_MAIN_MIN_AREA_PX:
+                continue
+            region = (masks_main[sl] == lbl).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+            # Hollow ring masks (c0) must become solid discs, otherwise area,
+            # equivalent diameter and solidity are all measured on the rim only.
+            filled = np.zeros_like(region)
+            cv2.drawContours(
+                filled,
+                [max(contours, key=cv2.contourArea)],
+                -1,
+                1,
+                thickness=cv2.FILLED,
+            )
+            filled_bool = filled.astype(bool)
+            combined[sl][filled_bool] = next_id
+            occupied[sl] |= filled_bool
+            next_id += 1
+    n_main = next_id - 1
+
+    # ---- Residual catcher: small spheres + dense-cluster watershed split ------
+    combined, next_id, n_residual = _recover_clsm_residual_microspheres(
+        residual_source, base_diameter, combined, occupied, next_id
+    )
+
+    logger.info(
+        "CLSM microspheres [%s]: %d Cellpose + %d residual = %d objects",
+        resolved_mode, n_main, n_residual, next_id - 1,
+    )
+    return combined
+
+
+
 
 
 def predict_interactive_box_mask(

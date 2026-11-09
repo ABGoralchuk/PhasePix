@@ -3871,6 +3871,59 @@ def compute_interfacial_adsorption_metrics(
         "d_ref_um": round(float(d_ref), 4),
     })
 
+# Publication-grade aggregation classes used by the ``📊 Cluster Size (N_agg)
+# Distribution`` chart.  Boundaries are inclusive; ``None`` = open-ended upper bound.
+CLUSTER_SIZE_CLASSES: Tuple[Tuple[str, int, Optional[int]], ...] = (
+    ("Monomers (N = 1, Free)", 1, 1),
+    ("Dimers (N = 2)", 2, 2),
+    ("Trimers (N = 3)", 3, 3),
+    ("Small Clusters (N = 4–9)", 4, 9),
+    ("Large Flocs (N ≥ 10)", 10, None),
+)
+
+
+def _build_cluster_size_distribution(
+    cluster_sizes: Iterable[int],
+    columns: Iterable[str],
+) -> pd.DataFrame:
+    """
+    Group cluster sizes into the publication aggregation classes.
+
+    Every class is always present (even when empty) so the bar chart and its CSV
+    export keep a stable, comparable layout between images and sessions.
+
+    Args:
+        cluster_sizes: Aggregation number ``N_agg`` of every connected cluster,
+            singletons included.
+        columns: Exact column order of the returned plot-data table.
+
+    Returns:
+        pd.DataFrame: ``Cluster Class``, ``Cluster Count``, ``Total Particles in
+        Class`` and ``Share of Particles (%)`` (Σ = 100 %).
+    """
+    sizes = [int(size) for size in cluster_sizes if int(size) >= 1]
+    total_particles = int(sum(sizes))
+    records = []
+    for class_label, lower, upper in CLUSTER_SIZE_CLASSES:
+        if upper is None:
+            members = [size for size in sizes if size >= lower]
+        else:
+            members = [size for size in sizes if lower <= size <= upper]
+        particles_in_class = int(sum(members))
+        records.append({
+            "Cluster Class": class_label,
+            "Cluster Count": int(len(members)),
+            "Total Particles in Class": particles_in_class,
+            "Share of Particles (%)": (
+                round(100.0 * particles_in_class / total_particles, 3)
+                if total_particles > 0
+                else 0.0
+            ),
+        })
+    return pd.DataFrame(records, columns=list(columns))
+
+
+
     return per_bubble_df, ads_particles_df, summary
 
 
@@ -3881,7 +3934,9 @@ def compute_matrix_coalescence_metrics(
     pixel_to_um_ratio: float = 1.0,
     contact_dilation_px: int = 3,
     bubble_mask: Optional[np.ndarray] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict]:
+) -> Tuple[
+    pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict, pd.DataFrame
+]:
     """
     Quantify partial coalescence of matrix fat globules through a contact network (RAG).
 
@@ -3905,11 +3960,17 @@ def compute_matrix_coalescence_metrics(
             regardless of its (possibly stale) phase_class.
 
     Returns:
-        Tuple[pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict]:
+        Tuple[pd.DataFrame, pd.DataFrame, list[Tuple[int, int]], dict, pd.DataFrame]:
             1) per-globule table with Z, cluster id, cluster size and topological role,
-            2) cluster table for agglomerates with N_agg >= 2,
+            2) cluster table for agglomerates with N_agg >= 2 (sorted by N_agg
+               descending) carrying the particle-id list, the cluster equivalent
+               diameter, the radius of gyration R_g and the cluster aspect ratio,
             3) list of contact edges (id_1, id_2) for drawing coalescence bridges,
-            4) summary dictionary of matrix coalescence metrics.
+            4) summary dictionary of matrix coalescence metrics - including the
+               number-average <N_agg>_n, the weight-average <N_agg>_w and the
+               estimated 2D fractal dimension D_f of the aggregation process,
+            5) plot-data table of the aggregation classes (Monomers, Dimers,
+               Trimers, 4-9, >=10) behind the ``N_agg`` distribution bar chart.
     """
     particle_columns = [
         "id",
@@ -3927,12 +3988,23 @@ def compute_matrix_coalescence_metrics(
     ]
     cluster_columns = [
         "Cluster ID",
-        "Globules in Cluster (N_agg)",
+        "Particles in Cluster (N_agg)",
+        "Particle IDs",
+        "Mean Particle Ø (µm)",
+        "Cluster Equivalent Ø (µm)",
+        "Radius of Gyration R_g (µm)",
+        "Cluster Aspect Ratio",
         "Total Cluster Area (µm²)",
-        "Equivalent Cluster Diam (µm)",
-        "Mean Globule Diam (µm)",
         "Mean Coordination Z",
         "Mean Solidity",
+    ]
+    # Publication-grade aggregation classes: monomers -> large flocs.  They drive
+    # the ``📊 Cluster Size (N_agg) Distribution`` bar chart and its CSV export.
+    cluster_size_columns = [
+        "Cluster Class",
+        "Cluster Count",
+        "Total Particles in Class",
+        "Share of Particles (%)",
     ]
 
     ratio = _safe_float(pixel_to_um_ratio, 1.0)
@@ -3948,6 +4020,9 @@ def compute_matrix_coalescence_metrics(
         "Branching Nodes Z>=3 (%)": 0.0,
         "Mean Coordination Number (Z)": 0.0,
         "Mean Aggregation Number (N_agg)": 0.0,
+        "Mean Particles per Cluster <N_agg>_n": 0.0,
+        "Weight-Average Cluster Size <N_agg>_w": 0.0,
+        "Estimated 2D Fractal Dimension D_f": 0.0,
         "Mean Solidity": 0.0,
         "Mean Aspect Ratio": 0.0,
         "Contact Edges": 0,
@@ -3956,6 +4031,7 @@ def compute_matrix_coalescence_metrics(
 
     empty_particles = pd.DataFrame(columns=particle_columns)
     empty_clusters = pd.DataFrame(columns=cluster_columns)
+    empty_dist = _build_cluster_size_distribution([], cluster_size_columns)
 
     if (
         df is None
@@ -3963,7 +4039,7 @@ def compute_matrix_coalescence_metrics(
         or df.empty
         or "id" not in df.columns
     ):
-        return empty_particles, empty_clusters, [], summary
+        return empty_particles, empty_clusters, [], summary, empty_dist
 
     masks = None
     if isinstance(fat_masks, np.ndarray) and fat_masks.ndim >= 2:
@@ -3986,7 +4062,7 @@ def compute_matrix_coalescence_metrics(
     work["id"] = pd.to_numeric(work["id"], errors="coerce")
     work = work[work["id"].notna()].copy()
     if work.empty:
-        return empty_particles, empty_clusters, [], summary
+        return empty_particles, empty_clusters, [], summary, empty_dist
     work["id"] = work["id"].astype(int)
     for col in (
         "centroid_x",
@@ -4013,7 +4089,7 @@ def compute_matrix_coalescence_metrics(
         except (TypeError, ValueError):
             pass
     if work.empty:
-        return empty_particles, empty_clusters, [], summary
+        return empty_particles, empty_clusters, [], summary, empty_dist
 
 
     # Build graph nodes (one per matrix globule inside the ROI)
@@ -4104,7 +4180,7 @@ def compute_matrix_coalescence_metrics(
         })
 
     if not nodes:
-        return empty_particles, empty_clusters, [], summary
+        return empty_particles, empty_clusters, [], summary, empty_dist
 
     # Contact network (RAG): spatial hashing + mask-gap / centroid contact criteria
     n_nodes = len(nodes)
@@ -4222,29 +4298,114 @@ def compute_matrix_coalescence_metrics(
     particles_coal_df = pd.DataFrame(records, columns=particle_columns)
 
     cluster_records = []
+    # Per-cluster (N_agg, R_g [µm], mean particle radius [µm]) triples used for the
+    # 2D fractal-dimension fit, where r_0 is the primary particle radius.
+    fractal_points: list[Tuple[int, float, float]] = []
     for cluster_id, members in cluster_members.items():
         if len(members) < 2:
             continue
-        total_area = float(sum(nodes[i]["area_um2"] for i in members))
-        mean_diam = float(np.mean([nodes[i]["diameter_um"] for i in members]))
+        member_nodes = [nodes[i] for i in members]
+        n_agg = int(len(members))
+        total_area = float(sum(nd["area_um2"] for nd in member_nodes))
+        mean_diam = float(np.mean([nd["diameter_um"] for nd in member_nodes]))
+
+        # Area-weighted centre of mass and radius of gyration of the particle
+        # centres: R_g = sqrt(Σ A_i |r_i - r_cm|² / Σ A_i), reported in µm.
+        weights = np.array(
+            [max(float(nd["area_um2"]), 1e-12) for nd in member_nodes], dtype=float
+        )
+        xs = np.array([float(nd["cx"]) for nd in member_nodes], dtype=float)
+        ys = np.array([float(nd["cy"]) for nd in member_nodes], dtype=float)
+        weight_sum = float(weights.sum())
+        cx_cm = float(np.dot(weights, xs) / weight_sum)
+        cy_cm = float(np.dot(weights, ys) / weight_sum)
+        rg_px = float(
+            np.sqrt(
+                np.dot(weights, (xs - cx_cm) ** 2 + (ys - cy_cm) ** 2) / weight_sum
+            )
+        )
+        rg_um = rg_px * ratio
+
+        # Cluster envelope: spans of the particle centres along the principal axis
+        # and its orthogonal minor axis, each widened by one mean particle
+        # diameter (a two-sphere dimer is 2d x d -> 2.0, a linear trimer 3.0, a
+        # compact triangle 1.0).
+        centred = np.vstack([xs - cx_cm, ys - cy_cm])
+        try:
+            _eigvals, eigvecs = np.linalg.eigh(np.cov(centred, aweights=weights))
+            major_vec = eigvecs[:, -1]
+            minor_vec = eigvecs[:, 0]
+            proj_major = centred[0] * major_vec[0] + centred[1] * major_vec[1]
+            proj_minor = centred[0] * minor_vec[0] + centred[1] * minor_vec[1]
+            span_major = float(proj_major.max() - proj_major.min()) + mean_diam
+            span_minor = float(proj_minor.max() - proj_minor.min()) + mean_diam
+            aspect = span_major / max(span_minor, 1e-6)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            aspect = 1.0
+
         cluster_records.append({
             "Cluster ID": int(cluster_id),
-            "Globules in Cluster (N_agg)": int(len(members)),
-            "Total Cluster Area (µm²)": total_area,
-            "Equivalent Cluster Diam (µm)": (
+            "Particles in Cluster (N_agg)": n_agg,
+            "Particle IDs": ", ".join(str(int(nd["id"])) for nd in member_nodes),
+            "Mean Particle Ø (µm)": mean_diam,
+            "Cluster Equivalent Ø (µm)": (
                 math.sqrt(4.0 * total_area / math.pi) if total_area > 0 else 0.0
             ),
-            "Mean Globule Diam (µm)": mean_diam,
+            "Radius of Gyration R_g (µm)": rg_um,
+            "Cluster Aspect Ratio": float(aspect),
+            "Total Cluster Area (µm²)": total_area,
             "Mean Coordination Z": float(
                 np.mean([coordination[i] for i in members])
             ),
-            "Mean Solidity": float(np.mean([nodes[i]["solidity"] for i in members])),
+            "Mean Solidity": float(np.mean([nd["solidity"] for nd in member_nodes])),
         })
-    clusters_df = pd.DataFrame(cluster_records, columns=cluster_columns)
+        fractal_points.append((n_agg, rg_um, 0.5 * mean_diam))
 
+    clusters_df = pd.DataFrame(cluster_records, columns=cluster_columns)
+    if not clusters_df.empty:
+        # Biggest agglomerates first - the researcher immediately sees how many
+        # silica microspheres are cemented together in the worst cluster.
+        clusters_df = clusters_df.sort_values(
+            "Particles in Cluster (N_agg)", ascending=False, kind="mergesort"
+        ).reset_index(drop=True)
+
+
+    # Aggregation classes (Monomers / Dimers / Trimers / 4-9 / >=10)
+    cluster_sizes_all = [int(len(members)) for members in cluster_members.values()]
+    cluster_size_dist_df = _build_cluster_size_distribution(
+        cluster_sizes_all, cluster_size_columns
+    )
 
     total_globules = int(n_nodes)
-    multi_sizes = [len(members) for members in cluster_members.values() if len(members) >= 2]
+    multi_sizes = [size for size in cluster_sizes_all if size >= 2]
+    sizes_array = np.asarray(cluster_sizes_all, dtype=float)
+    # <N_agg>_w = Σ N_k² / Σ N_k over every group (monomers included): the standard
+    # weight-average aggregation number of the whole dispersion.
+    weight_average_n = (
+        float(np.dot(sizes_array, sizes_array) / sizes_array.sum())
+        if sizes_array.size and sizes_array.sum() > 0
+        else 0.0
+    )
+
+    # 2D fractal dimension: N_agg ∝ (R_g / r_0)^D_f, so D_f is the slope of
+    # ln(N_agg) against ln(R_g / r_0) fitted over clusters with N_agg >= 3 and
+    # clipped to the physically meaningful 2D range [1.0, 2.0].
+    d_f = 0.0
+    fit_points = [
+        (n_agg, rg_um, r0)
+        for n_agg, rg_um, r0 in fractal_points
+        if n_agg >= 3 and rg_um > 0 and r0 > 0
+    ]
+    if len(fit_points) >= 2:
+        x_fit = np.log(
+            np.array([rg_um / r0 for _, rg_um, r0 in fit_points], dtype=float)
+        )
+        y_fit = np.log(np.array([n_agg for n_agg, _, _ in fit_points], dtype=float))
+        if np.all(np.isfinite(x_fit)) and float(np.ptp(x_fit)) > 1e-6:
+            slope = float(np.polyfit(x_fit, y_fit, 1)[0])
+            if np.isfinite(slope):
+                d_f = float(np.clip(slope, 1.0, 2.0))
+
     summary.update({
         "Total Matrix Globules": total_globules,
         "Coalesced Fraction (%)": round(
@@ -4260,6 +4421,11 @@ def compute_matrix_coalescence_metrics(
         "Mean Aggregation Number (N_agg)": round(
             float(np.mean(multi_sizes)) if multi_sizes else 0.0, 3
         ),
+        "Mean Particles per Cluster <N_agg>_n": round(
+            float(np.mean(multi_sizes)) if multi_sizes else 0.0, 3
+        ),
+        "Weight-Average Cluster Size <N_agg>_w": round(weight_average_n, 3),
+        "Estimated 2D Fractal Dimension D_f": round(d_f, 3),
         "Mean Solidity": round(
             float(np.mean([nd["solidity"] for nd in nodes])), 4
         ),
@@ -4270,7 +4436,13 @@ def compute_matrix_coalescence_metrics(
         "Clusters (N>=2)": int(len(multi_sizes)),
     })
 
-    return particles_coal_df, clusters_df, edges, summary
+    return (
+        particles_coal_df,
+        clusters_df,
+        edges,
+        summary,
+        cluster_size_dist_df,
+    )
 
 
 if __name__ == "__main__":

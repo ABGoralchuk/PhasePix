@@ -44,7 +44,7 @@ import seaborn as sns
 from scipy.ndimage import binary_fill_holes, find_objects
 
 # Internal application modules
-from cellpose_model import get_cellpose_model, run_inference, get_device, detect_hardware, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, smooth_internal_crystals
+from cellpose_model import get_cellpose_model, run_inference, get_device, detect_hardware, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, cached_segment_clsm_microspheres, smooth_internal_crystals, to_grayscale_2d
 from analyzer import (
     extract_metrics,
     calculate_granulometry_metrics,
@@ -209,6 +209,111 @@ def save_light_presets(presets: dict) -> None:
         OSError: If the JSON file cannot be written (caller surfaces the message in the UI).
     """
     with open(LIGHT_PRESETS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(presets, fh, indent=2, ensure_ascii=False)
+
+
+# ---------------- CONFOCAL (CLSM) CALIBRATION PRESETS ----------------
+# Laboratory-validated objective coefficients for confocal laser scanning
+# micrographs (🔦 Confocal Fluorescence). Stored values mirror the Light block:
+# um_per_px (physical size of one pixel) plus the reference scale-bar geometry
+# used to derive it. 20x (0.799 µm/px) and 63x (0.099 µm/px) are the exact lab
+# calibrations; the remaining objectives are placeholders until calibrated.
+DEFAULT_CLSM_OBJECTIVES = {
+    "10x CLSM Objective (400×400)": {
+        "um_per_px": 1.59800,
+        "scale_bar_um": 50.0,
+        "scale_bar_px": 31.29,
+    },
+    "20x CLSM Objective (400×400)": {
+        "um_per_px": 0.79900,
+        "scale_bar_um": 50.0,
+        "scale_bar_px": 62.58,
+    },
+    "40x CLSM Objective": {
+        "um_per_px": 0.39950,
+        "scale_bar_um": 20.0,
+        "scale_bar_px": 50.06,
+    },
+    "63x CLSM Objective (1024×1024)": {
+        "um_per_px": 0.09900,
+        "scale_bar_um": 10.0,
+        "scale_bar_px": 101.01,
+    },
+    "100x CLSM Objective": {
+        "um_per_px": 0.06200,
+        "scale_bar_um": 10.0,
+        "scale_bar_px": 161.29,
+    },
+    "Custom CLSM Calibration": {
+        "um_per_px": 0.79900,
+        "scale_bar_um": 50.0,
+        "scale_bar_px": 62.58,
+    },
+}
+
+CLSM_PRESETS_FILE = "clsm_calibration_presets.json"
+# Resolve relative to the application root so presets survive any working directory.
+CLSM_PRESETS_PATH = Path(__file__).resolve().parent / CLSM_PRESETS_FILE
+
+
+def load_clsm_presets() -> dict:
+    """
+    Load confocal objective presets from ``clsm_calibration_presets.json``.
+
+    Defaults are always available; any user-saved / edited entries found in the
+    JSON file override their built-in counterparts. Malformed entries or a
+    corrupted file fall back silently to the built-in defaults so the UI never
+    breaks during a session.
+
+    Returns:
+        dict: Mapping ``objective name -> {"um_per_px", "scale_bar_um", "scale_bar_px"}``.
+    """
+    presets = {name: dict(values) for name, values in DEFAULT_CLSM_OBJECTIVES.items()}
+
+    try:
+        if CLSM_PRESETS_PATH.exists():
+            with open(CLSM_PRESETS_PATH, "r", encoding="utf-8") as fh:
+                stored = json.load(fh)
+            if isinstance(stored, dict):
+                for name, values in stored.items():
+                    if not isinstance(values, dict):
+                        continue
+                    try:
+                        um_per_px = float(values.get("um_per_px"))
+                        scale_bar_um = float(values.get("scale_bar_um", 50.0))
+                        scale_bar_px = float(values.get("scale_bar_px", 50.0 / um_per_px))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        continue
+                    if um_per_px <= 0 or scale_bar_um <= 0 or scale_bar_px <= 0:
+                        continue
+                    presets[str(name)] = {
+                        "um_per_px": um_per_px,
+                        "scale_bar_um": scale_bar_um,
+                        "scale_bar_px": scale_bar_px,
+                    }
+    except (OSError, json.JSONDecodeError):
+        # Corrupted / unreadable file: keep the in-memory defaults.
+        pass
+
+    if "Custom CLSM Calibration" not in presets:
+        presets["Custom CLSM Calibration"] = dict(
+            DEFAULT_CLSM_OBJECTIVES["Custom CLSM Calibration"]
+        )
+
+    return presets
+
+
+def save_clsm_presets(presets: dict) -> None:
+    """
+    Persist confocal objective presets to ``clsm_calibration_presets.json``.
+
+    Args:
+        presets: Mapping ``objective name -> {"um_per_px", "scale_bar_um", "scale_bar_px"}``.
+
+    Raises:
+        OSError: If the JSON file cannot be written (caller surfaces the message in the UI).
+    """
+    with open(CLSM_PRESETS_PATH, "w", encoding="utf-8") as fh:
         json.dump(presets, fh, indent=2, ensure_ascii=False)
 
 
@@ -3287,9 +3392,9 @@ st.set_page_config(
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v1.8.8"
-PHASEPIX_BUILD_DATE = "2026.11.06"
-PHASEPIX_BUILD_TITLE = "Fix SEM Bubble Detection & Sub-3s Light Mode Scaling"
+PHASEPIX_BUILD_VERSION = "v2.0.0"
+PHASEPIX_BUILD_DATE = "2026.11.09"
+PHASEPIX_BUILD_TITLE = "PhasePix 2.0 — Confocal Fluorescence (CLSM) & Silica Cluster Analytics"
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -3370,6 +3475,92 @@ def decode_image_bytes(file_bytes: bytes) -> np.ndarray:
         # Fallback to standard PIL decoding
         pil_img = Image.open(io.BytesIO(file_bytes)).convert("L")
         return np.array(pil_img, dtype=np.uint8)
+
+    except Exception as exc:
+        st.error(f"Failed to read image file: {exc}")
+        raise exc
+
+
+def _to_uint8_preserving_color(arr: np.ndarray) -> np.ndarray:
+    """
+    Scale a decoded numeric array to uint8 while KEEPING its channel structure.
+
+    Unlike the analysis decoder (which collapses everything to one plane), this
+    helper keeps a multi-channel CLSM stack as ``(H, W, 3)`` RGB. 16-bit data is
+    stretched with a single global min/max pair so the relative R:G:B intensity
+    balance (i.e. the colour mix the microscopist tuned on the confocal) is
+    preserved exactly - per-channel stretching would shift the hue.
+
+    Args:
+        arr: Decoded array of any numeric dtype with shape ``(H, W)``,
+            ``(H, W, 1)``, ``(H, W, 2)`` or ``(H, W, C>=3)``.
+
+    Returns:
+        np.ndarray: ``(H, W)`` uint8 for single-channel input, ``(H, W, 3)``
+        uint8 RGB for multi-channel input (alpha / extra channels dropped).
+    """
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+    elif arr.ndim == 3 and arr.shape[2] == 2:
+        # Two-channel stacks (e.g. fluorescence + transmitted light): the first
+        # channel carries the signal of interest, the second is a reference.
+        arr = arr[:, :, 0]
+    elif arr.ndim == 3 and arr.shape[2] > 3:
+        # RGBA / multi-channel: keep the visible RGB triplet, drop alpha & extras.
+        arr = arr[:, :, :3]
+
+    if arr.dtype != np.uint8:
+        arr = np.clip(
+            (arr.astype(np.float32) - float(arr.min()))
+            / max(float(arr.max()) - float(arr.min()), 1e-6)
+            * 255.0,
+            0,
+            255,
+        ).astype(np.uint8)
+
+    return arr
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def decode_image_rgb_bytes(file_bytes: bytes) -> np.ndarray:
+    """
+    Decode image bytes into a uint8 array that PRESERVES colour channels.
+
+    Confocal (CLSM) acquisitions are frequently stored as 8-bit or 16-bit
+    multi-channel TIFF/PNG/JPG stacks, and the channel mixing carries the actual
+    biological contrast (e.g. green droplets against a red matrix).
+    ``decode_image_bytes`` deliberately collapses every file to a single 2D
+    intensity plane for quantitative metrics; this companion decoder keeps the
+    full colour information on the way in so the overlay / dashboard can render
+    the frame exactly as it was acquired.
+
+    Cached via ``@st.cache_data`` (16 entries) for the same reason as
+    ``decode_image_bytes``: the sidebar size probe and the analysis pass request
+    the very same bytes several times per rerun.
+
+    Args:
+        file_bytes: Raw bytes of the uploaded micrograph.
+
+    Returns:
+        np.ndarray: ``(H, W, 3)`` uint8 RGB for multi-channel files, or a plain
+        ``(H, W)`` uint8 grayscale array for single-channel files.
+    """
+    try:
+        # First attempt decoding via tifffile (handles scientific 16-bit/8-bit
+        # TIFFs as well as multi-page / multi-channel CLSM stacks).
+        try:
+            arr = tifffile.imread(io.BytesIO(file_bytes))
+            if isinstance(arr, np.ndarray) and arr.size > 0:
+                return _to_uint8_preserving_color(arr)
+        except Exception:
+            pass
+
+        # Fallback to standard PIL decoding: colour modes stay RGB, single
+        # channel / scientific modes are normalised through the same helper.
+        pil_img = Image.open(io.BytesIO(file_bytes))
+        if pil_img.mode in ("L", "I", "F", "I;16", "I;16B", "I;16L", "I;16N"):
+            return _to_uint8_preserving_color(np.array(pil_img))
+        return _to_uint8_preserving_color(np.array(pil_img.convert("RGB")))
 
     except Exception as exc:
         st.error(f"Failed to read image file: {exc}")
@@ -3502,30 +3693,69 @@ def get_local_images(directory: str = "images") -> list:
 IMAGE_ROOT_DIR = Path("images")
 SEM_IMAGE_DIR = IMAGE_ROOT_DIR / "sem"
 LIGHT_IMAGE_DIR = IMAGE_ROOT_DIR / "light"
+CLSM_IMAGE_DIR = IMAGE_ROOT_DIR / "clsm"
+
+
+def resolve_clsm_image_dir() -> Path:
+    """
+    Return the CLSM image folder, honouring both ``images/CLSM`` and ``images/clsm``.
+
+    Confocal exports are commonly stored in an upper-case ``images/CLSM`` folder
+    created by hand, while the code base uses lower-case modality folders. Both
+    spellings are accepted (the lookup is effectively case-insensitive so files
+    dropped into either folder are listed automatically). A variant that already
+    contains micrographs wins over an empty one, otherwise the existing folder is
+    kept and ``images/clsm`` is the fallback that gets created on demand.
+
+    Returns:
+        Path: Path to the CLSM micrograph folder.
+    """
+    candidates = (IMAGE_ROOT_DIR / "CLSM", CLSM_IMAGE_DIR)
+    for candidate in candidates:
+        if candidate.is_dir() and get_local_images(str(candidate)):
+            return candidate
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return CLSM_IMAGE_DIR
 
 
 def ensure_modality_image_folders() -> None:
-    """Create images/, images/sem/ and images/light/ automatically on startup."""
+    """Create images/, images/sem/, images/light/ and the CLSM folder on startup."""
     for _dir in (IMAGE_ROOT_DIR, SEM_IMAGE_DIR, LIGHT_IMAGE_DIR):
         _dir.mkdir(parents=True, exist_ok=True)
+    # Never create a second CLSM folder next to a hand-made images/CLSM.
+    if not (IMAGE_ROOT_DIR / "CLSM").is_dir() and not CLSM_IMAGE_DIR.is_dir():
+        CLSM_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_modality_images(is_light_mode: bool) -> Tuple[list, str, bool]:
+def get_modality_images(
+    is_light_mode: bool,
+    is_clsm_mode: bool = False,
+) -> Tuple[list, str, bool]:
     """
     Return the image list for the active imaging modality.
 
-    Light Microscopy reads ``images/light/`` and SEM reads ``images/sem/``. If the
+    SEM reads ``images/sem/``, Light Microscopy reads ``images/light/`` and
+    Confocal Fluorescence reads ``images/CLSM/`` (or ``images/clsm/``). If the
     modality folder is empty, files directly under ``images/`` are listed instead
     so existing projects keep working.
 
     Args:
         is_light_mode: Whether the sidebar modality switch is set to Light Microscopy.
+        is_clsm_mode: Whether the sidebar modality switch is set to Confocal
+            Fluorescence (takes precedence over ``is_light_mode``).
 
     Returns:
         Tuple[list, str, bool]: (image_paths, primary_folder, used_legacy_fallback)
     """
     ensure_modality_image_folders()
-    primary_dir = LIGHT_IMAGE_DIR if is_light_mode else SEM_IMAGE_DIR
+    if is_clsm_mode:
+        primary_dir = resolve_clsm_image_dir()
+    elif is_light_mode:
+        primary_dir = LIGHT_IMAGE_DIR
+    else:
+        primary_dir = SEM_IMAGE_DIR
     modality_files = get_local_images(str(primary_dir))
     if modality_files:
         return modality_files, str(primary_dir), False
@@ -4889,7 +5119,9 @@ with st.sidebar:
         st.toast(f"🔄 Restored built-in presets: {_preset_restored_flash}", icon="🔄")
 
     st.title("🔬 PhasePix Controls")
-    st.markdown("Quantitative SEM & Light Microscopy Colloid Analyzer.")
+    st.markdown(
+        "Quantitative SEM · Light Microscopy · Confocal Fluorescence Colloid Analyzer."
+    )
     st.caption(
         f"📦 **Build: {PHASEPIX_BUILD_DATE} ({PHASEPIX_BUILD_VERSION} - {PHASEPIX_BUILD_TITLE})**"
     )
@@ -4929,17 +5161,24 @@ with st.sidebar:
     st.subheader("0. Imaging Modality")
     imaging_mode = st.radio(
         "Microscopy Mode",
-        options=["🔬 SEM Micrograph", "💡 Light Microscopy"],
+        options=[
+            "🔬 SEM Micrograph",
+            "💡 Light Microscopy",
+            "🔦 Confocal Fluorescence",
+        ],
         index=0,
         horizontal=True,
         key="imaging_modality_radio",
         help=(
             "**SEM Micrograph** — electron micrographs with an embedded databar / scale bar.  \n"
             "**Light Microscopy** — transmitted-light images (e.g. emulsion fat droplets) "
-            "calibrated from a stored objective preset instead of the SEM scale bar."
+            "calibrated from a stored objective preset instead of the SEM scale bar.  \n"
+            "**Confocal Fluorescence** — multi-channel CLSM stacks; colour channels are "
+            "preserved for rendering and calibrated from a CLSM objective preset."
         ),
     )
     is_light_mode = (imaging_mode == "💡 Light Microscopy")
+    is_clsm_mode = (imaging_mode == "🔦 Confocal Fluorescence")
 
     # Shared preprocessing toggles keep different physical defaults per modality
     # (CLAHE helps recover shadowed SEM craters but amplifies brightfield halos).
@@ -4958,8 +5197,15 @@ with st.sidebar:
     st.divider()
 
     st.subheader("1. Image Input")
-    available_images, images_primary_dir, images_used_fallback = get_modality_images(is_light_mode)
-    _folder_hint = "light micrographs" if is_light_mode else "SEM micrographs"
+    available_images, images_primary_dir, images_used_fallback = get_modality_images(
+        is_light_mode, is_clsm_mode
+    )
+    if is_clsm_mode:
+        _folder_hint = "CLSM confocal micrographs"
+    elif is_light_mode:
+        _folder_hint = "light micrographs"
+    else:
+        _folder_hint = "SEM micrographs"
     st.caption(f"📁 Folder: {images_primary_dir}/ (drop {_folder_hint} here)")
     if images_used_fallback and available_images:
         st.caption(
@@ -5073,10 +5319,13 @@ with st.sidebar:
     st.divider()
 
     st.subheader("2. Footer Panel Exclusion")
-    if is_light_mode:
-        # Light micrographs have no SEM databar — keep the panel collapsed and
-        # default the crop to 0 px so the full frame is analysed.
-        with st.expander("Optional Banner Crop (Light Mode)", expanded=False):
+    if is_light_mode or is_clsm_mode:
+        # Light / confocal micrographs have no SEM databar — keep the panel
+        # collapsed and default the crop to 0 px so the full frame is analysed.
+        _banner_mode_label = "Light" if is_light_mode else "CLSM"
+        with st.expander(
+            f"Optional Banner Crop ({_banner_mode_label} Mode)", expanded=False
+        ):
             footer_height = int(
                 st.number_input(
                     "Footer Height (pixels)",
@@ -5084,10 +5333,15 @@ with st.sidebar:
                     value=0,
                     step=5,
                     help=(
-                        "Optional: crop a bottom banner from the light micrograph. "
+                        f"Optional: crop a bottom banner from the "
+                        f"{'light micrograph' if is_light_mode else 'CLSM frame'}. "
                         "Leave at 0 for standard microscope camera images."
                     ),
-                    key="light_footer_height_input",
+                    key=(
+                        "light_footer_height_input"
+                        if is_light_mode
+                        else "clsm_footer_height_input"
+                    ),
                 )
             )
     else:
@@ -5109,7 +5363,7 @@ with st.sidebar:
 
     st.subheader("3. Spatial Calibration")
 
-    # Objective preset chosen in Light Microscopy mode (None while in SEM mode)
+    # Objective preset chosen in Light / CLSM mode (None while in SEM mode)
     selected_objective: Optional[str] = None
 
     if is_light_mode:
@@ -5241,6 +5495,172 @@ with st.sidebar:
             except OSError as exc:
                 st.error(f"Could not write `{LIGHT_PRESETS_FILE}`: {exc}")
 
+    elif is_clsm_mode:
+        # ── Confocal Fluorescence (CLSM): objective-preset calibration ───────
+        # CLSM acquisitions carry no SEM databar/scale-bar line, therefore
+        # detect_scale_bar() is never invoked in this mode either; the physical
+        # scale comes from the laboratory-calibrated objective preset.
+        detected_bar_pixels = 0
+        scale_preview = None
+        use_auto_scale = False
+
+        clsm_presets = load_clsm_presets()
+        clsm_preset_names = list(clsm_presets.keys())
+
+        # Auto-select the lab-validated objective from the frame geometry: the
+        # 20x CLSM acquisition is saved as 400x400 px, the 63x one as
+        # 1024x1024 px. Other frame sizes keep the default / previous choice.
+        _clsm_size_target: Optional[str] = None
+        if image_bytes is not None:
+            try:
+                _clsm_probe_shape = decode_image_rgb_bytes(image_bytes).shape
+                _clsm_probe_wh = (int(_clsm_probe_shape[1]), int(_clsm_probe_shape[0]))
+                if _clsm_probe_wh == (400, 400):
+                    _clsm_size_target = "20x CLSM Objective (400×400)"
+                elif _clsm_probe_wh == (1024, 1024):
+                    _clsm_size_target = "63x CLSM Objective (1024×1024)"
+            except Exception:
+                _clsm_size_target = None
+
+        # Apply the geometry default only once per newly loaded frame, so a
+        # manual objective choice for the current image is never overridden.
+        if (
+            _clsm_size_target
+            and st.session_state.get("clsm_autoselect_image") != image_name
+        ):
+            st.session_state["clsm_autoselect_image"] = image_name
+            st.session_state["clsm_objective_preset"] = _clsm_size_target
+
+        _default_clsm_objective = _clsm_size_target or "20x CLSM Objective (400×400)"
+        _default_clsm_idx = (
+            clsm_preset_names.index(_default_clsm_objective)
+            if _default_clsm_objective in clsm_preset_names
+            else 0
+        )
+
+        selected_objective = st.selectbox(
+            "CLSM Objective Preset",
+            options=clsm_preset_names,
+            index=_default_clsm_idx,
+            key="clsm_objective_preset",
+            help=(
+                "Laboratory-validated confocal objective calibration (µm per pixel). "
+                "Pick 'Custom CLSM Calibration' for an arbitrary coefficient."
+            ),
+        )
+
+        _active_clsm_preset = clsm_presets.get(
+            selected_objective, DEFAULT_CLSM_OBJECTIVES["Custom CLSM Calibration"]
+        )
+        _clsm_um_per_px = float(_active_clsm_preset.get("um_per_px", 0.799))
+        _clsm_bar_um = float(_active_clsm_preset.get("scale_bar_um", 50.0))
+        _clsm_bar_px = float(_active_clsm_preset.get("scale_bar_px", 62.58))
+
+        # Widget state for keys that disappear from the layout (e.g. after
+        # switching to SEM mode and back) is discarded by Streamlit, therefore
+        # both the objective change AND missing keys are handled here.
+        clsm_calib_input_style = st.radio(
+            "Calibration Input Method",
+            ["Direct Ratio (µm/px)", "Known Scale (µm / pixels)"],
+            horizontal=True,
+            key="clsm_calib_input_style",
+        )
+
+        _clsm_objective_changed = (
+            st.session_state.get("clsm_preset_tracker") != selected_objective
+        )
+        if _clsm_objective_changed:
+            st.session_state["clsm_preset_tracker"] = selected_objective
+            st.session_state["clsm_um_per_px_input"] = _clsm_um_per_px
+            st.session_state["clsm_scale_bar_um_input"] = _clsm_bar_um
+            st.session_state["clsm_scale_bar_px_input"] = _clsm_bar_px
+
+        if clsm_calib_input_style == "Direct Ratio (µm/px)":
+            if "clsm_um_per_px_input" not in st.session_state:
+                st.session_state["clsm_um_per_px_input"] = _clsm_um_per_px
+            pixel_to_um_ratio = float(
+                st.number_input(
+                    "Calibration Factor (µm/px)",
+                    min_value=0.0001,
+                    max_value=100.0,
+                    value=float(_clsm_um_per_px),
+                    step=0.001,
+                    format="%.5f",
+                    help=(
+                        "Physical size represented by a single pixel at the "
+                        "selected CLSM objective."
+                    ),
+                    key="clsm_um_per_px_input",
+                )
+            )
+            pixels_per_um = 1.0 / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 5.0
+            # Manifest compatibility: emulate a nominal 10 µm reference scale bar
+            scale_bar_um = 10.0
+            scale_bar_length_px = (
+                scale_bar_um / pixel_to_um_ratio if pixel_to_um_ratio > 0 else 50.0
+            )
+        else:
+            if "clsm_scale_bar_um_input" not in st.session_state:
+                st.session_state["clsm_scale_bar_um_input"] = _clsm_bar_um
+            if "clsm_scale_bar_px_input" not in st.session_state:
+                st.session_state["clsm_scale_bar_px_input"] = _clsm_bar_px
+            scale_bar_um = float(
+                st.number_input(
+                    "Real Stage Micrometer / Scale Size (µm)",
+                    min_value=0.1,
+                    max_value=5000.0,
+                    step=0.5,
+                    help=(
+                        "Known physical length of the stage micrometer division "
+                        "or embedded scale bar."
+                    ),
+                    key="clsm_scale_bar_um_input",
+                )
+            )
+            scale_bar_length_px = float(
+                st.number_input(
+                    "Measured Length (pixels)",
+                    min_value=1.0,
+                    max_value=20000.0,
+                    step=1.0,
+                    help="Length of that same reference distance measured in pixels.",
+                    key="clsm_scale_bar_px_input",
+                )
+            )
+            if scale_bar_length_px > 0 and scale_bar_um > 0:
+                pixel_to_um_ratio = float(scale_bar_um) / float(scale_bar_length_px)
+                pixels_per_um = float(scale_bar_length_px) / float(scale_bar_um)
+            else:
+                pixel_to_um_ratio = 1.0 / 5.0
+                pixels_per_um = 5.0
+                st.warning("Enter valid reference size (µm) and measured length (pixels).")
+
+        st.info(
+            f"Active Scale: **{pixels_per_um:.3f} px/µm** ({pixel_to_um_ratio:.4f} µm/px)"
+        )
+
+        if st.button(
+            "💾 Save Current Value to CLSM Preset",
+            use_container_width=True,
+            key="clsm_save_preset_btn",
+        ):
+            clsm_presets[selected_objective] = {
+                "um_per_px": float(pixel_to_um_ratio),
+                "scale_bar_um": float(scale_bar_um),
+                "scale_bar_px": float(scale_bar_length_px),
+            }
+            try:
+                save_clsm_presets(clsm_presets)
+                st.success(
+                    f"Saved **{selected_objective}** → "
+                    f"{float(pixel_to_um_ratio):.5f} µm/px "
+                    f"({pixels_per_um:.3f} px/µm → `{CLSM_PRESETS_FILE}`)",
+                    icon="💾",
+                )
+                st.toast(f"Preset saved: {selected_objective}", icon="💾")
+            except OSError as exc:
+                st.error(f"Could not write `{CLSM_PRESETS_FILE}`: {exc}")
+
     else:
         # ── SEM Mode: unchanged automatic scale-bar detection ────────────────
         # Detect scale bar in UPPER-RIGHT banner only (avoids table separator line)
@@ -5330,8 +5750,9 @@ with st.sidebar:
 
     st.subheader("4. Phase Classification")
 
-    if is_light_mode:
-        # Phase classification is locked in light mode; the radio is hidden.
+    if is_light_mode or is_clsm_mode:
+        # Single dispersed phase in Light / CLSM modes: the SEM sample-type radio
+        # is irrelevant (CLSM always analyses colloidal silica microspheres).
         sample_type = "Emulsion"
     else:
         sample_type = st.radio(
@@ -5378,6 +5799,56 @@ with st.sidebar:
         overlap_priority = "Air Bubbles"
         out_of_range_handling = "Unclassified"
         st.caption(f"🟧 Fat: [{min_fat_size:.2f}, {max_fat_size:.2f}] µm")
+
+    elif is_clsm_mode:
+        # ── Confocal Fluorescence: colloidal silica microspheres ─────────────
+        detection_focus = None  # Single dispersed phase - no SEM air/fat split
+        st.info(
+            "🟣 **Confocal Fluorescence Mode: Colloidal Microspheres** — every "
+            "segmented object inside the size range is counted as one microsphere; "
+            "air-bubble and adsorbed-fat phases do not exist in this analysis.",
+            icon="🔒",
+        )
+        clsm_dispersed_system = st.selectbox(
+            "CLSM Dispersed System",
+            options=["🟣 Colloidal Microspheres"],
+            index=0,
+            key="clsm_dispersed_system_select",
+            help=(
+                "Dispersed phase analysed in CLSM mode. **Colloidal Microspheres** "
+                "segments compact silica spheres (composite RGB, c1 negative "
+                "contrast and c0 fluorescent-shell channels alike)."
+            ),
+        )
+        st.markdown("**Microsphere Size Range (µm):**")
+        col_ms1, col_ms2 = st.columns(2)
+        with col_ms1:
+            min_fat_size = float(st.number_input(
+                "Min Particle Size (µm)",
+                min_value=0.0,
+                max_value=5000.0,
+                value=0.50,
+                step=0.1,
+                help="Minimum equivalent diameter in micrometers for silica microspheres.",
+                key="clsm_min_particle_size_input",
+            ))
+        with col_ms2:
+            max_fat_size = float(st.number_input(
+                "Max Particle Size (µm)",
+                min_value=0.0,
+                max_value=5000.0,
+                value=80.0,
+                step=1.0,
+                help="Maximum equivalent diameter in micrometers for silica microspheres.",
+                key="clsm_max_particle_size_input",
+            ))
+        # Internal defaults for the phases that do not exist in a dispersed
+        # colloidal system (keeps the shared classification maths untouched).
+        min_air_size = 10.0
+        max_air_size = 100.0
+        overlap_priority = "Air Bubbles"
+        out_of_range_handling = "Unclassified"
+        st.caption(f"🟣 Microspheres: [{min_fat_size:.2f}, {max_fat_size:.2f}] µm")
 
     elif sample_type == "Emulsion":
         detection_focus = None  # Not applicable for single-phase Emulsion
@@ -5555,6 +6026,35 @@ with st.sidebar:
         )
         is_crystallized_mode = emulsion_profile.startswith("❄️")
 
+    # CLSM optical channel (Confocal Fluorescence only). ``None`` outside CLSM so
+    # the cached segmentation call and the classification tracker stay valid.
+    clsm_channel_mode: Optional[str] = None
+    if is_clsm_mode:
+        emulsion_profile = "N/A (CLSM Mode)"
+        clsm_channel_mode = st.radio(
+            "🔬 CLSM Channel / Optical Mode",
+            options=[
+                "🔄 Auto-Detect (RGB Composite / c1 Negative / c0 Shell)",
+                "🎨 Composite RGB (Green Matrix + Magenta Shell)",
+                "⚫ Channel c1 (Dark Spheres in Bright Matrix)",
+                "⚪ Channel c0 (Bright Fluorescent Shells on Dark Background)",
+            ],
+            index=0,
+            key="clsm_channel_mode_radio",
+            help=(
+                "**Auto-Detect** — a 3-channel RGB stack is treated as the composite "
+                "(green matrix + magenta shell), a single plane with median > 90 grey "
+                "levels as the bright-background **c1** negative-contrast matrix, and "
+                "anything darker as the **c0** fluorescent-shell channel.  \n"
+                "**Composite RGB** — uses ``255 − G`` (the dark silica core becomes a "
+                "bright solid disc) blended with the magenta shell for sharp "
+                "inter-particle boundaries.  \n"
+                "**Channel c1** — inverted so the dark spheres become bright discs.  \n"
+                "**Channel c0** — hollow bright rings are hole-filled and given a "
+                "distance-transform dome so they are measured as whole solid spheres."
+            ),
+        )
+
     model_type = st.selectbox(
         "Pretrained Model",
         options=["cyto3", "cyto2", "nuclei", "Custom Model File..."],
@@ -5600,7 +6100,36 @@ with st.sidebar:
     expected_droplet_um: Optional[float] = None
 
     if sample_type == "Emulsion":
-        if is_light_mode:
+        if is_clsm_mode:
+            # CLSM: physical microsphere diameter (µm) -> pixels via the active
+            # objective preset.  The residual catcher below Cellpose's receptive
+            # field is scaled from this same value (0.8 x base), so raising it
+            # trades fine-sphere recall for large-sphere stability.
+            expected_droplet_um = float(
+                st.slider(
+                    "🎯 Typical Microsphere Diameter for AI (µm)",
+                    min_value=1.0,
+                    max_value=60.0,
+                    value=14.0,
+                    step=0.5,
+                    help=(
+                        "Physical diameter (µm) of the silica microspheres AI should "
+                        "focus on. Converted to pixels with the active CLSM objective "
+                        "calibration; smaller spheres below Cellpose's receptive field "
+                        "are recovered by the distance-transform watershed catcher."
+                    ),
+                    key="clsm_microsphere_um",
+                )
+            )
+            eff_diameter = float(
+                np.clip(expected_droplet_um / max(pixel_to_um_ratio, 1e-6), 8.0, 220.0)
+            )
+            st.caption(
+                f"🎯 AI Target Scale: **{expected_droplet_um:.1f} µm** → **{eff_diameter:.0f} px** "
+                f"(at {pixels_per_um:.2f} px/µm) | residual catcher "
+                f"**5–{max(6.0, 0.8 * eff_diameter):.0f} px**"
+            )
+        elif is_light_mode:
             # Physical (µm) target scale — automatically converted to pixels using the
             # active objective calibration, and no longer capped at 45 px so large
             # crystallized globules are captured whole instead of split into shards.
@@ -5687,7 +6216,26 @@ with st.sidebar:
     # Pickering corona rim band (µm) - SEM Whipped Emulsion only, inert elsewhere.
     corona_capture_um = 0.0
 
-    if is_light_mode:
+    if is_clsm_mode:
+        # CLSM (single-phase colloidal dispersion): no air / adsorbed-fat /
+        # corona controls exist, so they stay hidden with inert internal values.
+        air_min_circularity = 0.50
+        ads_min_circularity = 0.30
+        enable_deepscan = False
+        fat_min_circularity = st.slider(
+            "🟣 Microsphere Min Circularity", 0.0, 1.0, 0.55, 0.01,
+            help=(
+                "Shape gate for segmented silica microspheres. Compact spheres "
+                "score 0.8-1.0; aggregate debris, crescent fragments and merged "
+                "clusters fall below this value and are rejected."
+            ),
+            key="clsm_microsphere_circ_slider",
+        )
+        st.caption(
+            "ℹ️ CLSM: only the microsphere circularity gate is applied — every "
+            "detected object inside the Section 4 size range is one sphere."
+        )
+    elif is_light_mode:
         # Light microscopy (single-phase emulsion): air-bubble / adsorbed-fat
         # controls are irrelevant, so they stay hidden with safe internal values.
         air_min_circularity = 0.50
@@ -6303,6 +6851,11 @@ if is_light_mode:
     st.markdown(
         "Automated brightfield & crystallized fat droplet segmentation, granulometry ($D[3,2], D[4,3]$), and coalescence network analytics."
     )
+elif is_clsm_mode:
+    st.title("PhasePix: Quantitative Confocal Fluorescence Analyzer")
+    st.markdown(
+        "Multi-channel CLSM segmentation with preserved RGB colour data, objective-preset calibration, and granulometry ($D[3,2], D[4,3]$) of fluorescent phases."
+    )
 else:
     st.title("PhasePix: Quantitative SEM Microstructure Analyzer")
     st.markdown(
@@ -6322,8 +6875,20 @@ else:
     pipeline_timing = pipeline_timing_template()
     _stage_started = time.perf_counter()
 
-    # 1. Decode original full micrograph
-    original_img = decode_image_bytes(image_bytes)
+    # 1. Decode original full micrograph. CLSM acquisitions are often
+    #    multi-channel RGB stacks, so the colour frame is kept for rendering
+    #    while every quantitative stage runs on its luminance projection
+    #    (single 2D intensity plane, identical maths to SEM / Light modes).
+    clsm_color_img: Optional[np.ndarray] = None
+    if is_clsm_mode:
+        clsm_color_img = decode_image_rgb_bytes(image_bytes)
+        original_img = (
+            clsm_color_img
+            if clsm_color_img.ndim == 2
+            else to_grayscale_2d(clsm_color_img)
+        )
+    else:
+        original_img = decode_image_bytes(image_bytes)
     img_h, img_w = original_img.shape[:2]
 
     # Guard against invalid footer height exceeding image bounds
@@ -6561,6 +7126,33 @@ else:
                     flow_threshold=float(flow_threshold),
                     cellprob_threshold=-2.0,
                 )
+    elif is_clsm_mode:
+        # ── Confocal Fluorescence: silica microspheres (all 3 CLSM file types) ──
+        # The colour stack is passed through untouched so the composite mode can
+        # use the green matrix + magenta shell channels; c1/c0 exports reach the
+        # same entry point as a single plane and are routed by auto-detection.
+        if clsm_color_img is not None:
+            clsm_seg_source = (
+                clsm_color_img[:-effective_footer, :]
+                if effective_footer > 0
+                else clsm_color_img
+            )
+        else:
+            clsm_seg_source = analysis_img
+        with st.spinner("🔦 Segmenting silica microspheres (CLSM)..."):
+            masks = cached_segment_clsm_microspheres(
+                image=clsm_seg_source,
+                base_diameter_px=float(eff_diameter),
+                channel_mode=str(clsm_channel_mode or "auto"),
+                model_name=model_type,
+                custom_model_path=custom_model_path,
+                flow_threshold=float(flow_threshold),
+                cellprob_threshold=float(cellprob_threshold),
+                enable_clahe=enable_clahe,
+            )
+        _air_df_pass = pd.DataFrame()
+        air_masks = None
+        combined_bubble_mask = compute_cumulative_bubble_mask(None)
     else:
         # ── Standard single-pass (Emulsion) ──────────────────────────────────
         with st.spinner("Executing AI particle segmentation..."):
@@ -6807,12 +7399,14 @@ else:
         # v1.8.7: small discrete droplets (< 20 px) get a pixel-grid relief on both
         # gates, because rasterising a round 8-22 px droplet already costs it several
         # hundredths of circularity/solidity (see ``small_droplet_shape_gates``).
+        # v2.0: CLSM microspheres are 5-20 px objects too, so they receive the same
+        # pixel-grid relief.
         circ_gate, solidity_gate = small_droplet_shape_gates(
             raw_df["diameter_um"] if "diameter_um" in raw_df.columns else pd.Series(dtype=float),
             pixel_to_um_ratio,
             fat_min_circularity,
             fat_min_solidity,
-            is_light_mode,
+            bool(is_light_mode or is_clsm_mode),
         )
         if is_light_mode and float(fat_min_solidity) > 0 and "solidity" in raw_df.columns:
             solidity_ok = np.where(
@@ -6899,6 +7493,10 @@ else:
         round(float(eff_diameter), 1) if eff_diameter else 0.0,
         int(crystal_smooth_strength),
         bool(enable_multiscale_crystal),
+        # Switching the CLSM optical mode / circularity gate produces a mask with
+        # different object ids, so the sticky editor state must be rebuilt.
+        str(clsm_channel_mode or ""),
+        round(float(fat_min_circularity), 3) if is_clsm_mode else 0.0,
     )
     if st.session_state.get("last_class_params") != current_class_params or st.session_state.pop("force_class_refresh", False):
         st.session_state["last_class_params"] = current_class_params
@@ -7164,11 +7762,22 @@ else:
     unclass_count = int(classified_df["phase_class"].astype(str).str.lower().eq("unclassified").sum()) if not classified_df.empty else 0
 
     # Visualization preparations: Dimming & Padding
-    # Apply translucent dimming to footer panel on full-size display image
+    # Apply translucent dimming to footer panel on full-size display image.
+    # CLSM frames keep their original colour mix (only the analysis plane is
+    # grayscale), so the overlay is rendered on the true acquisition colours.
+    _display_source_img = (
+        clsm_color_img
+        if (is_clsm_mode and clsm_color_img is not None)
+        else original_img
+    )
     base_display_img = (
-        apply_footer_dimming(original_img, footer_height=effective_footer, dim_factor=0.4)
+        apply_footer_dimming(_display_source_img, footer_height=effective_footer, dim_factor=0.4)
         if effective_footer > 0
-        else np.stack([original_img, original_img, original_img], axis=-1)
+        else (
+            _display_source_img
+            if _display_source_img.ndim == 3
+            else np.stack([_display_source_img, _display_source_img, _display_source_img], axis=-1)
+        )
     )
 
     # Zero-pad filtered masks along the bottom to match full micrograph dimensions
@@ -7523,11 +8132,12 @@ else:
         "🖌️ Manual Correction",
         "🔬 Metrics",
         "🛡️ Interfacial Analytics",
-        "🍇 Matrix Coalescence",
+        "🍇 Cluster & Coalescence Analytics",
         "💾 Reproducibility & Export",
     ]
-    if is_light_mode:
-        # Single-phase emulsion light micrographs contain no air bubbles.
+    if is_light_mode or is_clsm_mode:
+        # Single-phase Light / CLSM acquisitions contain no air bubbles, so the
+        # interfacial (bubble-rim) analytics have nothing to measure.
         tab_options = [t for t in tab_options if t != "🛡️ Interfacial Analytics"]
     # Streamlit 1.39 has no `st.segmented_control` (added in 1.40), so the tab bar
     # is a horizontal radio group - same look, same "always one tab active"
@@ -10207,11 +10817,13 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         )
 
     # ---------------- TAB: MATRIX COALESCENCE NETWORK ----------------
-    elif active_tab == "🍇 Matrix Coalescence":
-        st.subheader("🍇 Matrix Partial Coalescence Network Analysis")
+    elif active_tab == "🍇 Cluster & Coalescence Analytics":
+        st.subheader("🍇 Cluster & Coalescence Analytics")
         st.markdown(
-            "Build the contact network (RAG) of free matrix fat globules and quantify partial "
-            "coalescence: coordination number $Z$, agglomerate size $N_{agg}$, branching nodes "
+            "Build the contact network (RAG) of the free dispersed phase (matrix fat "
+            "globules in SEM / Light, silica microspheres in CLSM) and quantify "
+            "aggregation: coordination number $Z$, agglomeration number $N_{agg}$, the "
+            "number- and weight-average cluster sizes, the 2D fractal dimension $D_f$ "
             "and the mean solidity (neck index)."
         )
 
@@ -10264,6 +10876,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 clusters_df,
                 coalescence_edges,
                 coal_summary,
+                cluster_size_dist_df,
             ) = compute_matrix_coalescence_metrics(
                 df=classified_df,
                 fat_masks=padded_masks,
@@ -10300,6 +10913,36 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 help="Mean convexity of matrix globules; lower values indicate stronger sintering necks.",
             )
 
+            # ── Cluster aggregation KPIs (v2.0.0) ────────────────────────────
+            kpi_6, kpi_7, kpi_8 = st.columns(3)
+            kpi_6.metric(
+                "Weight-Average Cluster Size <N_agg>_w",
+                f"{float(coal_summary.get('Weight-Average Cluster Size <N_agg>_w', 0.0)):.2f}",
+                help=(
+                    "Σ N_k² / Σ N_k over every group (monomers included): the standard "
+                    "weight-average aggregation number, which gives large flocs their "
+                    "physical weight in the average."
+                ),
+            )
+            kpi_7.metric(
+                "Mean Particles / Cluster",
+                f"{float(coal_summary.get('Mean Particles per Cluster <N_agg>_n', 0.0)):.2f}",
+                help=(
+                    "Number-average <N_agg>_n = mean N_agg across multi-particle "
+                    "clusters only (free monomers excluded)."
+                ),
+            )
+            _d_f_value = float(coal_summary.get("Estimated 2D Fractal Dimension D_f", 0.0))
+            kpi_8.metric(
+                "2D Fractal Dimension D_f",
+                f"{_d_f_value:.2f}" if _d_f_value > 0 else "n/a",
+                help=(
+                    "Slope of ln(N_agg) vs ln(R_g / r_0) fitted over clusters with "
+                    "N_agg ≥ 3 and clipped to [1.0, 2.0]. Near 1.0 = chain-like / "
+                    "linear flocs, near 2.0 = compact, space-filling clusters."
+                ),
+            )
+
             coal_summary_df = pd.DataFrame([coal_summary])
             st.download_button(
                 "📥 Download Overall Coalescence Summary (CSV)",
@@ -10316,7 +10959,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                     "(Emulsion / Whipped Emulsion mode)."
                 )
 
-            net_col, stats_col = st.columns([1.15, 1.0])
+            net_col, stats_col, nagg_col = st.columns([1.15, 0.95, 0.95])
             with net_col:
                 st.markdown("#### 🕸️ Coalescence Network Map")
                 st.caption(
@@ -10413,38 +11056,112 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         "table"
                     )
 
-                st.markdown("#### 🍇 Cluster Agglomerates (N_agg ≥ 2)")
-                if clusters_df.empty:
-                    st.info("No multi-globule agglomerates were detected in the analysed region.")
+            with nagg_col:
+                st.markdown("#### 📊 Cluster Size (N_agg) Distribution")
+                if cluster_size_dist_df.empty:
+                    st.info("No clusters are available for an aggregation-size distribution.")
                 else:
-                    st.dataframe(
-                        clusters_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        height=210,
+                    fig_nagg, ax_nagg = plt.subplots(figsize=(6, 3.4), dpi=130)
+                    ax_nagg.bar(
+                        cluster_size_dist_df["Cluster Class"],
+                        cluster_size_dist_df["Share of Particles (%)"],
+                        color="#8e6bbf",
                     )
-                    st.download_button(
-                        label="📥 Export Clusters (CSV)",
-                        data=clusters_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"phasepix_coalescence_clusters_{clean_stem}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
+                    ax_nagg.set_ylabel("Share of Particles (%)")
+                    ax_nagg.set_title("Cluster Size (N_agg) Distribution")
+                    ax_nagg.tick_params(axis="x", labelrotation=28, labelsize=6)
+                    fig_nagg.tight_layout()
+                    st.pyplot(fig_nagg, use_container_width=True)
+                    buf_nagg = io.BytesIO()
+                    fig_nagg.savefig(buf_nagg, format="png", dpi=300, bbox_inches="tight")
+                    plt.close(fig_nagg)
 
-                st.markdown("#### 🟠 All Matrix Globules in ROI")
+                    col_nagg_png, col_nagg_csv = st.columns(2)
+                    with col_nagg_png:
+                        st.download_button(
+                            "📥 Download Cluster Size Plot (PNG)",
+                            data=buf_nagg.getvalue(),
+                            file_name=f"Cluster_Size_Distribution_{clean_stem}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            key=f"dl_nagg_png_{clean_stem}",
+                        )
+                    with col_nagg_csv:
+                        st.download_button(
+                            "📥 Download Cluster Size Plot Data (CSV)",
+                            data=cluster_size_dist_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"Cluster_Size_Plot_Data_{clean_stem}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            disabled=cluster_size_dist_df.empty,
+                            key=f"dl_nagg_plot_data_{clean_stem}",
+                            help=(
+                                "Exact bar-chart series behind this figure (aggregation "
+                                "class, cluster count, particles per class and share of "
+                                "particles %) — ready to re-plot in Excel, Origin or "
+                                "GraphPad Prism."
+                            ),
+                        )
+                    st.caption(
+                        f"{int(cluster_size_dist_df['Cluster Count'].sum())} clusters · "
+                        f"{int(cluster_size_dist_df['Total Particles in Class'].sum())} "
+                        "particles in the network · this is exactly the "
+                        "`📥 Download Cluster Size Plot Data (CSV)` table"
+                    )
+                    with st.expander("📊 View Exact Cluster Size Table", expanded=False):
+                        st.dataframe(
+                            cluster_size_dist_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+            # ── 🔬 Per-cluster aggregation table (v2.0.0) ─────────────────────
+            st.markdown(
+                "#### 🔬 Individual Multi-Particle Clusters "
+                "(How Many Particles Stuck Together)"
+            )
+            st.caption(
+                "One row per connected agglomerate ($N_{agg} \\geq 2$), largest first. "
+                "`Particle IDs` lists exactly which segmented particles are cemented "
+                "together, $R_g$ is the area-weighted radius of gyration of the "
+                "particle centres and `Cluster Aspect Ratio` ≈ 1 for compact clusters, "
+                "> 2 for chain-like flocs."
+            )
+            if clusters_df.empty:
+                st.info(
+                    "No multi-particle clusters were detected in the analysed region — "
+                    "every detected particle is a free monomer."
+                )
+            else:
                 st.dataframe(
-                    particles_coal_df,
+                    clusters_df,
                     use_container_width=True,
                     hide_index=True,
-                    height=260,
+                    height=280,
                 )
                 st.download_button(
-                    label="📥 Export Particles (CSV)",
-                    data=particles_coal_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"phasepix_coalescence_particles_{clean_stem}.csv",
+                    label="📥 Download Per-Cluster Table (CSV)",
+                    data=clusters_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"phasepix_cluster_aggregation_{clean_stem}.csv",
                     mime="text/csv",
                     use_container_width=True,
+                    key=f"dl_clusters_table_{clean_stem}",
                 )
+
+            st.markdown("#### 🟠 All Matrix Globules in ROI")
+            st.dataframe(
+                particles_coal_df,
+                use_container_width=True,
+                hide_index=True,
+                height=260,
+            )
+            st.download_button(
+                label="📥 Export Particles (CSV)",
+                data=particles_coal_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"phasepix_coalescence_particles_{clean_stem}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     # ---------------- TAB 4: REPRODUCIBILITY & EXPORT ----------------
     elif active_tab == "💾 Reproducibility & Export":
@@ -10463,7 +11180,11 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Source Image SHA-256": sha256_hex,
             "PhasePix Build Version": PHASEPIX_BUILD_VERSION,
             "Imaging Modality": imaging_mode,
-            "Objective Preset": selected_objective if is_light_mode else "N/A (SEM Scale Bar)",
+            "Objective Preset": (
+                selected_objective
+                if (is_light_mode or is_clsm_mode)
+                else "N/A (SEM Scale Bar)"
+            ),
             "Full Micrograph Dimensions (px)": f"{img_w}x{img_h}",
             "Footer Height Excluded (px)": effective_footer,
             "Analysis Region Dimensions (px)": f"{analysis_img.shape[1]}x{analysis_img.shape[0]}",
@@ -10485,6 +11206,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "Matrix Fat Min Circularity": float(fat_min_circularity),
             "Matrix Fat Min Solidity": float(fat_min_solidity),
             "Emulsion Droplet Profile": emulsion_profile,
+            "CLSM Channel / Optical Mode": (
+                str(clsm_channel_mode) if is_clsm_mode else "N/A (not CLSM)"
+            ),
             "Typical Droplet Diameter for AI (µm)": (
                 float(expected_droplet_um) if expected_droplet_um is not None else "N/A (SEM Mode)"
             ),
