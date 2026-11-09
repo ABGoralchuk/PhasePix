@@ -2421,6 +2421,83 @@ CLSM_RESIDUAL_MAX_OVERLAP = 0.25
 # Anything smaller than this is sensor noise / a diffraction speck, not a sphere.
 CLSM_MAIN_MIN_AREA_PX = 9
 
+# ---------------- v2.0.0 CLUSTER SPLITTING (magenta shell = separator) --------
+# In the RGB composite the magenta shell is BRIGHT exactly where two silica cores
+# touch, so adding it to the core image glued neighbours into peanut blobs.  The
+# shell is therefore subtracted instead: every contact neck becomes a dark groove
+# and each dark core stays an independent bright disc.
+CLSM_SHELL_SEPARATION_WEIGHT = 0.90
+# Dense magenta-rich beds (e.g. the bottom-left agglomerate of Snap-22.tif) hide
+# dozens of small spheres whose cores Cellpose merges into one irregular blob.
+CLSM_AGGLOMERATE_MAGENTA_MIN = 110      # R at/above this level = fluorescent magenta
+CLSM_AGGLOMERATE_MIN_DIAM_PX = 3.0
+CLSM_AGGLOMERATE_MAX_DIAM_PX = 24.0
+CLSM_AGGLOMERATE_MIN_CIRCULARITY = 0.60
+CLSM_AGGLOMERATE_MIN_SOLIDITY = 0.70
+CLSM_AGGLOMERATE_PEAK_SEPARATION_PX = 3.0
+CLSM_AGGLOMERATE_MAX_OVERLAP = 0.25
+# A dark core only becomes a sphere when a fluorescent shell ring encloses it.
+CLSM_AGGLOMERATE_CORE_MIN_LEVEL = 150.0   # minimum 255 - G level of a real core
+CLSM_AGGLOMERATE_RING_PAD_PX = 3          # shell-ring width measured around a core
+CLSM_AGGLOMERATE_RING_MIN_RIDGE = 15      # R - G (grey levels) that marks a shell
+CLSM_AGGLOMERATE_RING_MIN_FRACTION = 0.45 # share of the ring that must be shell
+CLSM_AGGLOMERATE_MIN_CONTRAST = 18.0      # core must be this much darker than its ring
+# Post-segmentation split: any Cellpose mask this irregular is 2+ cemented spheres.
+CLSM_MERGED_MAX_CIRCULARITY = 0.72
+CLSM_MERGED_MIN_SOLIDITY = 0.88
+CLSM_MERGED_PEAK_FRACTION = 0.35
+
+
+def _mask_circularity_solidity(region: np.ndarray) -> Tuple[float, float]:
+    """
+    Measure the circularity and convexity of one binary mask patch.
+
+    Args:
+        region: Binary patch (bounding box of a single object).
+
+    Returns:
+        Tuple[float, float]: (circularity, solidity); ``(0.0, 0.0)`` for an empty
+        patch or a degenerate contour.
+    """
+    region_u8 = np.ascontiguousarray(region, dtype=np.uint8)
+    if not np.any(region_u8):
+        return 0.0, 0.0
+    contours, _ = cv2.findContours(region_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0, 0.0
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area <= 0.0:
+        return 0.0, 0.0
+    perimeter = float(cv2.arcLength(contour, True))
+    circularity = (4.0 * math.pi * area) / (perimeter ** 2) if perimeter > 0.0 else 0.0
+    hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+    solidity = area / hull_area if hull_area > 0.0 else 0.0
+    return float(circularity), float(solidity)
+
+
+def _clsm_rgb_channels(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split a CLSM composite frame into its green matrix and magenta shell planes.
+
+    Args:
+        image: ``(H, W, 3)`` RGB frame, or a grayscale ``(H, W)`` plane.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: ``(green, magenta)`` uint8 planes, where
+        ``green = rgb[:, :, 1]`` (continuous matrix) and
+        ``magenta = max(rgb[:, :, 0], rgb[:, :, 2])`` (fluorescent shell).
+        For grayscale input the single plane is returned as both channels.
+    """
+    if image.ndim == 3 and image.shape[2] >= 3:
+        green = np.ascontiguousarray(image[:, :, 1], dtype=np.uint8)
+        magenta = np.ascontiguousarray(
+            np.maximum(image[:, :, 0], image[:, :, 2]), dtype=np.uint8
+        )
+        return green, magenta
+    gray = np.ascontiguousarray(to_grayscale_2d(image), dtype=np.uint8)
+    return gray, np.zeros_like(gray)
+
 
 def resolve_clsm_channel_mode(channel_mode: str, image: np.ndarray) -> str:
     """
@@ -2512,18 +2589,27 @@ def _clsm_segmentation_planes(
         represented as bright solid discs.
     """
     if resolved_mode == CLSM_CHANNEL_COMPOSITE:
-        if image.ndim == 3 and image.shape[2] >= 3:
-            green = image[:, :, 1].astype(np.float32)
-            # Magenta = red + blue; the shell rim is the brightest of the two.
-            shell = np.maximum(image[:, :, 0], image[:, :, 2]).astype(np.float32)
-        else:
-            # Grayscale fallback: the single plane plays both roles, which is
-            # still exact for a negative-contrast acquisition.
-            green = to_grayscale_2d(image).astype(np.float32)
-            shell = green
-        core_inv = 255.0 - green
-        blended = np.clip(0.80 * core_inv + 0.35 * shell, 0.0, 255.0).astype(np.uint8)
-        return blended, core_inv.astype(np.uint8)
+        green_u8, magenta_u8 = _clsm_rgb_channels(image)
+        core_channel = cv2.bitwise_not(green_u8)
+        # The magenta shell is a *separator*, never a bridge: the thin fluorescent
+        # neck between two touching silica cores is bright magenta, so adding it to
+        # the core image (the v2.0.0 recipe, ``0.80*core + 0.35*R``) glued
+        # neighbours into peanut blobs and turned the dense bottom-left agglomerate
+        # into one irregular mass.  Subtracting the shell ridge instead turns every
+        # contact neck into a dark groove Cellpose cannot cross, so each dark core
+        # stays an independent bright disc.
+        shell_ridge = np.clip(
+            magenta_u8.astype(np.int16) - green_u8.astype(np.int16), 0, 255
+        ).astype(np.float32)
+        separated = np.clip(
+            core_channel.astype(np.float32)
+            - CLSM_SHELL_SEPARATION_WEIGHT * shell_ridge,
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        # Residual catcher source: same shell-separated cores, so the small spheres
+        # hidden in magenta beds stay individual bright discs there too.
+        return separated, separated
 
     gray = to_grayscale_2d(image)
 
@@ -2696,7 +2782,13 @@ def _recover_clsm_residual_microspheres(
         overlap = int(np.count_nonzero(region & occupied[sl])) / float(area)
         if overlap > CLSM_RESIDUAL_MAX_OVERLAP:
             continue
-        combined[sl][region] = next_id
+        # Never overwrite an accepted sphere: only the free pixels of the candidate
+        # are claimed, otherwise a 25 %-overlapping write would shred the neighbour
+        # that already owns them into 1-px fragments.
+        free = region & ~occupied[sl]
+        if int(np.count_nonzero(free)) < min_area:
+            continue
+        combined[sl][free] = next_id
         next_id += 1
         added += 1
     if added:
@@ -2705,6 +2797,260 @@ def _recover_clsm_residual_microspheres(
             added, min_diam, max_diam,
         )
     return combined, next_id, added
+
+
+def _split_merged_clsm_objects(
+    masks: np.ndarray,
+    min_peak_sep_px: float,
+) -> Tuple[np.ndarray, int]:
+    """
+    Split every merged (non-round) Cellpose mask into its individual spheres.
+
+    A single silica microsphere is compact by definition, so a mask whose
+    circularity or solidity falls below ``CLSM_MERGED_MAX_CIRCULARITY`` /
+    ``CLSM_MERGED_MIN_SOLIDITY`` is 2+ cemented spheres that Cellpose grew as one
+    blob.  Such masks are cut with a distance-transform marker watershed whose
+    local-maxima window is ``min_peak_sep_px`` (``0.35 x base_diameter_px``), and
+    each round fragment receives its own label.
+
+    Args:
+        masks: int32 label mask (0 = background).
+        min_peak_sep_px: Minimum distance between two sphere centres, in pixels.
+
+    Returns:
+        Tuple[np.ndarray, int]: (relabelled mask with consecutive ids, number of
+        masks that were actually split).
+    """
+    shape = masks.shape[:2]
+    if masks is None or masks.size == 0 or int(masks.max()) <= 0:
+        return np.zeros(shape, dtype=np.int32), 0
+
+    out = np.zeros(shape, dtype=np.int32)
+    next_id = 1
+    splits = 0
+    for lbl, sl in enumerate(ndi.find_objects(masks), start=1):
+        if sl is None:
+            continue
+        patch = masks[sl] == lbl
+        if not patch.any():
+            continue
+        circularity, solidity = _mask_circularity_solidity(patch)
+        if circularity >= CLSM_MERGED_MAX_CIRCULARITY and solidity >= CLSM_MERGED_MIN_SOLIDITY:
+            out[sl][patch] = next_id
+            next_id += 1
+            continue
+
+        parts = _watershed_split_microspheres(patch, float(min_peak_sep_px))
+        n_parts = int(parts.max())
+        if n_parts <= 1:
+            out[sl][patch] = next_id
+            next_id += 1
+            continue
+
+        # ``parts`` is patch-sized, so every part slice must be shifted back into
+        # full-frame coordinates before it can index the output canvas.
+        y_offset = int(sl[0].start)
+        x_offset = int(sl[1].start)
+        min_part_area = max(CLSM_MAIN_MIN_AREA_PX, int(0.12 * int(np.count_nonzero(patch))))
+        kept = 0
+        for part_lbl, part_sl in enumerate(ndi.find_objects(parts), start=1):
+            if part_sl is None:
+                continue
+            part = parts[part_sl] == part_lbl
+            if int(np.count_nonzero(part)) < min_part_area:
+                continue
+            part_circ, part_sol = _mask_circularity_solidity(part)
+            # A real sphere fragment must still look round; slivers between three
+            # cores are rejected here instead of reaching the size distribution.
+            if part_circ < CLSM_RESIDUAL_MIN_CIRCULARITY or part_sol < CLSM_RESIDUAL_MIN_SOLIDITY:
+                continue
+            target = (
+                slice(y_offset + part_sl[0].start, y_offset + part_sl[0].stop),
+                slice(x_offset + part_sl[1].start, x_offset + part_sl[1].stop),
+            )
+            out[target][part] = next_id
+            next_id += 1
+            kept += 1
+        if kept == 0:
+            out[sl][patch] = next_id
+            next_id += 1
+        else:
+            splits += 1
+
+    if splits:
+        logger.info("CLSM cluster split: %d merged mask(s) separated into single spheres", splits)
+    return out, splits
+
+
+def _recover_clsm_agglomerate_spheres(
+    image: np.ndarray,
+    base_diameter_px: float,
+    combined: np.ndarray,
+    occupied: np.ndarray,
+    next_id: int,
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Recover the small spheres hidden inside dense magenta agglomerates.
+
+    A tight bed of small silica spheres (the bottom-left agglomerate of
+    ``Snap-22.tif``, x ≈ 45-105, y ≈ 295-355) is blanketed in fluorescent magenta,
+    so its cores are dim and touching and Cellpose grows one irregular blob for the
+    whole bed - which then fails the sidebar circularity gate.  Global colour
+    regions cannot isolate such a bed (the bright green matrix and the bed have
+    practically identical R/G statistics), so the discriminator used here is
+    strictly LOCAL: a dark core (high ``255 - G``) becomes a sphere only when
+
+    * a fluorescent shell ring surrounds it - at least
+      ``CLSM_AGGLOMERATE_RING_MIN_FRACTION`` of the annulus reaches
+      ``R - G >= CLSM_AGGLOMERATE_RING_MIN_RIDGE`` (or ``R >= 110``), and
+    * the core itself is ``CLSM_AGGLOMERATE_MIN_CONTRAST`` grey levels darker than
+      that ring (a flat shadow pocket has no core at all).
+
+    The surviving core mask is split with a distance-transform marker watershed
+    (peak separation ``CLSM_AGGLOMERATE_PEAK_SEPARATION_PX``), so every individual
+    small sphere inside the bed becomes its own compact mask
+    (``3 px .. 24 px`` diameter, ``circularity >= 0.60``) instead of one merged
+    irregular blob.
+
+    Args:
+        image: Original CLSM frame (``(H, W, 3)`` RGB composite).
+        base_diameter_px: Cellpose target diameter in pixels (log only).
+        combined: Running output label mask (modified in place).
+        occupied: Running footprint canvas of the accepted objects.
+        next_id: Label id the next accepted sphere receives.
+
+    Returns:
+        Tuple[np.ndarray, int, int]: (combined, next_id, added).
+    """
+    if image.ndim != 3 or image.shape[2] < 3 or combined.size == 0:
+        return combined, next_id, 0
+
+    green, magenta = _clsm_rgb_channels(image)
+    if not np.any(magenta >= CLSM_AGGLOMERATE_MAGENTA_MIN):
+        return combined, next_id, 0
+
+    # The magenta shell ridge (R - G) is the accent that surrounds every sphere in
+    # a dense bed.  Global colour regions cannot isolate an agglomerate (on
+    # Snap-22.tif the bright matrix and the bottom-left bed have practically
+    # identical R/G statistics), so the discriminator is LOCAL: a dark core only
+    # becomes a sphere when a magenta ridge ring encloses it.
+    core_inv = cv2.bitwise_not(green)
+    ridge = np.clip(
+        magenta.astype(np.int16) - green.astype(np.int16), 0, 255
+    ).astype(np.uint8)
+
+    # Dark cores = the dark tail of the green matrix (high 255 - G).
+    otsu_value, _ = cv2.threshold(
+        core_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    core_threshold = max(float(otsu_value), CLSM_AGGLOMERATE_CORE_MIN_LEVEL)
+    cores = (core_inv >= core_threshold) & ~occupied
+    if not np.any(cores):
+        return combined, next_id, 0
+
+    cores_u8 = cv2.morphologyEx(
+        cores.astype(np.uint8),
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    if not cores_u8.any():
+        return combined, next_id, 0
+
+    labels = _watershed_split_microspheres(
+        cores_u8.astype(bool), CLSM_AGGLOMERATE_PEAK_SEPARATION_PX
+    )
+    if int(labels.max()) <= 0:
+        return combined, next_id, 0
+
+    label_area = np.bincount(labels.ravel(), minlength=int(labels.max()) + 1)
+    min_area = max(
+        4,
+        int(
+            round(
+                math.pi
+                * (CLSM_AGGLOMERATE_MIN_DIAM_PX / 2.0) ** 2
+                * 0.65
+            )
+        ),
+    )
+    height, width = labels.shape[:2]
+    pad = int(CLSM_AGGLOMERATE_RING_PAD_PX) + 1
+    added = 0
+    for lbl, sl in enumerate(ndi.find_objects(labels), start=1):
+        if sl is None or int(label_area[lbl]) < min_area:
+            continue
+        # Work in a padded window so the surrounding shell ring is measurable.
+        y0 = max(0, sl[0].start - pad)
+        y1 = min(height, sl[0].stop + pad)
+        x0 = max(0, sl[1].start - pad)
+        x1 = min(width, sl[1].stop + pad)
+        local = labels[y0:y1, x0:x1]
+        region = local == lbl
+        area = int(np.count_nonzero(region))
+        if area <= 0:
+            continue
+        equiv_diam = 2.0 * math.sqrt(area / math.pi)
+        if (
+            equiv_diam < CLSM_AGGLOMERATE_MIN_DIAM_PX
+            or equiv_diam > CLSM_AGGLOMERATE_MAX_DIAM_PX
+        ):
+            continue
+        circularity, solidity = _mask_circularity_solidity(region)
+        if (
+            circularity < CLSM_AGGLOMERATE_MIN_CIRCULARITY
+            or solidity < CLSM_AGGLOMERATE_MIN_SOLIDITY
+        ):
+            continue
+
+        # 1. Magenta ring signature: the candidate must be enclosed by the
+        #    fluorescent shell of the agglomerate, not by plain green matrix.
+        ring = cv2.dilate(
+            region.astype(np.uint8),
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * int(CLSM_AGGLOMERATE_RING_PAD_PX) + 1,) * 2,
+            ),
+        ).astype(bool) & ~region
+        if not np.any(ring):
+            continue
+        ring_ridge = ridge[y0:y1, x0:x1][ring]
+        ring_magenta = magenta[y0:y1, x0:x1][ring]
+        shell_ring = (ring_ridge >= CLSM_AGGLOMERATE_RING_MIN_RIDGE) | (
+            ring_magenta >= int(CLSM_AGGLOMERATE_MAGENTA_MIN)
+        )
+        if float(np.mean(shell_ring)) < CLSM_AGGLOMERATE_RING_MIN_FRACTION:
+            continue
+
+        # 2. Core contrast: the candidate core must be measurably darker than the
+        #    shell ring around it (a flat shadow pocket has no core at all).
+        local_core = core_inv[y0:y1, x0:x1]
+        contrast = float(local_core[region].mean()) - float(local_core[ring].mean())
+        if contrast < CLSM_AGGLOMERATE_MIN_CONTRAST:
+            continue
+
+        overlap = int(np.count_nonzero(region & occupied[y0:y1, x0:x1])) / float(area)
+        if overlap > CLSM_AGGLOMERATE_MAX_OVERLAP:
+            continue
+        # Claim only unoccupied pixels so an accepted sphere is never shredded.
+        free = region & ~occupied[y0:y1, x0:x1]
+        if int(np.count_nonzero(free)) < min_area:
+            continue
+        combined[y0:y1, x0:x1][free] = next_id
+        next_id += 1
+        added += 1
+
+    if added:
+        logger.info(
+            "CLSM agglomerate recovery appended %d sphere(s) enclosed by magenta "
+            "shells (diam %.1f-%.1f px, base %.1f px)",
+            added,
+            CLSM_AGGLOMERATE_MIN_DIAM_PX,
+            CLSM_AGGLOMERATE_MAX_DIAM_PX,
+            float(base_diameter_px),
+        )
+    return combined, next_id, added
+
+
 
 
 
@@ -2728,9 +3074,9 @@ def cached_segment_clsm_microspheres(
            median grey level: RGB -> composite, ``median > 90`` -> c1 bright
            matrix, ``median <= 90`` -> c0 dark-background shells).
         2. ``_clsm_segmentation_planes`` builds the Cellpose input: the negative
-           stain core ``255 - G`` blended with the magenta shell for the RGB
-           composite, a plain inversion for c1, and hole-filling + a
-           distance-transform dome for hollow c0 rings.
+           stain core ``255 - G`` with the magenta shell ridge **subtracted** (the
+           shell is a boundary separator, never a bridge), a plain inversion for
+           c1, and hole-filling + a distance-transform dome for hollow c0 rings.
         3. One Cellpose pass at ``base_diameter_px`` (clamped into Cellpose's
            28-45 px comfort zone by ``run_inference(allow_downscale=True)``, so a
            1024x1024 confocal frame costs ~1 Mpx of network work).  Every mask is
@@ -2789,36 +3135,51 @@ def cached_segment_clsm_microspheres(
         for lbl, sl in enumerate(ndi.find_objects(masks_main), start=1):
             if sl is None or int(label_area[lbl]) < CLSM_MAIN_MIN_AREA_PX:
                 continue
-            region = (masks_main[sl] == lbl).astype(np.uint8)
-            contours, _ = cv2.findContours(
-                region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if not contours:
+            # Pure hole filling (binary_fill_holes) instead of redrawing the filled
+            # external contour: a redrawn disc can spill over a neighbouring label
+            # that was written earlier and shred it into 1-px fragments.  Filling
+            # enclosed holes turns a hollow c0 ring into a solid disc without ever
+            # growing past the object's own boundary.
+            region = masks_main[sl] == lbl
+            filled_bool = ndi.binary_fill_holes(region)
+            if not filled_bool.any():
                 continue
-            # Hollow ring masks (c0) must become solid discs, otherwise area,
-            # equivalent diameter and solidity are all measured on the rim only.
-            filled = np.zeros_like(region)
-            cv2.drawContours(
-                filled,
-                [max(contours, key=cv2.contourArea)],
-                -1,
-                1,
-                thickness=cv2.FILLED,
-            )
-            filled_bool = filled.astype(bool)
             combined[sl][filled_bool] = next_id
             occupied[sl] |= filled_bool
             next_id += 1
     n_main = next_id - 1
 
+    # ---- Post-segmentation cluster split: every merged mask becomes N spheres ---
+    # A mask that is not compact is 2+ cemented microspheres, so it is cut with a
+    # distance-transform marker watershed before any filtering can reject it as
+    # "irregular" (circularity < 0.55 in the sidebar).
+    min_peak_sep_px = max(3, int(round(CLSM_MERGED_PEAK_FRACTION * base_diameter)))
+    combined, n_split = _split_merged_clsm_objects(combined, min_peak_sep_px)
+    next_id = int(combined.max()) + 1 if combined.size else 1
+    occupied = combined > 0
+    n_after_split = next_id - 1
+
     # ---- Residual catcher: small spheres + dense-cluster watershed split ------
     combined, next_id, n_residual = _recover_clsm_residual_microspheres(
         residual_source, base_diameter, combined, occupied, next_id
     )
+    occupied = combined > 0
+
+    # ---- Dense magenta agglomerates: individual small spheres inside the bed ---
+    combined, next_id, n_agglomerate = _recover_clsm_agglomerate_spheres(
+        image, base_diameter, combined, occupied, next_id
+    )
 
     logger.info(
-        "CLSM microspheres [%s]: %d Cellpose + %d residual = %d objects",
-        resolved_mode, n_main, n_residual, next_id - 1,
+        "CLSM microspheres [%s]: %d Cellpose (%d after splitting %d merged mask(s)) "
+        "+ %d residual + %d agglomerate = %d objects",
+        resolved_mode,
+        n_main,
+        n_after_split,
+        n_split,
+        n_residual,
+        n_agglomerate,
+        next_id - 1,
     )
     return combined
 

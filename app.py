@@ -255,6 +255,13 @@ CLSM_PRESETS_FILE = "clsm_calibration_presets.json"
 # Resolve relative to the application root so presets survive any working directory.
 CLSM_PRESETS_PATH = Path(__file__).resolve().parent / CLSM_PRESETS_FILE
 
+# Dispersed phase offered by Section 4 in Confocal Fluorescence mode (single
+# st.radio option, matching the SEM "Sample Type" / Light style).
+CLSM_DISPERSED_SYSTEM = "🟣 Colloidal Microspheres & Aggregates (Silica)"
+# 20x CLSM frames are dominated by 5-10 µm silica spheres, so the AI target scale
+# defaults to 8 µm (≈ 10 px at 0.799 µm/px) instead of the old 14 µm.
+CLSM_DEFAULT_MICROSPHERE_UM = 8.0
+
 
 def load_clsm_presets() -> dict:
     """
@@ -919,6 +926,17 @@ PARAMETER_WIDGET_DEFAULTS: dict = {
         "shared_clahe_checkbox": True,
         "shared_model_type_select": "cyto2",
     },
+    "CLSM": {
+        "clsm_dispersed_system_radio": CLSM_DISPERSED_SYSTEM,
+        "clsm_min_particle_size_input": 0.50,
+        "clsm_max_particle_size_input": 80.0,
+        "clsm_microsphere_um": CLSM_DEFAULT_MICROSPHERE_UM,
+        "clsm_microsphere_circ_slider": 0.55,
+        "shared_flow_slider": 0.70,
+        "shared_cellprob_slider": -1.0,
+        "shared_clahe_checkbox": True,
+        "shared_model_type_select": "cyto2",
+    },
     "Light": {
         "light_min_fat_size_input": 0.50,
         "light_max_fat_size_input": 50.0,
@@ -973,6 +991,18 @@ def default_parameter_presets() -> dict:
                 "shared_flow_slider": 0.70,
                 "shared_cellprob_slider": -1.0,
                 "shared_clahe_checkbox": False,
+            },
+        },
+        "CLSM": {
+            "🔦 Silica Microspheres 5–10 µm (20x, auto channel)": {
+                "clsm_dispersed_system_radio": CLSM_DISPERSED_SYSTEM,
+                "clsm_min_particle_size_input": 0.50,
+                "clsm_max_particle_size_input": 40.0,
+                "clsm_microsphere_um": CLSM_DEFAULT_MICROSPHERE_UM,
+                "clsm_microsphere_circ_slider": 0.55,
+                "shared_flow_slider": 0.70,
+                "shared_cellprob_slider": -1.0,
+                "shared_clahe_checkbox": True,
             },
         },
         "SEM": {
@@ -1148,24 +1178,31 @@ def collect_parameter_snapshot(modality: str, live_values: Optional[dict] = None
 def build_default_parameter_state(
     is_light_mode: bool,
     light_profile: Optional[str] = None,
+    is_clsm_mode: bool = False,
 ) -> dict:
     """
     Return the clean Section 4/5 defaults for the active modality and optical profile.
 
-    Light mode follows the selected droplet profile (crystallized vs liquid), while
-    SEM mode uses the canonical whipped-emulsion recipe. Used by the sidebar
-    "🔄 Reset to Defaults" action so a student can always return to the validated
-    starting point (e.g. 9.0 µm target, cyto2, 0.50-50.0 µm, smoothing 3,
-    solidity 0.84 for crystallized fat).
+    Light mode follows the selected droplet profile (crystallized vs liquid), CLSM
+    mode restores the validated silica-microsphere recipe (8 µm AI target, silica
+    size window, 0.55 circularity gate), and SEM mode uses the canonical
+    whipped-emulsion recipe. Used by the sidebar "🔄 Reset to Defaults" action and
+    when a new micrograph is loaded.
 
     Args:
         is_light_mode: Whether Light Microscopy is active.
-        light_profile: Current light-mode profile string (ignored in SEM mode).
+        light_profile: Current light-mode profile string (ignored in SEM / CLSM).
+        is_clsm_mode: Whether Confocal Fluorescence (CLSM) is active.
 
     Returns:
         dict: JSON-safe ``widget_key -> default_value`` mapping.
     """
-    modality = "Light" if is_light_mode else "SEM"
+    if is_clsm_mode:
+        modality = "CLSM"
+    elif is_light_mode:
+        modality = "Light"
+    else:
+        modality = "SEM"
     defaults = dict(PARAMETER_WIDGET_DEFAULTS.get(modality, {}))
 
     if is_light_mode:
@@ -1464,6 +1501,9 @@ def _format_param_value(key: str, value) -> str:
         "light_min_fat_size_input",
         "light_max_fat_size_input",
         "light_expected_droplet_um",
+        "clsm_min_particle_size_input",
+        "clsm_max_particle_size_input",
+        "clsm_microsphere_um",
     ):
         return _fmt_um(value)
     if isinstance(value, (bool, np.bool_)):
@@ -1475,6 +1515,7 @@ def _format_param_value(key: str, value) -> str:
         "sem_air_circ_slider",
         "sem_ads_circ_slider",
         "light_solidity_slider",
+        "clsm_microsphere_circ_slider",
     ):
         return f"{float(value):.2f}"
     if key == "light_crystal_smooth_slider":
@@ -2739,6 +2780,7 @@ def diagnose_and_recommend_parameters(
     is_light_mode: bool,
     current_params: dict,
     sample_type: str = "Whipped Emulsion",
+    is_clsm_mode: bool = False,
 ) -> dict:
     """
     Measure the current micrograph and translate the optics into Cellpose settings.
@@ -2756,6 +2798,10 @@ def diagnose_and_recommend_parameters(
         sample_type: User-selected SEM ``Sample Type`` (``"Emulsion"`` /
             ``"Whipped Emulsion"`` / ``"Foam"``). The advisor tailors — and never
             overrides — this explicit analysis mode.
+        is_clsm_mode: ``True`` for Confocal Fluorescence (single dispersed silica
+            phase). The proposal is then expressed with the CLSM widget keys, so an
+            Apply click never touches hidden SEM controls and the saved recipe lands
+            in the ``"CLSM"`` preset bucket.
 
     Returns:
         dict: ``modality``, ``summary_metrics``, ``recommended_widget_state``,
@@ -2776,6 +2822,126 @@ def diagnose_and_recommend_parameters(
             "summary_metrics": _light_summary_metrics(diag),
             "recommended_widget_state": dict(diag["recommended"]),
             "comparison_rows": _light_comparison_rows(diag, current_params),
+        }
+
+    if is_clsm_mode:
+        # Confocal Fluorescence: one dispersed silica phase.  The single-phase
+        # Emulsion diagnostics already measure exactly what a microsphere bed needs
+        # (compact particle diameters), so they are reused and the proposal is
+        # translated onto the CLSM widget keys.
+        aliased_params = dict(current_params or {})
+        aliased_params.setdefault("sem_sample_type_radio", "Emulsion")
+        # Polarity matters: the single-phase Emulsion probe looks for BRIGHT compact
+        # bodies on a dark background, while a CLSM composite renders the silica
+        # cores as DARK discs inside a bright green matrix (exactly what the
+        # segmentation uses via ``255 - G``).  Feeding the inversion therefore
+        # measures the sphere population instead of the matrix texture.
+        clsm_probe_img = cv2.bitwise_not(np.ascontiguousarray(gray, dtype=np.uint8))
+        clsm_diag = _diagnose_sem_micrograph(
+            clsm_probe_img, pixel_to_um_ratio, aliased_params, sample_type="Emulsion"
+        )
+        key_map = {
+            "sem_min_fat_um": "clsm_min_particle_size_input",
+            "sem_max_fat_um": "clsm_max_particle_size_input",
+            "shared_fat_circ_slider": "clsm_microsphere_circ_slider",
+        }
+        recommended: dict = {}
+        for key, value in clsm_diag["recommended"].items():
+            mapped_key = key_map.get(key)
+            if mapped_key is not None:
+                recommended[mapped_key] = value
+            elif key in (
+                "shared_flow_slider",
+                "shared_cellprob_slider",
+                "shared_clahe_checkbox",
+                "shared_model_type_select",
+            ):
+                recommended[key] = value
+        recommended.setdefault(
+            "clsm_microsphere_um", CLSM_DEFAULT_MICROSPHERE_UM
+        )
+        # Size window: the SEM-style top-hat probe cannot resolve a densely packed
+        # colloidal bed (it isolates only the brightest specks, e.g. P10-P95 =
+        # 2.0-3.4 µm on Snap-22.tif), so proposing *its* bounds would silently throw
+        # away most real spheres.  The window is therefore anchored on the physical
+        # AI target scale (a ±2-stop / ×4 window), and the probe statistics stay
+        # visible in the diagnostics above as measured reference values.
+        target_um = float(recommended.get("clsm_microsphere_um", CLSM_DEFAULT_MICROSPHERE_UM))
+        target_um = float(np.clip(target_um, 1.0, 60.0))
+        recommended["clsm_min_particle_size_input"] = round(max(0.50, 0.25 * target_um), 2)
+        recommended["clsm_max_particle_size_input"] = round(
+            min(500.0, max(2.0 * target_um, 4.0 * target_um)), 2
+        )
+
+        diameter_text = (
+            f"{clsm_diag['fat_p10']:.1f}-{clsm_diag['fat_p95']:.1f} µm"
+            if clsm_diag["has_fine"]
+            else "not resolvable by the top-hat probe"
+        )
+        target_um_text = f"{target_um:.1f} µm"
+        measured_why = (
+            f"The bright compact probe of this CLSM field spans {diameter_text} "
+            f"(P10-P95, {clsm_diag['n_globules']} objects), but a dense colloidal bed "
+            "is only partially resolved by that probe. The silica size window is "
+            f"therefore anchored on the physical AI target scale ({target_um_text}): "
+            "0.25 x target as the lower bound and 4 x target as the upper bound, so "
+            "every sphere of the population survives the size filter."
+        )
+        rows = [
+            _comparison_row(
+                "clsm_min_particle_size_input",
+                "Min Particle Size (µm)",
+                recommended["clsm_min_particle_size_input"],
+                current_params,
+                measured_why,
+            ),
+            _comparison_row(
+                "clsm_max_particle_size_input",
+                "Max Particle Size (µm)",
+                recommended["clsm_max_particle_size_input"],
+                current_params,
+                measured_why,
+            ),
+            _comparison_row(
+                "clsm_microsphere_circ_slider",
+                "Microsphere Min Circularity",
+                recommended["clsm_microsphere_circ_slider"],
+                current_params,
+                "Silica microspheres are compact by nature; a 0.60 circularity gate "
+                "keeps complete spheres and drops aggregate debris and rim shards, "
+                "while the watershed split already separates touching spheres.",
+            ),
+            _comparison_row(
+                "shared_flow_slider",
+                "flow_threshold",
+                recommended["shared_flow_slider"],
+                current_params,
+                "Flow threshold controls how much boundary error Cellpose tolerates. "
+                "0.70 is the validated default for crisp fluorescent sphere rims.",
+            ),
+            _comparison_row(
+                "shared_cellprob_slider",
+                "cellprob_threshold",
+                recommended["shared_cellprob_slider"],
+                current_params,
+                "A negative cell-probability threshold lets the network accept dim "
+                "cores inside dense agglomerates instead of only the bright ones.",
+            ),
+            _comparison_row(
+                "shared_clahe_checkbox",
+                "Enable CLAHE Preprocessing",
+                recommended["shared_clahe_checkbox"],
+                current_params,
+                "CLAHE locally normalises the green matrix / magenta shell contrast, "
+                "which keeps small spheres in shadowed cavities visible.",
+            ),
+        ]
+        return {
+            "modality": "🔦 Confocal Fluorescence",
+            "sample_type": "Emulsion (CLSM silica microspheres)",
+            "summary_metrics": _sem_summary_metrics(clsm_diag),
+            "recommended_widget_state": recommended,
+            "comparison_rows": rows,
         }
 
     diag = _diagnose_sem_micrograph(
@@ -5301,7 +5467,7 @@ with st.sidebar:
                     "light_emulsion_profile_radio"
                 )
                 for _default_key, _default_value in build_default_parameter_state(
-                    is_light_mode, _active_light_profile
+                    is_light_mode, _active_light_profile, is_clsm_mode
                 ).items():
                     st.session_state[_default_key] = _default_value
                 if is_light_mode:
@@ -5809,15 +5975,16 @@ with st.sidebar:
             "air-bubble and adsorbed-fat phases do not exist in this analysis.",
             icon="🔒",
         )
-        clsm_dispersed_system = st.selectbox(
-            "CLSM Dispersed System",
-            options=["🟣 Colloidal Microspheres"],
+        clsm_dispersed_system = st.radio(
+            "Dispersed System Type",
+            options=[CLSM_DISPERSED_SYSTEM],
             index=0,
-            key="clsm_dispersed_system_select",
+            key="clsm_dispersed_system_radio",
             help=(
-                "Dispersed phase analysed in CLSM mode. **Colloidal Microspheres** "
-                "segments compact silica spheres (composite RGB, c1 negative "
-                "contrast and c0 fluorescent-shell channels alike)."
+                "Dispersed phase analysed in CLSM mode. **Colloidal Microspheres & "
+                "Aggregates (Silica)** segments compact silica spheres and their "
+                "aggregates (composite RGB, c1 negative contrast and c0 "
+                "fluorescent-shell channels alike)."
             ),
         )
         st.markdown("**Microsphere Size Range (µm):**")
@@ -6028,32 +6195,37 @@ with st.sidebar:
 
     # CLSM optical channel (Confocal Fluorescence only). ``None`` outside CLSM so
     # the cached segmentation call and the classification tracker stay valid.
+    # Auto-detection handles every real acquisition (RGB composite / c1 / c0), so
+    # Section 5 stays clean: the manual override lives in a collapsed expander.
     clsm_channel_mode: Optional[str] = None
     if is_clsm_mode:
         emulsion_profile = "N/A (CLSM Mode)"
-        clsm_channel_mode = st.radio(
-            "🔬 CLSM Channel / Optical Mode",
-            options=[
-                "🔄 Auto-Detect (RGB Composite / c1 Negative / c0 Shell)",
-                "🎨 Composite RGB (Green Matrix + Magenta Shell)",
-                "⚫ Channel c1 (Dark Spheres in Bright Matrix)",
-                "⚪ Channel c0 (Bright Fluorescent Shells on Dark Background)",
-            ],
-            index=0,
-            key="clsm_channel_mode_radio",
-            help=(
-                "**Auto-Detect** — a 3-channel RGB stack is treated as the composite "
-                "(green matrix + magenta shell), a single plane with median > 90 grey "
-                "levels as the bright-background **c1** negative-contrast matrix, and "
-                "anything darker as the **c0** fluorescent-shell channel.  \n"
-                "**Composite RGB** — uses ``255 − G`` (the dark silica core becomes a "
-                "bright solid disc) blended with the magenta shell for sharp "
-                "inter-particle boundaries.  \n"
-                "**Channel c1** — inverted so the dark spheres become bright discs.  \n"
-                "**Channel c0** — hollow bright rings are hole-filled and given a "
-                "distance-transform dome so they are measured as whole solid spheres."
-            ),
-        )
+        clsm_channel_mode = "🔄 Auto-Detect (RGB Composite / c1 Negative / c0 Shell)"
+        with st.expander("Advanced CLSM Channel Override", expanded=False):
+            clsm_channel_mode = st.radio(
+                "🔬 CLSM Channel / Optical Mode",
+                options=[
+                    "🔄 Auto-Detect (RGB Composite / c1 Negative / c0 Shell)",
+                    "🎨 Composite RGB (Green Matrix + Magenta Shell)",
+                    "⚫ Channel c1 (Dark Spheres in Bright Matrix)",
+                    "⚪ Channel c0 (Bright Fluorescent Shells on Dark Background)",
+                ],
+                index=0,
+                key="clsm_channel_mode_radio",
+                help=(
+                    "Leave on **Auto-Detect**: a 3-channel RGB stack is treated as the "
+                    "composite (green matrix + magenta shell), a single plane with "
+                    "median > 90 grey levels as the bright-background **c1** "
+                    "negative-contrast matrix, and anything darker as the **c0** "
+                    "fluorescent-shell channel.  \n"
+                    "**Composite RGB** — ``255 − G`` with the magenta shell ridge "
+                    "subtracted, so the shell separates touching cores instead of "
+                    "gluing them into peanut blobs.  \n"
+                    "**Channel c1** — inverted so the dark spheres become bright discs.  \n"
+                    "**Channel c0** — hollow bright rings are hole-filled and given a "
+                    "distance-transform dome so they are measured as whole solid spheres."
+                ),
+            )
 
     model_type = st.selectbox(
         "Pretrained Model",
@@ -6110,13 +6282,15 @@ with st.sidebar:
                     "🎯 Typical Microsphere Diameter for AI (µm)",
                     min_value=1.0,
                     max_value=60.0,
-                    value=14.0,
+                    value=CLSM_DEFAULT_MICROSPHERE_UM,
                     step=0.5,
                     help=(
                         "Physical diameter (µm) of the silica microspheres AI should "
-                        "focus on. Converted to pixels with the active CLSM objective "
-                        "calibration; smaller spheres below Cellpose's receptive field "
-                        "are recovered by the distance-transform watershed catcher."
+                        "focus on (default 8 µm ≈ the dominant 5–10 µm population on "
+                        "20x CLSM frames). Converted to pixels with the active CLSM "
+                        "objective calibration; smaller spheres below Cellpose's "
+                        "receptive field are recovered by the distance-transform "
+                        "watershed catchers."
                     ),
                     key="clsm_microsphere_um",
                 )
@@ -6456,7 +6630,7 @@ with st.sidebar:
         "Measures the current micrograph in physical µm and *proposes* Section 4/5 "
         "settings. Nothing changes until you review the diagnostics and apply."
     )
-    if not is_light_mode:
+    if not is_light_mode and not is_clsm_mode:
         st.info(
             "ℹ️ **Reminder:** Please ensure the correct **Sample Type** "
             "(Emulsion, Whipped Emulsion, or Foam) is selected in **Section 4** before "
@@ -6521,9 +6695,11 @@ with st.sidebar:
                     bool(is_light_mode),
                     dict(_live_parameter_values),
                     sample_type=str(sample_type),
+                    is_clsm_mode=bool(is_clsm_mode),
                 )
                 _advisor_proposal["image_name"] = image_name
                 _advisor_proposal["is_light_mode"] = bool(is_light_mode)
+                _advisor_proposal["is_clsm_mode"] = bool(is_clsm_mode)
                 _advisor_proposal["sample_type"] = str(sample_type)
                 _advisor_proposal["calibration_um_per_px"] = float(pixel_to_um_ratio)
                 st.session_state["autotune_proposal"] = _advisor_proposal
@@ -6562,11 +6738,13 @@ with st.sidebar:
             ),
         ):
             st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
-                "Light" if is_light_mode else "SEM", _live_parameter_values
+                "CLSM" if is_clsm_mode else ("Light" if is_light_mode else "SEM"),
+                _live_parameter_values,
             )
             st.session_state["_pending_parameter_updates"] = build_default_parameter_state(
                 is_light_mode,
                 emulsion_profile if is_light_mode else None,
+                is_clsm_mode,
             )
             # Clear manual classification/exclusion state so the reset recipe is
             # evaluated against a clean object set.
@@ -6578,7 +6756,9 @@ with st.sidebar:
 
     # ── 📂 Custom Parameter Preset Manager ────────────────────────────────────
     with st.expander("📂 Parameter Presets (Save / Load Recipes)", expanded=False):
-        _preset_modality = "Light" if is_light_mode else "SEM"
+        _preset_modality = (
+            "CLSM" if is_clsm_mode else ("Light" if is_light_mode else "SEM")
+        )
         _parameter_presets = load_parameter_presets()
         _modality_presets = _parameter_presets.get(_preset_modality, {})
         st.caption(
@@ -7982,7 +8162,12 @@ else:
     c_idx += 1
 
     if sample_type == "Emulsion":
-        fat_label = "Fat Droplets" if ('is_light_mode' in locals() and is_light_mode) else "Fat Particles"
+        if is_clsm_mode:
+            fat_label = "Silica Microspheres"
+        elif is_light_mode:
+            fat_label = "Fat Droplets"
+        else:
+            fat_label = "Fat Particles"
         cols[c_idx].metric(
             fat_label,
             f"{fat_count:,}",
@@ -8907,12 +9092,20 @@ else:
                     "Air",
                 )
         elif sample_type == "Emulsion":
-            _render_phase_distribution(
-                "fat_particles",
-                "Fat Particles Size Distribution",
-                f"phasepix_fat_distribution_{clean_stem}.png",
-                "Fat",
-            )
+            if is_clsm_mode:
+                _render_phase_distribution(
+                    "fat_particles",
+                    "Silica Microspheres Size Distribution",
+                    f"phasepix_silica_microspheres_distribution_{clean_stem}.png",
+                    "Silica Microspheres",
+                )
+            else:
+                _render_phase_distribution(
+                    "fat_particles",
+                    "Fat Particles Size Distribution",
+                    f"phasepix_fat_distribution_{clean_stem}.png",
+                    "Fat",
+                )
         else:
             _render_phase_distribution(
                 "air_bubbles",
