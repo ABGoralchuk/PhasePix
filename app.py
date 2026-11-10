@@ -298,45 +298,37 @@ CLSM_BACKDROP_OPTIONS: Tuple[str, ...] = (
     CLSM_BACKDROP_C1,
     CLSM_BACKDROP_C0,
 )
-# One canonical session-state slot shared by every copy of the selector, so the
-# sidebar, the Interactive Dashboard and the Cluster Analytics tab never disagree.
+# One canonical session-state slot: the Sidebar Section 6 radio is the ONLY place
+# the backdrop can be changed, and every view (Dashboard overlay / raw / ruler /
+# PNG exports, Cluster network map) reads this slot.
 CLSM_BACKDROP_STATE_KEY = "clsm_backdrop_mode"
-# The three synced copies of the radio widget (unique keys - Streamlit forbids
-# duplicates). The on_change callback below writes the chosen value into ALL of
-# them, which is what keeps the copies in lock-step without a st.rerun().
-CLSM_BACKDROP_WIDGET_KEYS: Tuple[str, ...] = (
-    "clsm_backdrop_radio_sidebar",
-    "clsm_backdrop_radio_dashboard",
-    "clsm_backdrop_radio_clusters",
-)
+# Widget key of that single selector (kept in one place so nothing can drift).
+CLSM_BACKDROP_WIDGET_KEY = "clsm_backdrop_radio_sidebar"
 
 
-def _clsm_backdrop_widget_key(location_key: str) -> str:
-    """Return the widget key of one copy of the CLSM backdrop radio."""
+def _clsm_backdrop_widget_key(location_key: str = "sidebar") -> str:
+    """Return the widget key of the CLSM backdrop radio (the Sidebar copy)."""
+    if location_key == "sidebar":
+        return CLSM_BACKDROP_WIDGET_KEY
     return f"clsm_backdrop_radio_{location_key}"
 
 
 def _on_clsm_backdrop_change(source_widget_key: str) -> None:
     """
-    Propagate a backdrop pick made in ANY copy of the radio to every view.
+    Publish the backdrop chosen in the Sidebar radio to the whole session.
 
     Streamlit runs ``on_change`` callbacks BEFORE the script body is re-executed, so
-    this is the only safe place to sync the copies: by the time
-    ``base_display_img`` (which is built before the Dashboard radio is even
-    instantiated) and the two other radios are evaluated, they all already hold the
-    new value. Doing the same assignment inline inside ``clsm_backdrop_selector``
-    would overwrite the click that triggered the rerun, which is exactly why the
-    Dashboard / Clusters radio used to snap back to 🎨 Composite Color.
+    ``base_display_img`` - which is built far below the sidebar, after the whole
+    Section 1-6 block - already sees the new mode on that very same run. That is why
+    no ``st.rerun()`` and no widget-state juggling are needed: this callback only
+    writes :data:`CLSM_BACKDROP_STATE_KEY`.
 
     Args:
-        source_widget_key: Key of the copy the user just clicked.
+        source_widget_key: Key of the radio that fired the change.
     """
     chosen = st.session_state.get(source_widget_key)
-    if chosen not in CLSM_BACKDROP_OPTIONS:
-        return
-    st.session_state[CLSM_BACKDROP_STATE_KEY] = chosen
-    for widget_key in CLSM_BACKDROP_WIDGET_KEYS:
-        st.session_state[widget_key] = chosen
+    if chosen in CLSM_BACKDROP_OPTIONS:
+        st.session_state[CLSM_BACKDROP_STATE_KEY] = chosen
 
 
 def extract_clsm_backdrop_rgb(color_img: Optional[np.ndarray], backdrop_mode: str) -> Optional[np.ndarray]:
@@ -385,20 +377,19 @@ def extract_clsm_backdrop_rgb(color_img: Optional[np.ndarray], backdrop_mode: st
     return np.repeat(np.ascontiguousarray(plane)[:, :, None], 3, axis=2)
 
 
-def clsm_backdrop_selector(location_key: str) -> str:
+def clsm_backdrop_selector(location_key: str = "sidebar") -> str:
     """
-    Render the synced ``🖼️ CLSM Image Backdrop`` radio and return the active mode.
+    Render the single ``🖼️ CLSM Image Backdrop`` radio and return the active mode.
 
-    The same selector appears in Sidebar Section 6, on the Interactive Dashboard
-    (right above the micrograph) and on the Cluster & Coalescence Analytics tab.
-    Each copy owns a unique widget key (Streamlit forbids duplicates) while
-    :data:`CLSM_BACKDROP_STATE_KEY` holds the single source of truth.
-    :func:`_on_clsm_backdrop_change` propagates every click to all copies BEFORE the
-    script body runs, so nothing is ever overwritten and no extra rerun is needed.
+    The control lives ONLY in Sidebar Section 6 ("Visualization Settings") - the
+    Dashboard and Cluster & Coalescence tabs deliberately expose no duplicate, they
+    simply follow :data:`CLSM_BACKDROP_STATE_KEY`. :func:`_on_clsm_backdrop_change`
+    republishes every click BEFORE the script body runs, so ``base_display_img`` and
+    the exports downstream always render the freshly chosen channel.
 
     Args:
-        location_key: Short unique suffix for the widget key
-            (``"sidebar"``, ``"dashboard"``, ``"clusters"``).
+        location_key: Widget-key suffix; defaults to the sidebar copy
+            (``"clsm_backdrop_radio_sidebar"``).
 
     Returns:
         str: The backdrop mode currently in force.
@@ -411,16 +402,15 @@ def clsm_backdrop_selector(location_key: str) -> str:
         current = CLSM_BACKDROP_COMPOSITE
 
     # Publish the canonical value on the very first CLSM render so every consumer
-    # (base_display_img, the other radios, the exports) reads an explicit mode.
-    # This only ever runs when the slot is missing / invalid - a value written by
-    # _on_clsm_backdrop_change is already valid and is therefore never touched.
+    # (base_display_img, the exports) reads an explicit mode. This only runs when the
+    # slot is missing / invalid - a value written by _on_clsm_backdrop_change is
+    # already valid and is therefore never touched.
     if st.session_state.get(CLSM_BACKDROP_STATE_KEY) not in CLSM_BACKDROP_OPTIONS:
         st.session_state[CLSM_BACKDROP_STATE_KEY] = current
 
-    # Seed this copy ONLY once (or after an invalid value). A value that is already
-    # valid is either a fresh user click (just propagated by the on_change callback)
-    # or the previously synced choice - overwriting it here is what made the
-    # Dashboard / Clusters radio snap back.
+    # Seed the widget ONLY once (or after an invalid value): a valid value is either
+    # the fresh click that triggered this rerun or the previously stored choice, and
+    # overwriting it here is what used to snap the radio back to Composite Color.
     if st.session_state.get(widget_key) not in CLSM_BACKDROP_OPTIONS:
         st.session_state[widget_key] = current
 
@@ -8634,11 +8624,9 @@ else:
         # Column 1: Original Image & Segmentation Overlay
         with col_img:
             st.subheader("1. Micrograph & Overlay")
-            if is_clsm_mode:
-                # 🖼️ Backdrop selector right above the image: switching to
-                # "Grayscale c1" re-renders the overlay, the raw view, the ruler and
-                # the PNG exports on the crisp matrix channel of the same TIFF.
-                clsm_backdrop_selector("dashboard")
+            # The 🖼️ CLSM Image Backdrop selector lives ONLY in Sidebar Section 6
+            # (single source of truth) - no duplicate control here, but this view
+            # (overlay, raw, ruler, PNG exports) still follows the sidebar choice.
             view_mode = st.radio(
                 "Display Mode",
                 ["Segmentation Overlay", "Raw Micrograph", "📏 Interactive Ruler"],
@@ -11427,11 +11415,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "and the mean solidity (neck index)."
         )
 
-        if is_clsm_mode:
-            # 🖼️ Same synced backdrop: the Coalescence Network Map is rendered on
-            # this backdrop, so "Grayscale c1" shows the contact RAG on the clean
-            # dark-sphere / bright-matrix channel.
-            clsm_backdrop_selector("clusters")
+        # The 🖼️ CLSM Image Backdrop selector lives ONLY in Sidebar Section 6; the
+        # Coalescence Network Map below simply inherits that choice.
 
         if classified_df.empty or "phase_class" not in classified_df.columns:
             st.warning("No classified objects are available yet. Run the segmentation first.")
