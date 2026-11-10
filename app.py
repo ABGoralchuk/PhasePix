@@ -279,6 +279,126 @@ CLSM_PHASE_EDGE_COLOR = (130, 240, 255)  # crisp bright ice-blue sphere boundary
 # with them (nor with the green matrix).
 CLSM_UNCLASSIFIED_COLOR = (255, 230, 0)  # bright lemon-yellow
 
+# ---------------------------------------------------------------------------
+# CLSM image backdrop (what the analyst sees UNDER the masks)
+# ---------------------------------------------------------------------------
+# A composite CLSM frame is already a two-channel physics sandwich:
+#   * ``rgb[:, :, 1]`` (G) is the c1 NEGATIVE-CONTRAST MATRIX - a bright grey
+#     continuous phase with dark silica cores, i.e. the crispest possible backdrop
+#     for a cyan overlay;
+#   * ``max(rgb[:, :, 0], rgb[:, :, 2])`` (R/B) is the c0 fluorescent SHELL channel,
+#     which isolates the magenta silica rims.
+# Exposing both as grayscale backdrops lets the analyst switch diagnostic views
+# without re-acquiring the sample.
+CLSM_BACKDROP_COMPOSITE = "🎨 Composite Color (RGB)"
+CLSM_BACKDROP_C1 = "⚫ Grayscale c1 (Matrix — Best Contrast)"
+CLSM_BACKDROP_C0 = "⚪ Grayscale c0 (Shell Rings)"
+CLSM_BACKDROP_OPTIONS: Tuple[str, ...] = (
+    CLSM_BACKDROP_COMPOSITE,
+    CLSM_BACKDROP_C1,
+    CLSM_BACKDROP_C0,
+)
+# One canonical session-state slot shared by every copy of the selector, so the
+# sidebar, the Interactive Dashboard and the Cluster Analytics tab never disagree.
+CLSM_BACKDROP_STATE_KEY = "clsm_backdrop_mode"
+
+
+def extract_clsm_backdrop_rgb(color_img: Optional[np.ndarray], backdrop_mode: str) -> Optional[np.ndarray]:
+    """
+    Build the RGB backdrop shown under the CLSM overlay from one colour frame.
+
+    The composite CLSM TIFF already carries both acquisition channels, so the
+    grayscale backdrops are derived analytically (never estimated):
+
+    * ``⚫ Grayscale c1`` -> green channel ``color_img[:, :, 1]`` (negative-contrast
+      matrix: dark silica spheres on a bright grey field);
+    * ``⚪ Grayscale c0`` -> ``max(R, B)`` (fluorescent magenta shell rings);
+    * ``🎨 Composite Color`` -> the frame untouched, so the true acquisition hues
+      survive.
+
+    Args:
+        color_img: Decoded micrograph - ``(H, W, 3)`` RGB colour frame, a 2D plane,
+            or ``None`` when no image is loaded.
+        backdrop_mode: One of :data:`CLSM_BACKDROP_OPTIONS` (matched by its leading
+            emoji so a reworded label keeps working).
+
+    Returns:
+        Optional[np.ndarray]: ``(H, W, 3)`` RGB uint8 backdrop, or ``None`` when no
+        image was supplied.
+    """
+    if color_img is None:
+        return None
+    arr = np.asarray(color_img)
+
+    # Already a single intensity plane: every backdrop mode looks identical.
+    if arr.ndim == 2:
+        return np.repeat(arr[:, :, None], 3, axis=2)
+
+    if arr.ndim != 3:
+        return arr
+    if arr.shape[2] == 1:
+        return np.repeat(arr, 3, axis=2)
+
+    mode = str(backdrop_mode or "").strip()
+    if mode.startswith("⚫"):
+        plane = arr[:, :, 1]                      # c1 negative-contrast matrix
+    elif mode.startswith("⚪"):
+        plane = np.maximum(arr[:, :, 0], arr[:, :, 2])  # c0 fluorescent shells
+    else:
+        return np.ascontiguousarray(arr[:, :, :3])      # composite acquisition
+    return np.repeat(np.ascontiguousarray(plane)[:, :, None], 3, axis=2)
+
+
+def clsm_backdrop_selector(location_key: str) -> str:
+    """
+    Render the synced ``🖼️ CLSM Image Backdrop`` radio and return the active mode.
+
+    The same selector appears in Sidebar Section 6, on the Interactive Dashboard
+    (right above the micrograph) and on the Cluster & Coalescence Analytics tab.
+    Each copy owns a unique widget key (Streamlit forbids duplicates) while
+    :data:`CLSM_BACKDROP_STATE_KEY` holds the single source of truth, so picking a
+    backdrop anywhere re-renders every view on the next run.
+
+    Args:
+        location_key: Short unique suffix for the widget key
+            (``"sidebar"``, ``"dashboard"``, ``"clusters"``).
+
+    Returns:
+        str: The backdrop mode currently in force.
+    """
+    widget_key = f"clsm_backdrop_radio_{location_key}"
+    current = str(
+        st.session_state.get(CLSM_BACKDROP_STATE_KEY, CLSM_BACKDROP_COMPOSITE)
+    )
+    if current not in CLSM_BACKDROP_OPTIONS:
+        current = CLSM_BACKDROP_COMPOSITE
+
+    # Re-seed this copy before it is instantiated, so all three radios agree even
+    # when the change was made in another tab.
+    if st.session_state.get(widget_key) != current:
+        st.session_state[widget_key] = current
+
+    choice = st.radio(
+        "🖼️ CLSM Image Backdrop",
+        options=list(CLSM_BACKDROP_OPTIONS),
+        index=CLSM_BACKDROP_OPTIONS.index(current),
+        horizontal=True,
+        key=widget_key,
+        help=(
+            "Background under the overlay, the Raw Micrograph view, the Interactive "
+            "Ruler, the PNG exports and the Coalescence Network Map. **Composite "
+            "Color** keeps the true green-matrix / magenta-shell acquisition; "
+            "**Grayscale c1** shows the matrix channel (G) where the silica spheres "
+            "are dark and maximally crisp; **Grayscale c0** shows the fluorescent "
+            "shell channel (max(R, B))."
+        ),
+    )
+
+    if str(choice) != current:
+        st.session_state[CLSM_BACKDROP_STATE_KEY] = str(choice)
+        st.rerun()
+    return current
+
 
 def load_clsm_presets() -> dict:
     """
@@ -6926,6 +7046,12 @@ with st.sidebar:
 
     st.subheader("6. Visualization Settings")
 
+    if is_clsm_mode:
+        # 🖼️ Backdrop: composite RGB acquisition vs. the pure c1 matrix / c0 shell
+        # channels decoded from the same frame. Shared with the Dashboard and the
+        # Cluster & Coalescence tab through one canonical session-state slot.
+        clsm_backdrop_selector("sidebar")
+
     if sample_type == "Foam":
         show_air = st.checkbox("Show Air Bubbles", value=True)
         show_fat = False
@@ -8024,9 +8150,16 @@ else:
     # Visualization preparations: Dimming & Padding
     # Apply translucent dimming to footer panel on full-size display image.
     # CLSM frames keep their original colour mix (only the analysis plane is
-    # grayscale), so the overlay is rendered on the true acquisition colours.
+    # grayscale), so the overlay is rendered on the true acquisition colours -
+    # unless the analyst picked a grayscale c1 / c0 backdrop in Section 6, in
+    # which case the same TIFF is decoded into its single physical channel here,
+    # BEFORE create_mask_overlay / burn_in_scale_bar /
+    # render_coalescence_network_overlay run.
+    _clsm_backdrop_mode = str(
+        st.session_state.get(CLSM_BACKDROP_STATE_KEY, CLSM_BACKDROP_COMPOSITE)
+    )
     _display_source_img = (
-        clsm_color_img
+        extract_clsm_backdrop_rgb(clsm_color_img, _clsm_backdrop_mode)
         if (is_clsm_mode and clsm_color_img is not None)
         else original_img
     )
@@ -8457,6 +8590,11 @@ else:
         # Column 1: Original Image & Segmentation Overlay
         with col_img:
             st.subheader("1. Micrograph & Overlay")
+            if is_clsm_mode:
+                # 🖼️ Backdrop selector right above the image: switching to
+                # "Grayscale c1" re-renders the overlay, the raw view, the ruler and
+                # the PNG exports on the crisp matrix channel of the same TIFF.
+                clsm_backdrop_selector("dashboard")
             view_mode = st.radio(
                 "Display Mode",
                 ["Segmentation Overlay", "Raw Micrograph", "📏 Interactive Ruler"],
@@ -11244,6 +11382,12 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             "number- and weight-average cluster sizes, the 2D fractal dimension $D_f$ "
             "and the mean solidity (neck index)."
         )
+
+        if is_clsm_mode:
+            # 🖼️ Same synced backdrop: the Coalescence Network Map is rendered on
+            # this backdrop, so "Grayscale c1" shows the contact RAG on the clean
+            # dark-sphere / bright-matrix channel.
+            clsm_backdrop_selector("clusters")
 
         if classified_df.empty or "phase_class" not in classified_df.columns:
             st.warning("No classified objects are available yet. Run the segmentation first.")

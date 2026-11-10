@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 PALETTE_COLORS = {
     "air_bubbles": "#1f77b4",   # Blue for air bubbles (dark pores in SEM)
     "fat_particles": "#ff7f0e",  # Orange for fat particles (bright features in SEM)
-    # Confocal Fluorescence: single silica-microsphere phase. Vivid sky-cyan /
-    # azure - the complementary pole of the magenta shell, a hue that never occurs
-    # in the bright green CLSM matrix (amber-gold blended into a muddy brown there).
-    "silica": "#00C8FF",
+    # Confocal Fluorescence: single silica-microsphere phase. On the MICROGRAPH
+    # overlay silica is vivid sky-cyan (0, 200, 255); on the printed Size
+    # Distribution chart it keeps the warm golden-amber publication palette
+    # (#F5B041 bars / #D68910 KDE) so the histogram never reads as a cyan figure.
+    "silica": "#F5B041",
+    "silica_kde": "#D68910",      # warm golden-amber KDE line for the silica PSD
     "adsorbed_fat": "#E6AF00",   # Warm honey-gold for interior crater adsorbed fat globules
     # Pure bright lemon-yellow (golden-amber edge) for equatorial Pickering corona
     # globules: unmistakably yellow, so it can never clash with the lime-green
@@ -362,10 +364,17 @@ def plot_single_phase_distribution(
 
     phase_key = str(phase_class).strip()
     display_name = phase_key.replace("_", " ").title()
-    # Confocal silica uses the vivid sky-cyan fill (#00C8FF) so its histogram bar
-    # matches the sphere overlay rendered by ``create_mask_overlay``.
-    _fallback_color = "#00C8FF" if phase_key.lower() == "silica" else "#4c78a8"
+    # Silica keeps the warm golden-amber publication palette on the histogram even
+    # though its micrograph overlay is vivid sky-cyan: the chart is a print figure,
+    # the overlay is a segmentation diagnostic.
+    _is_silica_chart = phase_key.lower() == "silica"
+    _fallback_color = (
+        PALETTE_COLORS.get("silica", "#F5B041") if _is_silica_chart else "#4c78a8"
+    )
     plot_color = color or PALETTE_COLORS.get(phase_key, _fallback_color)
+    _kde_color = (
+        PALETTE_COLORS.get("silica_kde", "#D68910") if _is_silica_chart else plot_color
+    )
     plot_title = title or f"{display_name} Size Distribution"
 
     if df is None or df.empty or "diameter_um" not in df.columns:
@@ -420,6 +429,12 @@ def plot_single_phase_distribution(
             ax=ax,
             label=legend_label,
         )
+        # Silica: warmer, darker golden KDE curve over the #F5B041 bars, so the
+        # histogram reads as a warm publication figure instead of a cyan overlay.
+        if _is_silica_chart:
+            for _kde_line in ax.lines:
+                _kde_line.set_color(_kde_color)
+                _kde_line.set_linewidth(2.0)
 
     # Subtitle documents the active binning and confirms the mass balance (Σ = 100%)
     ax.text(
