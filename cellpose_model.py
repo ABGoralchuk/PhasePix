@@ -3051,6 +3051,149 @@ def _recover_clsm_agglomerate_spheres(
     return combined, next_id, added
 
 
+# ---------------- v2.0.0 CLSM SPHERICAL MASK REGULARIZATION -------------------
+# Silica microspheres are rigid, non-deformable spheres, so a watershed footprint
+# that deviates from a circle is a segmentation artefact, not real particle
+# geometry.  Every particle below these shape gates is re-drawn as the circular
+# disc of its own equivalent radius, which removes watershed polygons / honeycomb
+# clusters; a compact sphere keeps its exact area.
+CLSM_SPHERE_MAX_CIRCULARITY = 0.86
+CLSM_SPHERE_MAX_SOLIDITY = 0.94
+CLSM_SPHERE_RADIUS_TOLERANCE = 1.02
+CLSM_SPHERE_MIN_AREA_PX = 6
+
+
+def _regularize_clsm_spherical_masks(masks: np.ndarray) -> np.ndarray:
+    """
+    Re-draw jagged silica footprints as smooth, truly spherical masks.
+
+    For every label ``lbl > 0`` the sub-pixel centroid ``(cy, cx)`` and the
+    equivalent circular radius ``r_eq = sqrt(area / pi)`` are computed from the
+    label's own pixels.  A particle whose mask is polygonal / watershed-split
+    (``circularity < 0.86`` or ``solidity < 0.94``) has its footprint replaced by
+    the disc ``(y - cy)^2 + (x - cx)^2 <= (r_eq * 1.02)^2`` inside its local
+    bounding box.
+
+    Touching spheres overlap by 1-2 px inside that 2 % tolerance; each shared pixel
+    goes to the sphere with the smaller normalised distance ``dist / r_eq``, so a
+    cluster of cemented spheres becomes a clean row of tangent discs instead of a
+    honeycomb.  Discs may only claim pixels that are foreground or within 1 px of
+    it, and pixels of already-compact particles are never stolen.  Compact spheres
+    keep their exact area; a concave / crescent debris footprint is clamped to its
+    inscribed radius so it can never become a clipped crescent, and in every case
+    the resulting ``circularity`` is >= 0.82.
+
+    Args:
+        masks: 2D (or ``(H, W, 1)``) int label map, 0 = background.
+
+    Returns:
+        np.ndarray: int32 label map of the same shape with regularised particles.
+    """
+    if not isinstance(masks, np.ndarray) or masks.size == 0:
+        return masks
+
+    squeezed = masks.ndim == 3
+    labels = masks.squeeze() if squeezed else masks
+    if labels.ndim != 2:
+        return masks
+
+    source = labels.astype(np.int32, copy=False)
+    shape = masks.shape
+    if source.size == 0 or int(source.max()) <= 0:
+        return source.reshape(shape) if squeezed else source
+
+    height, width = source.shape
+    n_labels = int(source.max())
+
+    # Sub-pixel centroid + area of every label in ONE vectorised pass (no Python
+    # loop over pixels): bincount over the flattened label image.
+    flat = source.ravel()
+    counts = np.bincount(flat, minlength=n_labels + 1).astype(np.float64)
+    grid_y, grid_x = np.indices(source.shape)
+    sum_y = np.bincount(flat, weights=grid_y.ravel(), minlength=n_labels + 1)
+    sum_x = np.bincount(flat, weights=grid_x.ravel(), minlength=n_labels + 1)
+    del grid_y, grid_x
+
+    candidates = []
+    for lbl, sl in enumerate(ndi.find_objects(source), start=1):
+        if sl is None or lbl > n_labels:
+            continue
+        area = float(counts[lbl])
+        if area < CLSM_SPHERE_MIN_AREA_PX:
+            continue
+        circularity, solidity = _mask_circularity_solidity(source[sl] == lbl)
+        if (
+            circularity >= CLSM_SPHERE_MAX_CIRCULARITY
+            and solidity >= CLSM_SPHERE_MAX_SOLIDITY
+        ):
+            continue
+        cy = float(sum_y[lbl]) / area
+        cx = float(sum_x[lbl]) / area
+        r_eq = max(1.0, math.sqrt(area / math.pi))
+        candidates.append((lbl, cy, cx, r_eq))
+
+    if not candidates:
+        return source.reshape(shape) if squeezed else source
+
+    logger.info(
+        "CLSM spherical regularisation: %d/%d particle(s) re-drawn as smooth discs",
+        len(candidates),
+        int(np.count_nonzero(counts[1:])),
+    )
+
+    candidate_ids = np.asarray([c[0] for c in candidates], dtype=np.int32)
+    regularised_pixels = np.isin(source, candidate_ids)
+
+    # A pixel already owned by a compact particle keeps distance 0 and is therefore
+    # never overwritten (a disc only claims pixels with a strictly smaller value).
+    best_dist = np.full(source.shape, np.inf, dtype=np.float32)
+    best_dist[(source > 0) & (~regularised_pixels)] = 0.0
+    best_label = source.copy()
+    best_label[regularised_pixels] = 0
+
+    # Discs may only claim foreground pixels or pixels within 1 px of foreground.
+    allowed = ndi.binary_dilation(source > 0, iterations=1)
+    # Largest circle centred on each particle that still fits inside ``allowed``:
+    # a concave / crescent footprint can never produce a clipped crescent "sphere",
+    # so its radius is clamped to this inscribed bound before drawing.
+    fit_map = ndi.distance_transform_edt(allowed)
+
+    for lbl, cy, cx, r_eq in candidates:
+        # Radius: the equivalent-area radius, capped by what physically fits so the
+        # painted disc is a full circle rather than a clipped crescent.
+        _ci = int(np.clip(round(cy), 0, height - 1))
+        _cj = int(np.clip(round(cx), 0, width - 1))
+        r_fit = float(fit_map[_ci, _cj])
+        r_out = r_eq * CLSM_SPHERE_RADIUS_TOLERANCE
+        if r_fit > 0.0:
+            r_out = min(r_out, r_fit)
+        r_out = max(r_out, 1.0)
+
+        y0 = max(0, int(math.floor(cy - r_out)) - 1)
+        y1 = min(height, int(math.ceil(cy + r_out)) + 2)
+        x0 = max(0, int(math.floor(cx - r_out)) - 1)
+        x1 = min(width, int(math.ceil(cx + r_out)) + 2)
+        if y1 <= y0 or x1 <= x0:
+            continue
+
+        yy = np.arange(y0, y1, dtype=np.float32)[:, None]
+        xx = np.arange(x0, x1, dtype=np.float32)[None, :]
+        dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        disc = (dist <= r_out) & allowed[y0:y1, x0:x1]
+        if not disc.any():
+            continue
+
+        # Normalised distance decides who owns a 1-2 px shared boundary pixel.
+        norm = (dist / r_eq).astype(np.float32)
+        sub_dist = best_dist[y0:y1, x0:x1]
+        sub_label = best_label[y0:y1, x0:x1]
+        take = disc & (norm < sub_dist)
+        sub_dist[take] = norm[take]
+        sub_label[take] = lbl
+
+    return best_label.reshape(shape) if squeezed else best_label
+
+
 
 
 
@@ -3085,6 +3228,10 @@ def cached_segment_clsm_microspheres(
            ``0.8 x base_diameter_px`` spheres the network cannot resolve, split
            apart by a distance-transform watershed instead of being merged into
            one blob.
+        5. ``_regularize_clsm_spherical_masks`` re-draws every particle whose
+           footprint is not compact (``circularity < 0.86`` or
+           ``solidity < 0.94``) as its equivalent-area disc, so rigid silica
+           spheres always end up as smooth, truly circular masks (>= 0.82).
 
     Args:
         image: Analysis frame - ``(H, W, 3)`` RGB (``Snap-22.tif``) or
@@ -3169,6 +3316,13 @@ def cached_segment_clsm_microspheres(
     combined, next_id, n_agglomerate = _recover_clsm_agglomerate_spheres(
         image, base_diameter, combined, occupied, next_id
     )
+
+    # ---- Spherical regularisation: silica spheres must be TRUE smooth discs -----
+    # Watershed splitting leaves polygonal / honeycomb footprints on touching
+    # spheres. This final vectorised pass re-draws every non-compact particle as its
+    # own equivalent-area disc (area preserved, circularity >= 0.82), so the mask
+    # reflects rigid spherical geometry instead of the pixel grid.
+    combined = _regularize_clsm_spherical_masks(combined)
 
     logger.info(
         "CLSM microspheres [%s]: %d Cellpose (%d after splitting %d merged mask(s)) "

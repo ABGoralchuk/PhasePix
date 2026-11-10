@@ -266,11 +266,18 @@ CLSM_DEFAULT_MICROSPHERE_UM = 8.0
 # CLSM session can never be mistaken for a fat/emulsion analysis.
 CLSM_PHASE_KEY = "silica"
 CLSM_PHASE_LABEL = "Silica"
-CLSM_PHASE_COLOR = (255, 175, 0)        # warm amber-gold fill
-CLSM_PHASE_EDGE_COLOR = (255, 245, 120)  # crisp yellow-white per-particle edges
-# Bright cyan replaces the SEM lime-green Unclassified: a CLSM composite has a
-# bright GREEN matrix, so green highlights are invisible there.
-CLSM_UNCLASSIFIED_COLOR = (0, 229, 255)  # #00E5FF
+# Vivid sky-cyan / azure silica fill.  On a CLSM composite (Snap-22.tif) the matrix
+# is bright green and the fluorescent shells are magenta, so the old amber-gold
+# silica blended with both hues into a muddy brownish tone.  Sky-cyan is the
+# complementary pole of magenta and never occurs in the green matrix, so every
+# microsphere stays unmistakable against both channels.
+CLSM_PHASE_COLOR = (0, 200, 255)         # vivid sky-cyan / azure fill
+CLSM_PHASE_EDGE_COLOR = (130, 240, 255)  # crisp bright ice-blue sphere boundary
+# Bright lemon-yellow replaces the SEM lime-green Unclassified: a CLSM composite has
+# a bright GREEN matrix, so green highlights are invisible there - and the new
+# cyan/blue silica spheres need an Unclassified hue that can never be confused
+# with them (nor with the green matrix).
+CLSM_UNCLASSIFIED_COLOR = (255, 230, 0)  # bright lemon-yellow
 
 
 def load_clsm_presets() -> dict:
@@ -1090,7 +1097,9 @@ def load_parameter_presets() -> dict:
             with open(PARAMETER_PRESETS_PATH, "r", encoding="utf-8") as fh:
                 stored = json.load(fh)
             if isinstance(stored, dict):
-                for modality in ("SEM", "Light"):
+                # CLSM presets are persisted too, so a saved microsphere recipe
+                # survives an app restart exactly like the SEM / Light ones.
+                for modality in ("SEM", "Light", "CLSM"):
                     if modality not in stored:
                         # Never written yet: keep the built-in laboratory recipes.
                         continue
@@ -6682,6 +6691,27 @@ with st.sidebar:
         "sem_corona_Capture_um": float(corona_capture_um) if not is_light_mode else None,
     }
 
+    if is_clsm_mode:
+        # Confocal Fluorescence keys: without them ``collect_parameter_snapshot``
+        # filled the CLSM bucket from PARAMETER_WIDGET_DEFAULTS, so "↩️ Undo Last
+        # Apply" and preset saving silently reverted the microsphere recipe to
+        # factory values instead of the settings the user was actually running.
+        _live_parameter_values.update(
+            {
+                "clsm_dispersed_system_radio": st.session_state.get(
+                    "clsm_dispersed_system_radio", CLSM_DISPERSED_SYSTEM
+                ),
+                "clsm_min_particle_size_input": float(min_fat_size),
+                "clsm_max_particle_size_input": float(max_fat_size),
+                "clsm_microsphere_um": float(
+                    expected_droplet_um
+                    if expected_droplet_um is not None
+                    else CLSM_DEFAULT_MICROSPHERE_UM
+                ),
+                "clsm_microsphere_circ_slider": float(fat_min_circularity),
+            }
+        )
+
     if st.button(
         "🪄 Analyze Image & Recommend Parameters",
         type="primary",
@@ -6927,12 +6957,13 @@ with st.sidebar:
         show_adsorbed = False
         show_corona = False
         show_unclassified = st.checkbox(
-            "Show Unclassified (Cyan)" if is_clsm_mode else "Show Unclassified (Green)",
+            "Show Unclassified (Yellow)" if is_clsm_mode else "Show Unclassified (Green)",
             value=True,
             key="show_unclassified_toggle",
             help=(
-                "Toggles the cyan (#00E5FF) Unclassified underlay in the overlay and "
-                "the 🎨 canvas — cyan stays visible on the bright green CLSM matrix."
+                "Toggles the bright lemon-yellow (#FFE600) Unclassified underlay in "
+                "the overlay and the 🎨 canvas — yellow stays visible on the bright "
+                "green CLSM matrix and never clashes with the sky-cyan silica spheres."
                 if is_clsm_mode
                 else "Toggles the green Unclassified underlay in the overlay and the 🎨 canvas."
             ),
@@ -6946,7 +6977,7 @@ with st.sidebar:
             value=0.3,
             step=0.05,
             help=(
-                "Transparency level for the amber-gold silica microsphere overlay "
+                "Transparency level for the sky-cyan silica microsphere overlay "
                 "layer (0.0=fully transparent, 1.0=fully opaque)."
                 if is_clsm_mode
                 else "Transparency level for fat particles overlay layer (0.0=fully transparent, 1.0=fully opaque)."
@@ -7854,8 +7885,12 @@ else:
             & (~classified_df["id"].isin(_manual_override_ids))
         )
         if outside_partial.any():
+            # The in-range label must follow the active dispersed phase: ``silica``
+            # in CLSM mode, ``fat_particles`` for SEM emulsions. A hardcoded
+            # "fat_particles" resurrected a phase that does not exist in a confocal
+            # silica dispersion and corrupted every downstream table.
             classified_df.loc[outside_partial, "phase_class"] = np.where(
-                is_in_fat_size[outside_partial], "fat_particles", "Unclassified"
+                is_in_fat_size[outside_partial], _dispersed_phase, "Unclassified"
             )
 
         classified_df["is_partial_in_bubble"] = classified_df["phase_class"].astype(str).str.lower().eq("adsorbed_fat")
@@ -8344,7 +8379,7 @@ else:
                     key="autotune_apply_btn",
                 ):
                     st.session_state["_previous_parameter_snapshot"] = collect_parameter_snapshot(
-                        "Light" if is_light_mode else "SEM",
+                        "CLSM" if is_clsm_mode else ("Light" if is_light_mode else "SEM"),
                         _live_parameter_values,
                     )
                     st.session_state["_pending_parameter_updates"] = dict(
@@ -9344,8 +9379,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         horizontal=True,
                         help=(
                             "Choose the target phase, then click directly on as many existing "
-                            "particles as you want (one click each). Cyan particles are the AI's "
-                            "Unclassified detections, amber-gold are silica microspheres, orange "
+                            "particles as you want (one click each). Yellow particles are the AI's "
+                            "Unclassified detections, sky-cyan are silica microspheres, orange "
                             "are matrix fat, gold adsorbed fat and blue air bubbles. Every dot is "
                             "drawn in the target colour; press "
                             "'✅ Apply Phase to Clicked Particles' to commit. "
@@ -9444,14 +9479,14 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 with vis_col1:
                     canvas_show_unclassified = st.checkbox(
                         (
-                            "🟦 Show Unclassified"
+                            "🟨 Show Unclassified"
                             if is_clsm_mode
                             else "🟢 Show Unclassified"
                         ),
                         value=bool(show_unclassified),
                         key="canvas_show_unclassified",
                         help=(
-                            "Paint the cyan Unclassified particles onto the canvas."
+                            "Paint the bright lemon-yellow Unclassified particles onto the canvas."
                             if is_clsm_mode
                             else "Paint the green Unclassified particles onto the canvas."
                         ),
@@ -9466,7 +9501,7 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                         value=bool(show_fat),
                         key="canvas_show_fat",
                         help=(
-                            "Paint the amber-gold silica microspheres (synced with "
+                            "Paint the sky-cyan silica microspheres (synced with "
                             "Sidebar → Section 6)."
                             if is_clsm_mode
                             else "Paint the orange matrix-fat particles (synced with Sidebar → Section 6)."
@@ -9619,7 +9654,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 CLSM_PHASE_KEY: CLSM_PHASE_COLOR,
                 "adsorbed_fat": (230, 175, 0),
                 "corona_fat": CORONA_FAT_RGB,
-                # CLSM: cyan instead of lime green - the composite matrix is green.
+                # CLSM: bright lemon-yellow instead of lime green - the composite
+                # matrix is green, so a green highlight would be invisible.
                 "unclassified": (
                     CLSM_UNCLASSIFIED_COLOR if is_clsm_mode else (50, 205, 50)
                 ),
@@ -9742,8 +9778,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 canvas_fill_color = "rgba(255, 165, 0, 0.45)"
                 canvas_stroke_color = "#FFA500"
             elif click_target_phase == CLSM_PHASE_KEY:
-                canvas_fill_color = "rgba(255, 175, 0, 0.45)"
-                canvas_stroke_color = "#FFAF00"
+                canvas_fill_color = "rgba(0, 200, 255, 0.45)"
+                canvas_stroke_color = "#00C8FF"
             elif click_target_phase == "air_bubbles":
                 canvas_fill_color = "rgba(0, 191, 255, 0.45)"
                 canvas_stroke_color = "#00BFFF"
@@ -9751,8 +9787,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 canvas_fill_color = "rgba(255, 75, 75, 0.55)"
                 canvas_stroke_color = "#FF4B4B"
             elif is_clsm_mode:
-                canvas_fill_color = "rgba(0, 229, 255, 0.45)"
-                canvas_stroke_color = "#00E5FF"
+                canvas_fill_color = "rgba(255, 230, 0, 0.45)"
+                canvas_stroke_color = "#FFE600"
             else:
                 canvas_fill_color = "rgba(50, 205, 50, 0.45)"
                 canvas_stroke_color = "#32CD32"
@@ -9760,8 +9796,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             canvas_fill_color = "rgba(255, 165, 0, 0.4)"
             canvas_stroke_color = "#FFA500"
         elif default_manual_phase == CLSM_PHASE_KEY:
-            canvas_fill_color = "rgba(255, 175, 0, 0.4)"
-            canvas_stroke_color = "#FFAF00"
+            canvas_fill_color = "rgba(0, 200, 255, 0.4)"
+            canvas_stroke_color = "#00C8FF"
         elif default_manual_phase == "adsorbed_fat":
             canvas_fill_color = "rgba(230, 175, 0, 0.4)"
             canvas_stroke_color = "#E6AF00"
@@ -9770,8 +9806,8 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
             canvas_stroke_color = "#FFF220"
         elif default_manual_phase == "Unclassified":
             if is_clsm_mode:
-                canvas_fill_color = "rgba(0, 229, 255, 0.4)"
-                canvas_stroke_color = "#00E5FF"
+                canvas_fill_color = "rgba(255, 230, 0, 0.4)"
+                canvas_stroke_color = "#FFE600"
             else:
                 canvas_fill_color = "rgba(50, 205, 50, 0.4)"
                 canvas_stroke_color = "#32CD32"

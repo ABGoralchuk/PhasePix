@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 PALETTE_COLORS = {
     "air_bubbles": "#1f77b4",   # Blue for air bubbles (dark pores in SEM)
     "fat_particles": "#ff7f0e",  # Orange for fat particles (bright features in SEM)
-    # Confocal Fluorescence: single silica-microsphere phase. Warm amber-gold, a
-    # hue that never occurs in a green-matrix / magenta-shell CLSM composite.
-    "silica": "#FFAF00",
+    # Confocal Fluorescence: single silica-microsphere phase. Vivid sky-cyan /
+    # azure - the complementary pole of the magenta shell, a hue that never occurs
+    # in the bright green CLSM matrix (amber-gold blended into a muddy brown there).
+    "silica": "#00C8FF",
     "adsorbed_fat": "#E6AF00",   # Warm honey-gold for interior crater adsorbed fat globules
     # Pure bright lemon-yellow (golden-amber edge) for equatorial Pickering corona
     # globules: unmistakably yellow, so it can never clash with the lime-green
@@ -361,7 +362,10 @@ def plot_single_phase_distribution(
 
     phase_key = str(phase_class).strip()
     display_name = phase_key.replace("_", " ").title()
-    plot_color = color or PALETTE_COLORS.get(phase_key, "#4c78a8")
+    # Confocal silica uses the vivid sky-cyan fill (#00C8FF) so its histogram bar
+    # matches the sphere overlay rendered by ``create_mask_overlay``.
+    _fallback_color = "#00C8FF" if phase_key.lower() == "silica" else "#4c78a8"
+    plot_color = color or PALETTE_COLORS.get(phase_key, _fallback_color)
     plot_title = title or f"{display_name} Size Distribution"
 
     if df is None or df.empty or "diameter_um" not in df.columns:
@@ -891,6 +895,244 @@ def _inter_label_boundary(labels: np.ndarray) -> np.ndarray:
     return boundary
 
 
+# ---------------------------------------------------------------------------
+# CLSM silica: sub-pixel sphere geometry
+# ---------------------------------------------------------------------------
+# Silica microspheres are rigid, non-deformable spheres, so their overlay must be a
+# TRUE circle - never a watershed polygon, a honeycomb cluster or a 4-neighbour
+# pixel staircase.  Circles below this circularity are genuine non-spherical manual
+# objects (crescents, aggregate debris) and get a smoothed outline instead.
+CLSM_SILICA_CIRCULARITY_GATE = 0.72
+# OpenCV fixed-point precision for sub-pixel drawing: 3 -> 1/8 px steps.
+CLSM_SUBPIXEL_SHIFT = 3
+CLSM_SUBPIXEL_SCALE = float(1 << CLSM_SUBPIXEL_SHIFT)
+# Bright lemon-yellow Unclassified underlay for CLSM (never clashes with the
+# sky-cyan spheres or the bright green matrix).
+CLSM_UNCLASSIFIED_RGB = (255, 230, 0)
+CLSM_SILICA_FILL_RGB = (0, 200, 255)
+CLSM_SILICA_EDGE_RGB = (130, 240, 255)
+CLSM_SILICA_INTER_EDGE_RGB = (170, 250, 255)
+
+
+def _clsm_spherical_geometry(
+    labels: np.ndarray,
+    rows: Optional[pd.DataFrame] = None,
+) -> list:
+    """
+    Return the sub-pixel circle that describes every labelled silica sphere.
+
+    The mask supplies the area (hence the equivalent radius ``sqrt(area / pi)``)
+    and, when the particle table is missing or incomplete, the sub-pixel centroid.
+    Values from ``rows`` win whenever available so the rendered circle matches the
+    exported metrics exactly.
+
+    Args:
+        labels: 2D integer label map restricted to the silica phase (0 = not silica).
+        rows: Optional particle table with ``id`` / ``centroid_x`` / ``centroid_y``
+            / ``circularity`` columns.
+
+    Returns:
+        list: ``(label, cx, cy, radius_px, circularity)`` per particle, in label
+        order. Empty when the label map holds no particle.
+    """
+    geometry: list = []
+    if not isinstance(labels, np.ndarray) or labels.size == 0:
+        return geometry
+    labels_2d = labels.squeeze() if labels.ndim == 3 else labels
+    if labels_2d.ndim != 2 or int(labels_2d.max()) <= 0:
+        return geometry
+    labels_2d = labels_2d.astype(np.int32, copy=False)
+
+    # Fast id -> (centroid_x, centroid_y, circularity) lookup from the metrics table.
+    table: dict = {}
+    if rows is not None and not rows.empty and "id" in rows.columns:
+        ids = rows["id"].to_numpy()
+        cxs = (
+            rows["centroid_x"].to_numpy(dtype=float)
+            if "centroid_x" in rows.columns
+            else None
+        )
+        cys = (
+            rows["centroid_y"].to_numpy(dtype=float)
+            if "centroid_y" in rows.columns
+            else None
+        )
+        circs = (
+            rows["circularity"].to_numpy(dtype=float)
+            if "circularity" in rows.columns
+            else None
+        )
+        for idx, pid in enumerate(ids):
+            try:
+                table[int(pid)] = (
+                    float(cxs[idx]) if cxs is not None else float("nan"),
+                    float(cys[idx]) if cys is not None else float("nan"),
+                    float(circs[idx]) if circs is not None else float("nan"),
+                )
+            except (TypeError, ValueError):
+                continue
+
+    for lbl, sl in enumerate(find_objects(labels_2d), start=1):
+        if sl is None:
+            continue
+        patch = labels_2d[sl] == lbl
+        area = float(np.count_nonzero(patch))
+        if area < 3.0:
+            continue
+        ys, xs = np.nonzero(patch)
+        cy = float(ys.mean()) + float(sl[0].start)
+        cx = float(xs.mean()) + float(sl[1].start)
+        radius = math.sqrt(area / math.pi)
+
+        # Circularity of the raw mask contour (4*pi*A / P^2).
+        circularity = 0.0
+        cnts, _ = cv2.findContours(
+            patch.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea)
+            perimeter = float(cv2.arcLength(cnt, True))
+            if perimeter > 0.0:
+                circularity = float(
+                    min(
+                        1.0,
+                        4.0 * math.pi * float(cv2.contourArea(cnt)) / (perimeter ** 2),
+                    )
+                )
+
+        known = table.get(int(lbl))
+        if known is not None:
+            kx, ky, kcirc = known
+            if np.isfinite(kx) and np.isfinite(ky):
+                cx, cy = kx, ky
+            if np.isfinite(kcirc):
+                circularity = float(min(1.0, max(0.0, kcirc)))
+
+        geometry.append((int(lbl), cx, cy, max(1.0, radius), circularity))
+    return geometry
+
+
+def _draw_clsm_silica_spheres(
+    blended: np.ndarray,
+    mask_2d: np.ndarray,
+    phase_mask: np.ndarray,
+    phase_color,
+    phase_opacity: float,
+    rows: Optional[pd.DataFrame],
+) -> None:
+    """
+    Paint silica microspheres as anti-aliased, sub-pixel, truly spherical discs.
+
+    Two passes:
+        1. **Fill** - an 8-bit OpenCV coverage layer drawn with ``LINE_AA`` at
+           ``shift=3`` (1/8 px steps), blended once at ``phase_opacity``. This
+           removes the jagged 4-neighbour staircase of a raw ``masks[y, x]`` tint,
+           which is what made 400x400 spheres look like rough polygons.
+        2. **Boundary** - a crisp ``cv2.circle(..., shift=3)`` ice-blue rim per
+           circular sphere; non-circular manual objects (circularity < 0.72) keep a
+           Fourier / ``approxPolyDP`` smoothed contour drawn with ``LINE_AA``.
+
+    Args:
+        blended: RGB uint8 canvas, modified in place.
+        mask_2d: 2D label map of the whole frame.
+        phase_mask: Boolean mask of the silica phase pixels.
+        phase_color: RGB fill colour of the silica phase.
+        phase_opacity: Fill opacity (0..1) taken from the sidebar slider.
+        rows: Optional particle table for exact centroids / circularity.
+    """
+    silica_labels = np.where(phase_mask, mask_2d, 0).astype(np.int32)
+    geometry = _clsm_spherical_geometry(silica_labels, rows)
+    if not geometry:
+        return
+
+    scale = CLSM_SUBPIXEL_SCALE
+    gate = CLSM_SILICA_CIRCULARITY_GATE
+    non_circular_ids = [lbl for lbl, _cx, _cy, _r, circ in geometry if circ < gate]
+
+    # ---- Pass 1: anti-aliased spherical fill --------------------------------
+    if phase_opacity > 0.0:
+        coverage = np.zeros(mask_2d.shape, dtype=np.uint8)
+        for _lbl, cx, cy, radius, circ in geometry:
+            if circ < gate:
+                continue
+            cv2.circle(
+                coverage,
+                (int(round(cx * scale)), int(round(cy * scale))),
+                max(2 * int(scale), int(round(radius * scale))),
+                255,
+                -1,
+                cv2.LINE_AA,
+                CLSM_SUBPIXEL_SHIFT,
+            )
+        if coverage.any():
+            cov_rows = np.flatnonzero(coverage.any(axis=1))
+            cov_cols = np.flatnonzero(coverage.any(axis=0))
+            y0, y1 = int(cov_rows[0]), int(cov_rows[-1]) + 1
+            x0, x1 = int(cov_cols[0]), int(cov_cols[-1]) + 1
+            weight = (
+                coverage[y0:y1, x0:x1].astype(np.float32) / 255.0
+            )[..., None] * float(phase_opacity)
+            base = blended[y0:y1, x0:x1].astype(np.float32)
+            blended[y0:y1, x0:x1] = (
+                base * (1.0 - weight)
+                + np.asarray(phase_color, dtype=np.float32) * weight
+            ).clip(0, 255).astype(np.uint8)
+
+    # Non-circular debris keeps a plain mask tint (never a fake disc).
+    if non_circular_ids and phase_opacity > 0.0:
+        debris_mask = np.isin(mask_2d, non_circular_ids)
+        if np.any(debris_mask):
+            blended[debris_mask] = (
+                blended[debris_mask].astype(np.float32) * (1.0 - float(phase_opacity))
+                + np.asarray(phase_color, dtype=np.float32) * float(phase_opacity)
+            ).clip(0, 255).astype(np.uint8)
+
+    # ---- Pass 2: sub-pixel anti-aliased boundaries ---------------------------
+    for lbl, cx, cy, radius, circ in geometry:
+        if circ >= gate:
+            cv2.circle(
+                blended,
+                (int(round(cx * scale)), int(round(cy * scale))),
+                max(2 * int(scale), int(round(radius * scale))),
+                CLSM_SILICA_EDGE_RGB,
+                1,
+                cv2.LINE_AA,
+                CLSM_SUBPIXEL_SHIFT,
+            )
+            continue
+
+        # Non-circular manual object: smooth its polygon instead of the pixel grid.
+        cnts, _ = cv2.findContours(
+            (silica_labels == lbl).astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        for cnt in cnts:
+            pts = cnt.reshape(-1, 2).astype(np.float32)
+            smooth = None
+            if len(pts) >= 8:
+                try:
+                    from analyzer import _smooth_contour_fourier
+
+                    smooth = _smooth_contour_fourier(
+                        pts, n_harmonics=6, num_points=90
+                    ).round().astype(np.int32)
+                except Exception:  # Fourier smoothing is a soft dependency
+                    smooth = None
+            if smooth is None or len(smooth) < 3:
+                epsilon = max(0.8, 0.01 * float(cv2.arcLength(cnt, True)))
+                smooth = cv2.approxPolyDP(cnt, epsilon, True).reshape(-1, 2)
+            if len(smooth) >= 3:
+                cv2.polylines(
+                    blended,
+                    [smooth.reshape(-1, 1, 2)],
+                    isClosed=True,
+                    color=CLSM_SILICA_EDGE_RGB,
+                    thickness=1,
+                    lineType=cv2.LINE_AA,
+                )
+
+
 def create_mask_overlay(
     image: np.ndarray,
     masks: np.ndarray,
@@ -919,12 +1161,16 @@ def create_mask_overlay(
 
     Color coding (RGB):
     - 'fat_particles': Orange (RGB: 255, 165, 0)
-    - 'silica': Warm amber-gold (RGB: 255, 175, 0) fill with crisp yellow-white
-      (255, 245, 120) per-particle rims and 1-px (255, 240, 100) inter-particle
-      rings, so every individual microsphere inside a touching cluster is visible.
+    - 'silica': Vivid sky-cyan / azure (RGB: 0, 200, 255) fill with a crisp bright
+      ice-blue (130, 240, 255) per-sphere rim. On a CLSM composite (bright green
+      matrix, magenta shells) amber-gold blended into a muddy brown, whereas
+      sky-cyan is the complementary pole of magenta and never occurs in the matrix.
+      Every sphere is drawn as a TRUE sub-pixel circle (``cv2.LINE_AA``, ``shift=3``)
+      because silica microspheres are rigid, non-deformable spheres - never a
+      watershed polygon or a 4-neighbour pixel staircase.
       Confocal Fluorescence (is_clsm_mode=True or 'silica' present in the data)
-      switches the Unclassified underlay to bright cyan (0, 229, 255) instead of
-      lime green, because a CLSM composite has a bright green matrix.
+      switches the Unclassified underlay to bright lemon-yellow (255, 230, 0)
+      instead of lime green, because a CLSM composite has a bright green matrix.
     - 'air_bubbles': Deep Sky Blue (RGB: 0, 191, 255)
     - 'adsorbed_fat': Warm honey-gold (RGB: 230, 175, 0) — interior crater globules only
     - 'corona_fat' / ``is_corona_globule == True``: Pure lemon-yellow
@@ -965,8 +1211,9 @@ def create_mask_overlay(
             (defaults to True). Turning it off keeps the overlay focused on the
             explicitly classified phases.
         is_clsm_mode: Confocal Fluorescence mode. Renders the ``silica`` phase in
-            amber-gold with per-particle boundaries and paints ``Unclassified`` in
-            bright cyan (0, 229, 255) instead of lime green. Also auto-enabled when
+            vivid sky-cyan (0, 200, 255) as sub-pixel anti-aliased circles with an
+            ice-blue (130, 240, 255) rim, and paints ``Unclassified`` in bright
+            lemon-yellow (255, 230, 0) instead of lime green. Also auto-enabled when
             the supplied table already contains ``phase_class == 'silica'``.
         z_order: Layer rendering sequence ('Fat over Air' or 'Air over Fat'). Defaults to 'Fat over Air'.
         mask: Optional alias for masks (for backward compatibility).
@@ -1029,11 +1276,11 @@ def create_mask_overlay(
     FAT_COLOR = (255, 165, 0)        # Orange for fat particles
     AIR_COLOR = (0, 191, 255)        # Deep sky blue for air bubbles
     UNCLASS_COLOR = (
-        (0, 229, 255) if silica_active else (50, 205, 50)  # #00E5FF cyan / lime green
-    )
-    SILICA_COLOR = (255, 175, 0)         # Warm amber-gold fill for silica microspheres
-    SILICA_EDGE_COLOR = (255, 245, 120)  # Crisp yellow-white outer per-particle rim
-    SILICA_INTER_EDGE_COLOR = (255, 240, 100)  # 1-px ring between touching spheres
+        CLSM_UNCLASSIFIED_RGB if silica_active else (50, 205, 50)
+    )  # lemon-yellow (CLSM) / lime green (SEM)
+    SILICA_COLOR = CLSM_SILICA_FILL_RGB        # Vivid sky-cyan / azure sphere fill
+    SILICA_EDGE_COLOR = CLSM_SILICA_EDGE_RGB   # Crisp bright ice-blue sphere boundary
+    SILICA_INTER_EDGE_COLOR = CLSM_SILICA_INTER_EDGE_RGB  # soft seam between spheres
     ADSORBED_COLOR = (230, 175, 0)   # Warm honey-gold for interior crater adsorbed globules
     CORONA_COLOR = (255, 242, 32)    # Pure lemon-yellow for equatorial corona globules
     CORONA_EDGE_COLOR = (255, 190, 0)  # Warm golden-amber outline around corona globules
@@ -1168,34 +1415,30 @@ def create_mask_overlay(
             phase_mask = np.zeros_like(mask_2d, dtype=bool)
 
         if np.any(phase_mask):
-            blended[phase_mask] = (
-                blended[phase_mask].astype(np.float32) * (1.0 - phase_opacity)
-                + np.array(phase_color, dtype=np.float32) * phase_opacity
-            ).clip(0, 255).astype(np.uint8)
-
-            # CLSM silica: every individual sphere needs its own visible ring.
-            # findContours(RETR_EXTERNAL) only traces the perimeter of a whole
-            # cluster, so the inter-label boundary (where two touching spheres meet)
-            # is painted separately - otherwise 10 spheres look like one blob.
+            # CLSM silica is rendered as TRUE anti-aliased spheres (sub-pixel fill +
+            # ice-blue rim), so the raster mask tint is skipped for circular
+            # particles: a raw ``masks[y, x]`` blend would leave the 4-neighbour
+            # pixel staircase visible around every smooth disc. Non-circular manual
+            # objects still receive the plain tint inside the helper.
             if phase == "silica":
-                silica_labels = np.where(phase_mask, mask_2d, 0).astype(np.int32)
-                silica_cnts, _ = cv2.findContours(
-                    phase_mask.astype(np.uint8),
-                    cv2.RETR_LIST,
-                    cv2.CHAIN_APPROX_NONE,
+                _silica_rows = (
+                    df.loc[_phase_lower == "silica"]
+                    if _phase_lower is not None
+                    else df.iloc[0:0]
                 )
-                if silica_cnts:
-                    cv2.drawContours(
-                        blended,
-                        silica_cnts,
-                        -1,
-                        SILICA_EDGE_COLOR,
-                        1,
-                        lineType=cv2.LINE_AA,
-                    )
-                inter_edges = _inter_label_boundary(silica_labels)
-                if np.any(inter_edges):
-                    blended[inter_edges] = SILICA_INTER_EDGE_COLOR
+                _draw_clsm_silica_spheres(
+                    blended,
+                    mask_2d,
+                    phase_mask,
+                    phase_color,
+                    phase_opacity,
+                    _silica_rows,
+                )
+            else:
+                blended[phase_mask] = (
+                    blended[phase_mask].astype(np.float32) * (1.0 - phase_opacity)
+                    + np.array(phase_color, dtype=np.float32) * phase_opacity
+                ).clip(0, 255).astype(np.uint8)
 
             # Highlight fat particles with a crisp 1 px outline in Fat over Air mode
             if phase == "fat_particles" and z_order == "Fat over Air":
