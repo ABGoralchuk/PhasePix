@@ -4,7 +4,7 @@
 > **System:** PhasePix — Quantitative Microstructure & Colloid Analyzer
 > **Modality:** 🔬 Scanning Electron Microscopy (SEM)
 > **Dispersed systems:** 🫧 air bubbles · 🟧 matrix fat · 🟨 adsorbed fat · 👑 Pickering corona
-> **Revision:** 2.1.0 · **Validated on build:** v2.0.0 and later
+> **Revision:** 2.0.1 · **Validated on build:** v2.0.0 and later
 
 | Field | Value |
 | --- | --- |

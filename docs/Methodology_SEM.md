@@ -4,7 +4,7 @@
 > **Companion procedure:** [`SOP_SEM.md`](SOP_SEM.md)
 > **Modality:** 🔬 Scanning Electron Microscopy
 > **Phases:** 🫧 air · 🟧 matrix fat · 🟨 adsorbed fat · 👑 Pickering corona
-> **Revision:** 2.1.0 · **Validated on build:** v2.0.0 and later
+> **Revision:** 2.0.1 · **Validated on build:** v2.0.0 and later
 
 ## 1. 🎯 Purpose and Scope
 

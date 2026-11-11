@@ -3,7 +3,7 @@
 > **Document:** `docs/Methodology_CLSM.md` · **Downloadable Word twin:** `docs/Methodology_CLSM.docx`
 > **Companion procedure:** [`SOP_CLSM.md`](SOP_CLSM.md)
 > **Modality:** 🔦 Confocal Laser Scanning Microscopy · **Dispersed system:** 🟣 Silica microspheres
-> **Revision:** 2.1.0 · **Validated on build:** v2.0.0 and later
+> **Revision:** 2.0.1 · **Validated on build:** v2.0.0 and later
 
 ## 1. 🎯 Purpose and Scope
 

@@ -4,7 +4,7 @@
 > **System:** PhasePix — Quantitative Microstructure & Colloid Analyzer
 > **Modality:** 💡 Light (transmitted-light / brightfield) Microscopy
 > **Dispersed system:** 🟧 Fat droplets — 💧 liquid or ❄️ crystallised
-> **Revision:** 2.1.0 · **Validated on build:** v2.0.0 and later
+> **Revision:** 2.0.1 · **Validated on build:** v2.0.0 and later
 
 | Field | Value |
 | --- | --- |
