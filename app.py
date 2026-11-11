@@ -16,6 +16,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import time
 import zipfile
 from xml.etree import ElementTree
@@ -3794,6 +3795,13 @@ LEGACY_DOC_PREFIXES: Tuple[str, ...] = ("SOP_", "Methodology_")
 DOC_DOWNLOAD_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
+# Repository root: the one-click updater runs ``git pull`` from here, so a
+# PhasePix folder copied to a USB drive can refresh itself in place.
+PHASEPIX_REPO_DIR = Path(__file__).resolve().parent
+# Label of the interactive Documentation Hub tab (used as the fallback navigation
+# target when the running Streamlit release has no ``st.dialog``).
+SOP_HUB_TAB_LABEL = "📚 SOP & Methodology"
+GIT_PULL_TIMEOUT_S = 15
 
 
 def doc_sha256_bytes(payload: bytes) -> str:
@@ -3839,12 +3847,6 @@ def normalize_document_kind(value: str) -> str:
 def canonical_document_stem(doc_kind: str, modality: str) -> str:
     """Return the canonical, case-stable stem, e.g. ``Methodology_CLSM``."""
     return f"{normalize_document_kind(doc_kind)}_{normalize_document_modality(modality)}"
-
-
-# One-shot migration of legacy root-level documents into ``docs/`` (idempotent:
-# a file that already exists in ``docs/`` always wins, so nothing is overwritten,
-# and only ``SOP_*`` / ``Methodology_*`` names are touched).
-LEGACY_DOCS_MIGRATED: List[Path] = sync_legacy_documents()
 
 
 def sync_legacy_documents(
@@ -3942,6 +3944,13 @@ def find_document_path(
         if candidate.startswith(normalized_stem):
             return entry
     return None
+
+
+# One-shot migration of legacy root-level documents into ``docs/`` (idempotent:
+# a file that already exists in ``docs/`` always wins, so nothing is overwritten,
+# and only ``SOP_*`` / ``Methodology_*`` names are touched). It runs once per
+# Streamlit rerun of this module and is a no-op after the first migration.
+LEGACY_DOCS_MIGRATED: List[Path] = sync_legacy_documents()
 
 
 _DOC_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
@@ -4845,6 +4854,274 @@ def documentation_inventory(docs_dir: Path = DOCS_DIR) -> List[Dict[str, Any]]:
         for modality in DOC_MODALITIES
         for kind in DOC_KINDS
     ]
+
+
+def run_git_pull(
+    repo_dir: Optional[Path] = None,
+    timeout: int = GIT_PULL_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Fast-forward this working copy from ``origin/main`` (USB-drive updater).
+
+    Executes exactly::
+
+        git pull --ff-only origin main
+
+    in the repository root with ``capture_output=True`` and a hard ``timeout``,
+    so the button can never hang the Streamlit UI.  ``--ff-only`` guarantees that
+    local commits are never merged, rebased or discarded: an installation with
+    local changes simply reports a warning and keeps the files it already has.
+
+    Args:
+        repo_dir: Folder to run in; defaults to :data:`PHASEPIX_REPO_DIR`.
+        timeout: Seconds before the subprocess is killed (default 15).
+
+    Returns:
+        A dictionary with ``status`` (``"ok"``, ``"error"``, ``"timeout"`` or
+        ``"missing"``), ``ok``, ``command``, ``returncode``, ``stdout``,
+        ``stderr`` and ``already_current`` (``True`` when git reported
+        "Already up to date").
+    """
+    repo = Path(repo_dir) if repo_dir is not None else PHASEPIX_REPO_DIR
+    command = ["git", "pull", "--ff-only", "origin", "main"]
+    printable = " ".join(command)
+    base = {
+        "command": printable,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "already_current": False,
+        "repo_dir": str(repo),
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {
+            **base,
+            "status": "missing",
+            "ok": False,
+            "stderr": "Git executable not found (is Git installed and on PATH?).",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            **base,
+            "status": "timeout",
+            "ok": False,
+            "stderr": f"`{printable}` did not finish within {int(timeout)} s.",
+        }
+    except OSError as exc:
+        return {**base, "status": "error", "ok": False, "stderr": str(exc)}
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    succeeded = completed.returncode == 0
+    return {
+        **base,
+        "status": "ok" if succeeded else "error",
+        "ok": succeeded,
+        "returncode": completed.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "already_current": succeeded and "already up to date" in stdout.lower(),
+    }
+
+
+def render_git_pull_report(result: Dict[str, Any]) -> None:
+    """Render the outcome of :func:`run_git_pull` as a Streamlit message."""
+    status = str(result.get("status") or "")
+    command = str(result.get("command") or "git pull --ff-only origin main")
+    if status == "missing":
+        st.warning(
+            "🔄 Automatic update unavailable: **Git was not found** on this "
+            "computer. Copy the latest PhasePix folder from your administrator "
+            "instead — the current files keep working unchanged."
+        )
+        return
+    if status == "timeout":
+        st.warning(
+            f"⏱️ `{command}` timed out after {GIT_PULL_TIMEOUT_S} s — the machine "
+            "is probably offline. PhasePix continues with the current files."
+        )
+        return
+    if result.get("ok"):
+        if result.get("already_current"):
+            st.info(
+                "✅ **PhasePix is already up to date** — code, SOPs and Methodology "
+                "documents are current."
+            )
+        else:
+            st.success(
+                "✅ **Update downloaded.** Reopen the SOP / Methodology viewer (or "
+                "reload this page) to see the new revisions."
+            )
+        output = str(result.get("stdout") or "")
+        if output:
+            st.code(output, language="text")
+        return
+    st.warning(
+        "⚠️ **Fast-forward update was not possible** (offline, detached HEAD or "
+        "local changes). PhasePix continues with the files already on disk."
+    )
+    detail = str(result.get("stderr") or result.get("stdout") or "")
+    if detail:
+        st.code(detail, language="text")
+
+
+def render_document_download_buttons(
+    modality: str,
+    key_prefix: str,
+    columns: bool = True,
+) -> None:
+    """Render the two ``📥 .docx`` download buttons for one modality.
+
+    The Word file is taken from ``docs/``; a missing or stale one is generated
+    from its Markdown twin by :func:`ensure_docx_from_markdown` (inside
+    :func:`read_document`), so a download is always offered.  A modality without
+    any document shows a disabled button with an explanatory tooltip instead of
+    breaking the sidebar.
+
+    Args:
+        modality: ``"SEM"``, ``"Light"`` or ``"CLSM"`` (labels/emoji tolerated).
+        key_prefix: Unique widget-key prefix, so the sidebar copy and the modal
+            copy never collide.
+        columns: Lay the two buttons side by side (default) or stack them.
+    """
+    modality_key = normalize_document_modality(modality)
+    slots: List[Any] = (
+        list(st.columns(2)) if columns else [st.container(), st.container()]
+    )
+    plan = (
+        ("SOP", "📥 Download SOP (.docx)"),
+        ("Methodology", "📥 Download Methodology (.docx)"),
+    )
+    for slot, (kind, label) in zip(slots, plan):
+        with slot:
+            document = read_document(kind, modality_key)
+            payload = document.get("docx_bytes")
+            docx_path = document.get("docx_path")
+            file_name = (
+                docx_path.name
+                if docx_path is not None
+                else f"{canonical_document_stem(kind, modality_key)}.docx"
+            )
+            widget_key = f"{key_prefix}_{kind.lower()}_docx"
+            if payload:
+                st.download_button(
+                    label,
+                    data=payload,
+                    file_name=file_name,
+                    mime=DOC_DOWNLOAD_MIME,
+                    use_container_width=True,
+                    key=widget_key,
+                    help=f"Signed procedure for {modality_key} — `docs/{file_name}`",
+                )
+            else:
+                st.button(
+                    label,
+                    disabled=True,
+                    use_container_width=True,
+                    key=widget_key,
+                    help=(
+                        f"No Word file is available for {kind} · {modality_key}. "
+                        f"Add `docs/{canonical_document_stem(kind, modality_key)}.md` "
+                        "and it will be generated automatically."
+                    ),
+                )
+
+
+def render_document_viewer(
+    modality: str,
+    key_prefix: str,
+    show_header: bool = True,
+) -> None:
+    """Interactive viewer for the SOP / Methodology of one modality.
+
+    Used by the ``📖 Open Interactive SOP & Methodology`` button.  The document
+    follows the **active** sidebar modality, renders native LaTeX through
+    Streamlit's KaTeX pipeline, and offers the same two Word downloads.
+
+    Args:
+        modality: Active imaging modality (``SEM`` / ``Light`` / ``CLSM``).
+        key_prefix: Unique widget-key prefix for this viewer instance.
+        show_header: Show the "follows the active modality" caption.
+    """
+    modality_key = normalize_document_modality(modality)
+    if show_header:
+        st.caption(
+            f"Active modality: **{DOC_MODALITY_LABELS.get(modality_key, modality_key)}** "
+            "— this viewer always follows Sidebar → *0. Imaging Modality*."
+        )
+    kind_label = st.radio(
+        "Document type",
+        options=[DOC_KIND_LABELS[kind] for kind in DOC_KINDS],
+        horizontal=True,
+        key=f"{key_prefix}_kind_radio",
+        label_visibility="collapsed",
+    )
+    doc_kind = normalize_document_kind(kind_label)
+    document = read_document(doc_kind, modality_key)
+    render_document_download_buttons(modality_key, key_prefix)
+    markdown_text = document.get("markdown") or ""
+    if not markdown_text:
+        st.warning(
+            f"⚠️ No **{doc_kind}** document is available for **{modality_key}**. "
+            f"Add `docs/{canonical_document_stem(doc_kind, modality_key)}.md` "
+            "(or the matching `.docx`) and reopen this viewer."
+        )
+        return
+    if document.get("docx_is_user_supplied"):
+        rendered_from = "user-supplied Word file"
+    elif document.get("markdown_source") == "docx":
+        rendered_from = "Word file generated from Markdown"
+    else:
+        rendered_from = "Markdown source"
+    st.caption(
+        f"📄 Rendered from the {rendered_from} · {len(markdown_text):,} characters · "
+        "equations typeset with KaTeX"
+    )
+    st.markdown(markdown_text)
+
+
+def _sop_methodology_dialog_body(modality: str) -> None:
+    """Body of the wide ``📚 SOP & Methodology`` modal dialog."""
+    render_document_viewer(modality, key_prefix="sop_dialog", show_header=True)
+
+
+def _dialog_factory(width: str = "large") -> Optional[Any]:
+    """Return a ``st.dialog`` wrapper configured for a wide modal.
+
+    ``st.dialog`` exists from Streamlit 1.37 onwards, but the ``width`` keyword
+    only appears in later releases, while this project pins 1.39 and still runs
+    on newer versions.  The signature is therefore inspected once: ``None`` means
+    the running Streamlit has no dialog support at all and the caller must fall
+    back to tab navigation.
+    """
+    dialog = getattr(st, "dialog", None)
+    if dialog is None:
+        return None
+    try:
+        accepts_width = "width" in inspect.signature(dialog).parameters
+    except (TypeError, ValueError):
+        accepts_width = False
+    if accepts_width:
+        return lambda title: dialog(title, width=width)
+    return lambda title: dialog(title)
+
+
+_SOP_DIALOG_FACTORY = _dialog_factory("large")
+# ``None`` on Streamlit releases without ``st.dialog``; the sidebar then switches
+# the navigation tab to SOP_HUB_TAB_LABEL instead of opening a modal.
+render_sop_methodology_dialog = (
+    _SOP_DIALOG_FACTORY("📚 SOP & Methodology")(_sop_methodology_dialog_body)
+    if _SOP_DIALOG_FACTORY is not None
+    else None
+)
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -8350,6 +8627,65 @@ with st.sidebar:
             sb_color = st.selectbox("Color", ["White", "Black", "Yellow", "Red"], index=0)
         with col_sb3:
             sb_thick = st.slider("Thickness", min_value=1, max_value=10, value=3)
+
+    # ── ❓ Quick SOP, Docs & Updates (Documentation Hub entry point, v2.1.0) ──
+    # Deliberately the LAST sidebar block: it is reachable from every tab and it
+    # always reflects the modality selected in Section 0.  The two download
+    # buttons serve the curated Word files from ``docs/`` (a missing or stale one
+    # is generated from its Markdown twin on the spot), the viewer button opens
+    # the wide "📚 SOP & Methodology" modal, and the final button fast-forwards a
+    # USB-drive copy of the project from ``origin/main``.
+    st.divider()
+    quick_docs_status = st.empty()
+    pending_git_report = st.session_state.pop("_git_pull_report", None)
+    if pending_git_report:
+        with quick_docs_status.container():
+            render_git_pull_report(pending_git_report)
+
+    with st.expander("❓ Quick SOP, Docs & Updates", expanded=False):
+        active_doc_modality = normalize_document_modality(imaging_mode)
+        st.caption(
+            f"Active modality: **{DOC_MODALITY_LABELS.get(active_doc_modality, active_doc_modality)}** "
+            f"— served from `docs/` and versioned in Git."
+        )
+        render_document_download_buttons(active_doc_modality, "sidebar_quick_docs")
+
+        if st.button(
+            "📖 Open Interactive SOP & Methodology",
+            use_container_width=True,
+            key="sidebar_open_sop_hub_btn",
+            help=(
+                "Opens the full SOP and Methodology of the active modality in a "
+                "wide viewer with native LaTeX equations."
+            ),
+        ):
+            if render_sop_methodology_dialog is not None:
+                render_sop_methodology_dialog(active_doc_modality)
+            else:
+                # No ``st.dialog`` in this Streamlit release: ask the navigation
+                # bar (rendered further down) to switch to the Hub tab. The
+                # request is only honoured when that tab exists.
+                st.session_state["_pending_navigation_tab"] = SOP_HUB_TAB_LABEL
+                st.rerun()
+
+        st.divider()
+        st.caption(
+            "🔄 **One-click update** — fast-forwards this folder (code, SOPs and "
+            "Methodology files) from `origin/main`. Offline machines are unaffected."
+        )
+        if st.button(
+            "🔄 Check for Updates (Git Pull)",
+            use_container_width=True,
+            key="sidebar_git_pull_btn",
+            help=(
+                f"Runs `git pull --ff-only origin main` in `{PHASEPIX_REPO_DIR.name}/` "
+                f"with a {GIT_PULL_TIMEOUT_S} s timeout; local changes are never discarded."
+            ),
+        ):
+            with st.spinner("Checking origin/main..."):
+                git_pull_result = run_git_pull()
+            st.session_state["_git_pull_report"] = git_pull_result
+            st.rerun()
 
 
 # ---------------- MAIN APPLICATION DISPLAY ----------------

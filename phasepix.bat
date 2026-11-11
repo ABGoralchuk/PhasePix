@@ -11,6 +11,21 @@ echo.
 if not exist "app.py" goto :no_app
 
 rem -----------------------------------------------------------------
+rem 0. One-click auto-update: fast-forward this folder (code, SOPs and
+rem    Methodology files) when it is a Git clone and the PC is online.
+rem    Offline / local changes / missing Git are ignored so startup never
+rem    blocks, and --ff-only guarantees local work is never discarded.
+rem -----------------------------------------------------------------
+if not exist ".git" goto :skip_update
+where git >nul 2>&1
+if errorlevel 1 goto :skip_update
+echo Checking for PhasePix updates (git pull --ff-only origin main)...
+git pull --ff-only origin main 2>nul
+if errorlevel 1 echo Update check skipped - offline or local changes.
+echo.
+:skip_update
+
+rem -----------------------------------------------------------------
 rem 1. Locate a Python interpreter: local venv first, then py, then python
 rem -----------------------------------------------------------------
 set "PY_EXE="
