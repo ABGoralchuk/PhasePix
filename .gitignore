@@ -63,6 +63,9 @@ Icon_full.ico
 docs/.docx_generation_manifest.json
 docs/*.docx.tmp
 
+# Temporary backups written by the one-click updater while presets are parked
+*.upd
+
 # OS specific
 .DS_Store
 *.rtf

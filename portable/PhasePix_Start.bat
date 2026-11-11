@@ -76,11 +76,16 @@ goto :req_check
 
 :offline
 echo [INFO] Offline mode - starting current local version.
+echo [HINT] If the internet works, run this inside app\ to see why the fetch failed:
+echo        cd /d "%APP_DIR%" ^&^& "..\git\cmd\git.exe" fetch --all
+echo [HINT] A proxy, VPN or firewall blocking github.com also ends up here.
 goto :restore_presets_offline
 
 :update_failed
 echo [WARNING] GitHub was reachable but the update failed.
 echo [INFO] Offline mode - starting current local version.
+echo [HINT] Close Explorer/editor windows holding files in app\ (or wait for the
+echo        antivirus scan to finish) and run this launcher again.
 
 :restore_presets_offline
 if not exist "parameter_presets.json.tmp" goto :restore_light_offline

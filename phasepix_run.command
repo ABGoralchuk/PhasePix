@@ -5,12 +5,25 @@ cd "$(dirname "$0")"
 
 # ---------------------------------------------------------------------------
 # One-click auto-update: fast-forward this folder (code, SOPs and Methodology
-# files) when it is a Git clone and the machine is online. Every failure —
-# offline, local commits, Git not installed — is ignored, so startup never blocks.
+# files) when it is a Git clone and the machine is online. PhasePix rewrites
+# parameter_presets.json / light_calibration_presets.json whenever a lab recipe
+# is saved, so they are parked for the fast-forward and restored afterwards —
+# local preset edits can never block the update, and no recipe is ever lost.
 # ---------------------------------------------------------------------------
 if [ -d ".git" ] && command -v git >/dev/null 2>&1; then
     echo "Checking for PhasePix updates (git pull --ff-only origin main)..."
-    git pull --ff-only origin main 2>/dev/null || echo "  Update check skipped (offline or local changes)."
+    PRESET_STASH="$(mktemp -d)"
+    for preset in parameter_presets.json light_calibration_presets.json; do
+        [ -f "$preset" ] && cp "$preset" "$PRESET_STASH/$preset"
+    done
+    if ! git pull --ff-only origin main 2>/dev/null; then
+        git checkout -- parameter_presets.json light_calibration_presets.json 2>/dev/null || true
+        git pull --ff-only origin main 2>/dev/null || echo "  Update check skipped (offline or local changes)."
+    fi
+    for preset in parameter_presets.json light_calibration_presets.json; do
+        [ -f "$PRESET_STASH/$preset" ] && cp "$PRESET_STASH/$preset" "$preset"
+    done
+    rm -rf "$PRESET_STASH"
     echo ""
 fi
 

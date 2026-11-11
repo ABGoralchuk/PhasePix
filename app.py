@@ -4856,45 +4856,85 @@ def documentation_inventory(docs_dir: Path = DOCS_DIR) -> List[Dict[str, Any]]:
     ]
 
 
+# Tracked files that the running application rewrites by itself. They must be
+# parked before a fast-forward pull, otherwise git aborts with "Your local
+# changes to the following files would be overwritten by merge" and the
+# installation silently stays on an old build forever.
+GIT_PRESERVED_FILES: Tuple[str, ...] = (
+    "parameter_presets.json",
+    "light_calibration_presets.json",
+)
+
+
+def _build_version_on_disk(repo: Path) -> str:
+    """Read ``PHASEPIX_BUILD_VERSION`` from the app.py that is on disk right now."""
+    try:
+        source = (Path(repo) / "app.py").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    match = re.search(r'PHASEPIX_BUILD_VERSION\s*=\s*"([^"]+)"', source)
+    return match.group(1) if match else ""
+
+
 def run_git_pull(
     repo_dir: Optional[Path] = None,
     timeout: int = GIT_PULL_TIMEOUT_S,
 ) -> Dict[str, Any]:
     """Fast-forward this working copy from ``origin/main`` (USB-drive updater).
 
-    Executes exactly::
+    Runs ``git pull --ff-only origin main`` in the repository root with
+    ``capture_output=True`` and a hard ``timeout``, so the button can never hang
+    the Streamlit UI.  ``--ff-only`` guarantees that local commits are never
+    merged, rebased or discarded.
 
-        git pull --ff-only origin main
+    Two real-world reasons why an installation can stay on an old build are
+    handled explicitly:
 
-    in the repository root with ``capture_output=True`` and a hard ``timeout``,
-    so the button can never hang the Streamlit UI.  ``--ff-only`` guarantees that
-    local commits are never merged, rebased or discarded: an installation with
-    local changes simply reports a warning and keeps the files it already has.
+    1. **Not a Git clone** - a hand-copied folder, a zip without ``.git`` or a
+       portable distribution started from the wrong launcher.  The status is
+       ``"not-a-repository"`` and the UI explains what to do instead.
+    2. **Locally modified tracked presets.**  ``parameter_presets.json`` and
+       ``light_calibration_presets.json`` are rewritten by PhasePix itself every
+       time a lab recipe is saved, which makes ``git pull`` abort with "Your
+       local changes ... would be overwritten by merge".  Their bytes are kept in
+       memory, the files are restored to ``HEAD`` for the pull, and the
+       laboratory's own recipes are written back afterwards.
 
     Args:
         repo_dir: Folder to run in; defaults to :data:`PHASEPIX_REPO_DIR`.
-        timeout: Seconds before the subprocess is killed (default 15).
+        timeout: Seconds before a git subprocess is killed (default 15).
 
     Returns:
-        A dictionary with ``status`` (``"ok"``, ``"error"``, ``"timeout"`` or
-        ``"missing"``), ``ok``, ``command``, ``returncode``, ``stdout``,
-        ``stderr`` and ``already_current`` (``True`` when git reported
-        "Already up to date").
+        A dictionary with ``status`` (``"ok"``, ``"error"``, ``"timeout"``,
+        ``"missing"`` or ``"not-a-repository"``), ``ok``, ``command``,
+        ``returncode``, ``stdout``, ``stderr``, ``already_current``, ``branch``,
+        ``head``, ``working_tree`` (porcelain output), ``preserved_files``,
+        ``recovered_from_local_changes``, ``build_version`` (read from the
+        on-disk ``app.py`` *after* the pull), ``running_version``, ``is_portable``
+        and ``repo_dir``.
     """
     repo = Path(repo_dir) if repo_dir is not None else PHASEPIX_REPO_DIR
-    command = ["git", "pull", "--ff-only", "origin", "main"]
-    printable = " ".join(command)
-    base = {
-        "command": printable,
+    base: Dict[str, Any] = {
+        "command": "git pull --ff-only origin main",
         "returncode": None,
         "stdout": "",
         "stderr": "",
         "already_current": False,
         "repo_dir": str(repo),
+        "branch": "",
+        "head": "",
+        "working_tree": "",
+        "preserved_files": [],
+        "recovered_from_local_changes": False,
+        "build_version": "",
+        "running_version": PHASEPIX_BUILD_VERSION,
+        "is_portable": (repo.parent / "PhasePix_Start.bat").is_file(),
     }
+
+    # 1. Is git available, and is this folder actually a clone?
     try:
-        completed = subprocess.run(
-            command,
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -4913,14 +4953,92 @@ def run_git_pull(
             **base,
             "status": "timeout",
             "ok": False,
-            "stderr": f"`{printable}` did not finish within {int(timeout)} s.",
+            "stderr": f"`git rev-parse` did not finish within {int(timeout)} s.",
         }
     except OSError as exc:
         return {**base, "status": "error", "ok": False, "stderr": str(exc)}
 
+    if (probe.stdout or "").strip().lower() != "true":
+        return {
+            **base,
+            "status": "not-a-repository",
+            "ok": False,
+            "stderr": (probe.stderr or "").strip()
+            or f"{repo} is not inside a Git working tree.",
+        }
+
+    # 2. Park the two tracked preset files the application rewrites at runtime.
+    preserved: Dict[str, bytes] = {}
+    for name in GIT_PRESERVED_FILES:
+        candidate = repo / name
+        if candidate.is_file():
+            try:
+                preserved[name] = candidate.read_bytes()
+            except OSError:
+                continue
+
+    def _git(args: List[str]) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    completed = _git(["pull", "--ff-only", "origin", "main"])
+
+    if completed is None:
+        return {
+            **base,
+            "status": "timeout",
+            "ok": False,
+            "stderr": (
+                "`git pull --ff-only origin main` did not finish within "
+                f"{int(timeout)} s."
+            ),
+            "build_version": _build_version_on_disk(repo),
+        }
+
+    # 3. A fast-forward blocked by PhasePix's own preset edits: park, retry once.
+    recovered = False
+    combined_output = f"{completed.stdout or ''}\n{completed.stderr or ''}".lower()
+    blocked_by_local_changes = (
+        "would be overwritten by merge" in combined_output
+        or "your local changes" in combined_output
+        or "please commit your changes or stash them" in combined_output
+        or "overwritten by checkout" in combined_output
+    )
+    if completed.returncode != 0 and blocked_by_local_changes:
+        _git(["checkout", "--", *GIT_PRESERVED_FILES])
+        retry = _git(["pull", "--ff-only", "origin", "main"])
+        if retry is not None:
+            completed = retry
+            recovered = completed.returncode == 0
+
+    # 4. The laboratory's own recipes always win - write them back verbatim.
+    restored: List[str] = []
+    for name, payload in preserved.items():
+        try:
+            (repo / name).write_bytes(payload)
+            restored.append(name)
+        except OSError:
+            continue
+
     stdout = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
     succeeded = completed.returncode == 0
+
+    def _text(args: List[str]) -> str:
+        finished = _git(args)
+        if finished is None or finished.returncode != 0:
+            return ""
+        return (finished.stdout or "").strip()
+
     return {
         **base,
         "status": "ok" if succeeded else "error",
@@ -4929,13 +5047,22 @@ def run_git_pull(
         "stdout": stdout,
         "stderr": stderr,
         "already_current": succeeded and "already up to date" in stdout.lower(),
+        "branch": _text(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "head": _text(["log", "-1", "--oneline"]),
+        "working_tree": _text(["status", "--porcelain"]),
+        "preserved_files": restored,
+        "recovered_from_local_changes": recovered,
+        "build_version": _build_version_on_disk(repo),
     }
 
 
 def render_git_pull_report(result: Dict[str, Any]) -> None:
-    """Render the outcome of :func:`run_git_pull` as a Streamlit message."""
+    """Render the outcome of :func:`run_git_pull` as an actionable message."""
     status = str(result.get("status") or "")
     command = str(result.get("command") or "git pull --ff-only origin main")
+    repo_dir = str(result.get("repo_dir") or PHASEPIX_REPO_DIR)
+    is_portable = bool(result.get("is_portable"))
+    working_tree = str(result.get("working_tree") or "")
     if status == "missing":
         st.warning(
             "🔄 Automatic update unavailable: **Git was not found** on this "
@@ -4949,28 +5076,95 @@ def render_git_pull_report(result: Dict[str, Any]) -> None:
             "is probably offline. PhasePix continues with the current files."
         )
         return
+    if status == "not-a-repository":
+        st.warning(
+            f"🔄 `{repo_dir}` is **not a Git clone**, so there is nothing to pull "
+            "from. "
+            + (
+                "This looks like the portable distribution: start PhasePix with "
+                "**`PhasePix_Start.bat`** — it updates the folder on every launch."
+                if is_portable
+                else "Copy the complete latest folder from your administrator, or "
+                "clone once with `git clone https://github.com/ABGoralchuk/PhasePix.git`."
+            )
+        )
+        return
     if result.get("ok"):
+        build_version = str(result.get("build_version") or "")
+        running_version = str(result.get("running_version") or "")
         if result.get("already_current"):
             st.info(
-                "✅ **PhasePix is already up to date** — code, SOPs and Methodology "
-                "documents are current."
+                "✅ **PhasePix is already up to date**"
+                + (f" ({build_version})" if build_version else "")
+                + " — code, SOPs and Methodology documents are current."
             )
         else:
             st.success(
-                "✅ **Update downloaded.** Reopen the SOP / Methodology viewer (or "
-                "reload this page) to see the new revisions."
+                "✅ **Update downloaded**"
+                + (
+                    f" — the build on disk is now **{build_version}**."
+                    if build_version
+                    else "."
+                )
+            )
+            if build_version and running_version and build_version != running_version:
+                st.warning(
+                    f"🔁 This window is still running **{running_version}**. Stop the "
+                    "server (Ctrl+C) and start PhasePix again — a browser refresh is "
+                    "not enough, the Python process keeps the old `app.py` in memory."
+                )
+        preserved = [str(name) for name in (result.get("preserved_files") or [])]
+        if preserved:
+            st.caption(
+                "🧪 Your laboratory presets were preserved: "
+                + ", ".join(f"`{name}`" for name in preserved)
+                + (
+                    " (local edits had blocked the fast-forward — it was unblocked "
+                    "automatically)."
+                    if result.get("recovered_from_local_changes")
+                    else "."
+                )
             )
         output = str(result.get("stdout") or "")
         if output:
             st.code(output, language="text")
         return
+
     st.warning(
-        "⚠️ **Fast-forward update was not possible** (offline, detached HEAD or "
-        "local changes). PhasePix continues with the files already on disk."
+        "⚠️ **Fast-forward update was not possible.** PhasePix keeps running with "
+        "the files already on disk."
     )
     detail = str(result.get("stderr") or result.get("stdout") or "")
     if detail:
         st.code(detail, language="text")
+
+    diagnostics: List[str] = []
+    if result.get("branch"):
+        diagnostics.append(f"branch: {result['branch']}")
+    if result.get("head"):
+        diagnostics.append(f"HEAD:   {result['head']}")
+    if working_tree:
+        diagnostics.append("uncommitted changes:\n" + working_tree)
+    if diagnostics:
+        st.code("\n".join(diagnostics), language="text")
+
+    hints: List[str] = []
+    if working_tree:
+        hints.append(
+            "commit or stash the files listed above, or press 🔄 again — PhasePix "
+            "now preserves `parameter_presets.json` / "
+            "`light_calibration_presets.json` automatically"
+        )
+    if is_portable:
+        hints.append(
+            "start PhasePix with `PhasePix_Start.bat`, which runs `git fetch` + "
+            "`git reset --hard origin/main` on every launch"
+        )
+    hints.append(
+        "run `git pull --ff-only origin main` in a terminal inside the project "
+        "folder to see the full error text"
+    )
+    st.caption("💡 " + "; ".join(hints) + ".")
 
 
 def render_document_download_buttons(

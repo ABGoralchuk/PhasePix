@@ -13,15 +13,27 @@ if not exist "app.py" goto :no_app
 rem -----------------------------------------------------------------
 rem 0. One-click auto-update: fast-forward this folder (code, SOPs and
 rem    Methodology files) when it is a Git clone and the PC is online.
-rem    Offline / local changes / missing Git are ignored so startup never
-rem    blocks, and --ff-only guarantees local work is never discarded.
+rem    parameter_presets.json / light_calibration_presets.json are rewritten
+rem    by PhasePix itself whenever a lab recipe is saved, so they are backed
+rem    up here, parked for the fast-forward and restored afterwards - a dirty
+rem    working tree can never block the update again.
 rem -----------------------------------------------------------------
 if not exist ".git" goto :skip_update
 where git >nul 2>&1
 if errorlevel 1 goto :skip_update
 echo Checking for PhasePix updates (git pull --ff-only origin main)...
+if exist "parameter_presets.json" copy /y "parameter_presets.json" "parameter_presets.json.upd" >nul 2>&1
+if exist "light_calibration_presets.json" copy /y "light_calibration_presets.json" "light_calibration_presets.json.upd" >nul 2>&1
+git pull --ff-only origin main 2>nul
+if not errorlevel 1 goto :restore_user_presets
+git checkout -- parameter_presets.json light_calibration_presets.json >nul 2>&1
 git pull --ff-only origin main 2>nul
 if errorlevel 1 echo Update check skipped - offline or local changes.
+:restore_user_presets
+if exist "parameter_presets.json.upd" copy /y "parameter_presets.json.upd" "parameter_presets.json" >nul 2>&1
+if exist "parameter_presets.json.upd" del /q "parameter_presets.json.upd" >nul 2>&1
+if exist "light_calibration_presets.json.upd" copy /y "light_calibration_presets.json.upd" "light_calibration_presets.json" >nul 2>&1
+if exist "light_calibration_presets.json.upd" del /q "light_calibration_presets.json.upd" >nul 2>&1
 echo.
 :skip_update
 
