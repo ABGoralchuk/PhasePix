@@ -4,16 +4,22 @@ Provides automated Cellpose deep learning segmentation, morphological quantifica
 phase classification (air bubbles vs. fat particles), and comparative KDE size distribution.
 """
 
-from typing import Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pathlib import Path
 import base64
+from datetime import datetime, timezone
 import hashlib
 import inspect
 import io
 import json
 import math
+import os
 import re
+import shutil
 import time
+import zipfile
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape as xml_escape
 
 # ---------------- CPU THREADING GUARD (v1.7.3) ----------------
 # The strict MKL/OpenMP/OpenCV cap only exists for the Windows CPU-only fallback,
@@ -3737,6 +3743,1108 @@ st.set_page_config(
 PHASEPIX_BUILD_VERSION = "v2.0.0"
 PHASEPIX_BUILD_DATE = "2026.11.09"
 PHASEPIX_BUILD_TITLE = "PhasePix 2.0 — Confocal Fluorescence (CLSM) & Silica Cluster Analytics"
+
+
+# =============================================================================
+# 📚 DOCUMENTATION, SOP & METHODOLOGY HUB (v2.1.0)
+# =============================================================================
+# The repository ships a ``docs/`` folder that is the *single source of truth*
+# for every laboratory procedure (``SOP_*``) and every equation
+# (``Methodology_*``) behind the three imaging modalities.  Every document
+# exists twice, once as reviewable text and once as a fileable Word document:
+#
+#     docs/SOP_SEM.md           <->  docs/SOP_SEM.docx
+#     docs/Methodology_SEM.md   <->  docs/Methodology_SEM.docx
+#     docs/SOP_Light.md         <->  docs/SOP_Light.docx   (a.k.a. SOP_light.docx)
+#     docs/Methodology_Light.md <->  docs/Methodology_Light.docx
+#     docs/SOP_CLSM.md          <->  docs/SOP_CLSM.docx
+#     docs/Methodology_CLSM.md  <->  docs/Methodology_CLSM.docx
+#
+# * ``.md`` files are versioned in Git, reviewed like code, rendered live in the
+#   "📚 SOP & Methodology" tab and mirrored in the Sidebar Quick-Help.  They
+#   carry native LaTeX (``$$ ... $$`` / ``$ ... $``) which Streamlit renders
+#   with KaTeX, so every symbol is typeset exactly as in the manuscript.
+# * ``.docx`` files are what a laboratory signs, prints and archives.  They are
+#   generated from the ``.md`` counterpart when that file is missing or newer,
+#   BUT a Word file edited or supplied by a human is never overwritten - see
+#   ``ensure_docx_from_markdown``: a sidecar manifest
+#   (``docs/.docx_generation_manifest.json``) records the SHA-256 of every
+#   auto-generated document, so a ``.docx`` whose hash no longer matches is
+#   treated as user-supplied and served verbatim.  Reverse direction: when the
+#   ``.md`` is absent, ``extract_docx_content`` / ``docx_blocks_to_markdown``
+#   read the user's own Word paragraphs *and* tables so the Hub can still
+#   display them (python-docx when installed, otherwise a dependency-free
+#   OpenXML reader built on ``zipfile`` + ``ElementTree``).
+DOCS_DIR = Path(__file__).resolve().parent / "docs"
+DOC_KINDS: Tuple[str, ...] = ("SOP", "Methodology")
+DOC_MODALITIES: Tuple[str, ...] = ("SEM", "Light", "CLSM")
+DOC_MODALITY_LABELS: Dict[str, str] = {
+    "SEM": "🔬 SEM Micrograph",
+    "Light": "💡 Light Microscopy",
+    "CLSM": "🔦 Confocal Fluorescence (CLSM)",
+}
+DOC_KIND_LABELS: Dict[str, str] = {
+    "SOP": "📋 Standard Operating Procedure",
+    "Methodology": "📐 Methodology, Equations & Assumptions",
+}
+DOC_MODALITY_ICONS: Dict[str, str] = {"SEM": "🔬", "Light": "💡", "CLSM": "🔦"}
+DOC_TEXT_SUFFIXES: Tuple[str, ...] = (".md", ".docx")
+DOC_MANIFEST_FILENAME = ".docx_generation_manifest.json"
+LEGACY_DOC_PREFIXES: Tuple[str, ...] = ("SOP_", "Methodology_")
+DOC_DOWNLOAD_MIME = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
+
+def doc_sha256_bytes(payload: bytes) -> str:
+    """Return the hex SHA-256 of ``payload`` (shared reproducibility helper)."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def doc_sha256_file(path: Path) -> str:
+    """Return the hex SHA-256 of a file, or ``""`` when it cannot be read."""
+    try:
+        return doc_sha256_bytes(Path(path).read_bytes())
+    except OSError:
+        return ""
+
+
+def ensure_docs_dir(docs_dir: Path = DOCS_DIR) -> Path:
+    """Create ``docs/`` when missing and return it as a ``Path``."""
+    docs_dir = Path(docs_dir)
+    try:
+        docs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # A read-only checkout still serves whatever documents already exist.
+        pass
+    return docs_dir
+
+
+def normalize_document_modality(value: str) -> str:
+    """Map any modality label/emoji/loose spelling onto ``SEM``/``Light``/``CLSM``."""
+    text = str(value or "").strip().lower()
+    if "clsm" in text or "confocal" in text or "🔦" in text:
+        return "CLSM"
+    if "light" in text or "brightfield" in text or "💡" in text:
+        return "Light"
+    return "SEM"
+
+
+def normalize_document_kind(value: str) -> str:
+    """Map any document label onto ``SOP`` or ``Methodology``."""
+    text = str(value or "").strip().lower()
+    return "Methodology" if "method" in text else "SOP"
+
+
+def canonical_document_stem(doc_kind: str, modality: str) -> str:
+    """Return the canonical, case-stable stem, e.g. ``Methodology_CLSM``."""
+    return f"{normalize_document_kind(doc_kind)}_{normalize_document_modality(modality)}"
+
+
+# One-shot migration of legacy root-level documents into ``docs/`` (idempotent:
+# a file that already exists in ``docs/`` always wins, so nothing is overwritten,
+# and only ``SOP_*`` / ``Methodology_*`` names are touched).
+LEGACY_DOCS_MIGRATED: List[Path] = sync_legacy_documents()
+
+
+def sync_legacy_documents(
+    docs_dir: Path = DOCS_DIR,
+    project_root: Optional[Path] = None,
+) -> List[Path]:
+    """Move legacy root-level ``SOP_*`` / ``Methodology_*`` files into ``docs/``.
+
+    Older PhasePix releases (and users upgrading by hand) keep their Word
+    procedures next to ``app.py``.  The Hub expects them inside ``docs/``, so the
+    first time the Hub is opened every root-level ``.md`` / ``.docx`` file whose
+    name starts with ``SOP_`` or ``Methodology_`` is relocated.
+
+    Safety guarantees (this helper runs on a live project folder):
+
+    * an existing ``docs/<name>`` is never overwritten - the root duplicate is
+      simply left where it is, so nothing is ever lost;
+    * only the two documentation prefixes are touched (``README.md``,
+      ``requirements.txt`` etc. are ignored);
+    * a failure to move one file never aborts the rest.
+
+    Returns:
+        The files that were actually moved, in deterministic order.
+    """
+    docs_dir = ensure_docs_dir(docs_dir)
+    project_root = Path(project_root) if project_root is not None else docs_dir.parent
+    moved: List[Path] = []
+    try:
+        entries = sorted(project_root.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return moved
+    for source in entries:
+        if not source.is_file():
+            continue
+        if source.parent.resolve() == docs_dir.resolve():
+            continue
+        if source.suffix.lower() not in DOC_TEXT_SUFFIXES:
+            continue
+        if not source.name.startswith(LEGACY_DOC_PREFIXES):
+            continue
+        destination = docs_dir / source.name
+        if destination.exists():
+            continue
+        try:
+            shutil.move(str(source), str(destination))
+        except OSError:
+            continue
+        moved.append(destination)
+    return moved
+
+
+def find_document_path(
+    doc_kind: str,
+    modality: str,
+    suffix: str,
+    docs_dir: Path = DOCS_DIR,
+) -> Optional[Path]:
+    """Locate one document on disk, tolerating case/separator spelling drift.
+
+    Resolution order (first hit wins):
+
+    1. exact canonical name - ``docs/SOP_CLSM.md``;
+    2. case-insensitive canonical name - ``docs/SOP_light.docx`` (the file that
+       shipped with v2.0.0 uses a lower-case ``light``);
+    3. case/separator-insensitive prefix match - ``docs/SOP-CLSM.md``,
+       ``docs/SOP CLSM v2.docx`` and similar hand-renamed copies.
+    """
+    docs_dir = Path(docs_dir)
+    if not docs_dir.is_dir():
+        return None
+    stem = canonical_document_stem(doc_kind, modality)
+    suffix = str(suffix).lower()
+    try:
+        entries = sorted(docs_dir.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return None
+    # Directory listing (not a direct ``is_file`` probe) keeps the result
+    # independent of the host filesystem's case sensitivity: on macOS/Windows an
+    # ``is_file()`` call for ``SOP_Light.docx`` would silently succeed against a
+    # shipped ``SOP_light.docx`` and the returned path would not exist on Linux.
+    files = [entry for entry in entries if entry.is_file()]
+    exact_name = f"{stem}{suffix}"
+    for entry in files:
+        if entry.name == exact_name:
+            return entry
+    wanted = exact_name.lower()
+    for entry in files:
+        if entry.name.lower() == wanted:
+            return entry
+    normalized_stem = stem.lower().replace("-", "_").replace(" ", "_")
+    for entry in files:
+        if entry.suffix.lower() != suffix:
+            continue
+        candidate = entry.stem.lower().replace("-", "_").replace(" ", "_")
+        if candidate.startswith(normalized_stem):
+            return entry
+    return None
+
+
+_DOC_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+_LATEX_SYMBOLS: Dict[str, str] = {
+    r"\mu": "µ",
+    r"\times": "×",
+    r"\cdot": "·",
+    r"\pm": "±",
+    r"\leq": "≤",
+    r"\le": "≤",
+    r"\geq": "≥",
+    r"\ge": "≥",
+    r"\approx": "≈",
+    r"\neq": "≠",
+    r"\infty": "∞",
+    r"\sum": "Σ",
+    r"\prod": "Π",
+    r"\sqrt": "√",
+    r"\pi": "π",
+    r"\theta": "θ",
+    r"\phi": "φ",
+    r"\varphi": "φ",
+    r"\sigma": "σ",
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\rho": "ρ",
+    r"\lambda": "λ",
+    r"\eta": "η",
+    r"\Delta": "Δ",
+    r"\Omega": "Ω",
+    r"\Sigma": "Σ",
+    r"\rightarrow": "→",
+    r"\to": "→",
+    r"\partial": "∂",
+    r"\in": "∈",
+    r"\circ": "°",
+    r"\degree": "°",
+    r"\propto": "∝",
+}
+
+
+def latex_to_plain(text: str) -> str:
+    """Flatten native LaTeX into readable Unicode for the Word fallback writer.
+
+    Streamlit renders ``$$ ... $$`` / ``$ ... $`` with KaTeX, but a ``.docx``
+    generated without Microsoft Equation support must stay legible in Word,
+    Pages and Google Docs.  Greek letters and operators become their Unicode
+    equivalents, fractions become ``(a)/(b)`` and grouping braces are dropped.
+    """
+    plain = str(text or "")
+    plain = plain.replace("$$", "").replace("$", "")
+    for command, symbol in _LATEX_SYMBOLS.items():
+        plain = re.sub(re.escape(command) + r"(?![A-Za-z])", symbol, plain)
+    plain = re.sub(r"\\(?:left|right|displaystyle|limits|quad|qquad)(?![A-Za-z])", "", plain)
+    plain = re.sub(r"\\[,;:!]", " ", plain)
+    plain = re.sub(r"\\(?:mathrm|mathbf|mathit|mathsf|text|operatorname)\{([^{}]*)\}", r"\1", plain)
+    plain = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", plain)
+    plain = re.sub(r"\\[A-Za-z]+", "", plain)
+    plain = plain.replace("{", "").replace("}", "")
+    return re.sub(r"[ \t]{2,}", " ", plain).strip()
+
+
+def strip_inline_markdown(text: str) -> str:
+    """Remove inline Markdown/HTML markup so the text is safe in a Word run."""
+    plain = latex_to_plain(str(text or ""))
+    plain = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", plain)
+    plain = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", plain)
+    plain = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", plain)
+    plain = plain.replace("**", "").replace("__", "")
+    plain = re.sub(r"(?<![\w*])[*_]([^*_]+)[*_](?![\w*])", r"\1", plain)
+    plain = re.sub(r"<br\s*/?>", " ", plain, flags=re.IGNORECASE)
+    plain = re.sub(r"<[^>]+>", "", plain)
+    return re.sub(r"[ \t]{2,}", " ", plain).strip()
+
+
+def markdown_blocks(markdown_text: str) -> List[Dict[str, Any]]:
+    """Split Markdown into a flat, Word-writable block list.
+
+    Recognised blocks (the only constructs the bundled documents use):
+
+    ``heading`` (``level`` 1-6), ``bullet`` (``level`` 0-3), ``table``
+    (``rows`` as a list of cell lists), ``code`` (fenced) and ``paragraph``.
+
+    Display equations written as a one-line ``$$ ... $$`` become paragraphs, so
+    they survive in the ``.docx`` as typeset-ready text instead of being lost.
+    """
+    blocks: List[Dict[str, Any]] = []
+    table_rows: List[List[str]] = []
+    in_fence = False
+
+    def flush_table() -> None:
+        if table_rows:
+            blocks.append({"type": "table", "rows": [list(row) for row in table_rows]})
+            table_rows.clear()
+
+    for raw_line in str(markdown_text or "").replace("\r\n", "\n").split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_table()
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            blocks.append({"type": "code", "text": stripped})
+            continue
+        if stripped.startswith("|"):
+            if _DOC_TABLE_SEPARATOR_RE.match(stripped):
+                continue
+            table_rows.append([cell.strip() for cell in stripped.strip("|").split("|")])
+            continue
+        flush_table()
+        if not stripped:
+            continue
+        if len(stripped) >= 3 and set(stripped) <= {"-", "*", "_"}:
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            blocks.append(
+                {
+                    "type": "heading",
+                    "level": len(heading.group(1)),
+                    "text": heading.group(2).strip(),
+                }
+            )
+            continue
+        if stripped.startswith(">"):
+            blocks.append({"type": "paragraph", "text": stripped.lstrip("> ").strip()})
+            continue
+        bullet = re.match(r"^([-*+])\s+(.*)$", stripped)
+        if bullet:
+            indent = len(line) - len(line.lstrip(" "))
+            blocks.append(
+                {
+                    "type": "bullet",
+                    "level": min(indent // 2, 3),
+                    "text": bullet.group(2).strip(),
+                }
+            )
+            continue
+        numbered = re.match(r"^(\d+)[.)]\s+(.*)$", stripped)
+        if numbered:
+            indent = len(line) - len(line.lstrip(" "))
+            blocks.append(
+                {
+                    "type": "bullet",
+                    "level": min(indent // 2, 3),
+                    "text": f"{numbered.group(1)}. {numbered.group(2).strip()}",
+                }
+            )
+            continue
+        blocks.append({"type": "paragraph", "text": stripped})
+    flush_table()
+    return blocks
+
+
+def _docx_paragraph_xml(
+    text: str,
+    style: Optional[str] = None,
+    bold: bool = False,
+    indent_twips: int = 0,
+) -> str:
+    """Build one ``<w:p>`` element (single run) for the OpenXML fallback writer."""
+    properties: List[str] = []
+    if style:
+        properties.append(f'<w:pStyle w:val="{style}"/>')
+    if indent_twips > 0:
+        properties.append(f'<w:ind w:left="{int(indent_twips)}"/>')
+    paragraph_properties = f"<w:pPr>{''.join(properties)}</w:pPr>" if properties else ""
+    cleaned = strip_inline_markdown(text)
+    if not cleaned:
+        return f"<w:p>{paragraph_properties}</w:p>"
+    run_properties = "<w:rPr><w:b/><w:bCs/></w:rPr>" if bold else ""
+    return (
+        f"<w:p>{paragraph_properties}<w:r>{run_properties}"
+        f'<w:t xml:space="preserve">{xml_escape(cleaned)}</w:t></w:r></w:p>'
+    )
+
+
+def _docx_table_xml(rows: List[List[str]], header_bold: bool = True) -> str:
+    """Build a bordered ``<w:tbl>`` with one paragraph per cell."""
+    if not rows:
+        return ""
+    columns = max(len(row) for row in rows) or 1
+    borders = "".join(
+        f'<w:{edge} w:val="single" w:sz="6" w:space="0" w:color="BFBFBF"/>'
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV")
+    )
+    parts: List[str] = [
+        '<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/>'
+        f"<w:tblBorders>{borders}</w:tblBorders></w:tblPr>"
+    ]
+    for row_index, row in enumerate(rows):
+        cells = list(row) + [""] * (columns - len(row))
+        parts.append("<w:tr>")
+        for cell in cells:
+            parts.append(
+                '<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>'
+                + _docx_paragraph_xml(
+                    cell,
+                    style="TableText",
+                    bold=bool(header_bold and row_index == 0),
+                )
+                + "</w:tc>"
+            )
+        parts.append("</w:tr>")
+    parts.append("</w:tbl>")
+    return "".join(parts)
+
+
+def _docx_document_xml(blocks: List[Dict[str, Any]], title: str = "") -> str:
+    """Render a parsed Markdown block list into ``word/document.xml``."""
+    body: List[str] = []
+    # A document whose first block is already the H1 title must not repeat it as
+    # an extra "Title" paragraph (the Markdown is the single source of truth).
+    leading_heading = ""
+    if blocks:
+        first_block = blocks[0]
+        if first_block.get("type") == "heading" and int(first_block.get("level") or 0) == 1:
+            leading_heading = strip_inline_markdown(first_block.get("text", "")).strip()
+    if title and title.strip() != leading_heading:
+        body.append(_docx_paragraph_xml(title, style="Title"))
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "heading":
+            level = min(max(int(block.get("level") or 1), 1), 4)
+            body.append(
+                _docx_paragraph_xml(block.get("text", ""), style=f"Heading{level}")
+            )
+        elif block_type == "bullet":
+            level = int(block.get("level") or 0)
+            marker = "•" if level == 0 else "◦"
+            body.append(
+                _docx_paragraph_xml(
+                    f"{marker} {block.get('text', '')}",
+                    style="ListParagraph",
+                    indent_twips=360 + 360 * level,
+                )
+            )
+        elif block_type == "table":
+            table_xml = _docx_table_xml(block.get("rows") or [])
+            if table_xml:
+                body.append(table_xml)
+                # Word merges two adjacent tables; this spacer keeps them apart.
+                body.append("<w:p/>")
+        elif block_type == "code":
+            body.append(
+                _docx_paragraph_xml(block.get("text", ""), style="CodeBlock")
+            )
+        else:
+            body.append(_docx_paragraph_xml(block.get("text", "")))
+    section_properties = (
+        '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" '
+        'w:header="709" w:footer="709" w:gutter="0"/></w:sectPr>'
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{''.join(body)}{section_properties}</w:body></w:document>"
+    )
+
+
+def _docx_heading_style_xml(
+    style_id: str,
+    name: str,
+    size_half_points: int,
+    spacing_before: int,
+    spacing_after: int,
+) -> str:
+    """Build one Word heading style definition for the fallback ``styles.xml``."""
+    outline_level = max(int(style_id[-1]) - 1, 0)
+    return (
+        f'<w:style w:type="paragraph" w:styleId="{style_id}">'
+        f'<w:name w:val="{name}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>'
+        f'<w:pPr><w:keepNext/><w:spacing w:before="{spacing_before}" w:after="{spacing_after}"/>'
+        f'<w:outlineLvl w:val="{outline_level}"/></w:pPr>'
+        f'<w:rPr><w:b/><w:bCs/><w:sz w:val="{size_half_points}"/>'
+        f'<w:szCs w:val="{size_half_points}"/></w:rPr></w:style>'
+    )
+
+
+def _docx_styles_xml() -> str:
+    """Return a self-contained ``word/styles.xml`` (no numbering part required)."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:docDefaults><w:rPrDefault><w:rPr>"
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>'
+        '<w:sz w:val="21"/><w:szCs w:val="21"/></w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/>'
+        "</w:pPr></w:pPrDefault></w:docDefaults>"
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
+        '<w:name w:val="Normal"/><w:qFormat/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/>'
+        '<w:basedOn w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:after="240"/></w:pPr>'
+        '<w:rPr><w:b/><w:sz w:val="40"/><w:szCs w:val="40"/></w:rPr></w:style>'
+        + _docx_heading_style_xml("Heading1", "heading 1", 32, 240, 120)
+        + _docx_heading_style_xml("Heading2", "heading 2", 28, 220, 100)
+        + _docx_heading_style_xml("Heading3", "heading 3", 24, 200, 80)
+        + _docx_heading_style_xml("Heading4", "heading 4", 22, 180, 60)
+        + '<w:style w:type="paragraph" w:styleId="ListParagraph">'
+        '<w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:qFormat/>'
+        '<w:pPr><w:spacing w:after="40"/></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="TableText">'
+        '<w:name w:val="Table Text"/><w:basedOn w:val="Normal"/>'
+        '<w:pPr><w:spacing w:after="0"/></w:pPr>'
+        '<w:rPr><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="CodeBlock">'
+        '<w:name w:val="Code Block"/><w:basedOn w:val="Normal"/>'
+        '<w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:pPr>'
+        '<w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/>'
+        '<w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr></w:style>'
+        "</w:styles>"
+    )
+
+
+def _docx_core_xml(title: str, author: str = "PhasePix Documentation Hub") -> str:
+    """Build ``docProps/core.xml`` (title, author, creation timestamp)."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"<dc:title>{xml_escape(title)}</dc:title>"
+        f"<dc:creator>{xml_escape(author)}</dc:creator>"
+        f"<cp:lastModifiedBy>{xml_escape(author)}</cp:lastModifiedBy>"
+        f'<dcterms:created xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:created>'
+        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:modified>'
+        "</cp:coreProperties>"
+    )
+
+
+_DOCX_CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+    '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+    '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+    '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+    "</Types>"
+)
+
+_DOCX_ROOT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+    '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+    "</Relationships>"
+)
+
+_DOCX_DOCUMENT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    "</Relationships>"
+)
+
+
+def _docx_app_xml() -> str:
+    """Build ``docProps/app.xml`` (application name shown in Word properties)."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        "<Application>PhasePix Documentation Hub</Application>"
+        "<AppVersion>2.1</AppVersion></Properties>"
+    )
+
+
+def write_minimal_docx(
+    blocks: List[Dict[str, Any]],
+    docx_path: Path,
+    title: str = "",
+    author: str = "PhasePix Documentation Hub",
+) -> Path:
+    """Write a valid, dependency-free ``.docx`` (OpenXML) file from blocks.
+
+    ``python-docx`` is optional in this project (it is deliberately absent from
+    ``requirements.txt`` so the portable Windows bundle stays small), therefore
+    the writer assembles the minimal OpenXML package by hand with ``zipfile``:
+
+    ``[Content_Types].xml``, ``_rels/.rels``, ``docProps/core.xml``,
+    ``docProps/app.xml``, ``word/document.xml``, ``word/styles.xml`` and
+    ``word/_rels/document.xml.rels``.
+
+    The result opens in Word, LibreOffice, Pages and Google Docs with real
+    Heading 1-4 styles, bulleted paragraphs and bordered tables.  The archive is
+    written to a ``.tmp`` sibling and atomically moved into place, so an
+    interrupted run can never leave a corrupt document behind.
+
+    Raises:
+        OSError: If the destination is not writable.
+    """
+    destination = Path(docx_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES_XML)
+            archive.writestr("_rels/.rels", _DOCX_ROOT_RELS_XML)
+            archive.writestr("docProps/core.xml", _docx_core_xml(title, author))
+            archive.writestr("docProps/app.xml", _docx_app_xml())
+            archive.writestr("word/document.xml", _docx_document_xml(blocks, title))
+            archive.writestr("word/styles.xml", _docx_styles_xml())
+            archive.writestr(
+                "word/_rels/document.xml.rels", _DOCX_DOCUMENT_RELS_XML
+            )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return destination
+
+
+def doc_manifest_path(docs_dir: Path = DOCS_DIR) -> Path:
+    """Return the sidecar manifest that tracks auto-generated Word files."""
+    return Path(docs_dir) / DOC_MANIFEST_FILENAME
+
+
+def load_doc_manifest(docs_dir: Path = DOCS_DIR) -> Dict[str, Any]:
+    """Read ``docs/.docx_generation_manifest.json`` (empty dict when absent)."""
+    try:
+        payload = json.loads(doc_manifest_path(docs_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if isinstance(payload, dict) and isinstance(payload.get("documents"), dict):
+        return {
+            str(name): dict(entry)
+            for name, entry in payload["documents"].items()
+            if isinstance(entry, dict)
+        }
+    return {}
+
+
+def save_doc_manifest(documents: Dict[str, Any], docs_dir: Path = DOCS_DIR) -> None:
+    """Persist the auto-generation manifest (best effort, never raises)."""
+    payload = {
+        "generated_by": "PhasePix Documentation Hub",
+        "note": (
+            "Entries list the SHA-256 of every Word file PhasePix generated from "
+            "its Markdown twin. A .docx whose hash differs from the recorded "
+            "value was edited or replaced by a human and is never overwritten."
+        ),
+        "documents": documents,
+    }
+    try:
+        Path(docs_dir).mkdir(parents=True, exist_ok=True)
+        doc_manifest_path(docs_dir).write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def docx_is_user_supplied(
+    docx_path: Path,
+    docs_dir: Optional[Path] = None,
+) -> bool:
+    """Return ``True`` when a ``.docx`` was not produced by the Hub generator.
+
+    A file counts as user-supplied when it has no manifest entry, or when its
+    current SHA-256 differs from the hash recorded at generation time (i.e. the
+    laboratory opened it in Word and saved changes).  Such files are always
+    served verbatim and are never regenerated behind the user's back.
+    """
+    docx_path = Path(docx_path)
+    if not docx_path.is_file():
+        return False
+    docs_dir = Path(docs_dir) if docs_dir is not None else docx_path.parent
+    entry = load_doc_manifest(docs_dir).get(docx_path.name) or {}
+    recorded = str(entry.get("docx_sha256") or "")
+    return recorded != doc_sha256_file(docx_path)
+
+
+def ensure_docx_from_markdown(
+    md_path: Path,
+    docx_path: Path,
+    docs_dir: Optional[Path] = None,
+    title: str = "",
+    force: bool = False,
+    overwrite_user_docx: bool = False,
+) -> Optional[Path]:
+    """Guarantee that a downloadable Word twin of ``md_path`` exists.
+
+    Decision table (``md_path`` exists in every branch):
+
+    ==========================  ==========================================
+    ``docx_path`` state         Action
+    ==========================  ==========================================
+    missing                     generate with :func:`write_minimal_docx`
+    auto-generated and current  return unchanged (no disk writes)
+    auto-generated and stale    regenerate from the Markdown source
+    user-supplied               **never touched** - returned verbatim
+    ==========================  ==========================================
+
+    "Stale" means the Markdown SHA-256 differs from the hash recorded when the
+    Word file was generated, or the ``.docx`` mtime is older than the ``.md``
+    mtime.  "Auto-generated" is decided by
+    :func:`docx_is_user_supplied`, which compares the live file hash with the
+    sidecar manifest - so dropping your own edited ``SOP_*.docx`` into ``docs/``
+    immediately makes it authoritative.
+
+    Args:
+        md_path: Markdown source (``docs/SOP_CLSM.md``).
+        docx_path: Word target (``docs/SOP_CLSM.docx``).
+        docs_dir: Folder that owns the generation manifest; defaults to
+            ``docx_path.parent``.
+        title: Title written into the document properties and as a Title
+            paragraph; defaults to the Markdown's first ``# heading``.
+        force: Regenerate even when the Word file is already current (used by
+            the explicit "Rebuild Word files" action).
+        overwrite_user_docx: Allow replacing a user-supplied Word file. Stays
+            ``False`` unless the user explicitly asks for it.
+
+    Returns:
+        The path of the servable ``.docx``, or ``None`` when neither the
+        Markdown nor an existing Word file is available.
+    """
+    md_path = Path(md_path)
+    docx_path = Path(docx_path)
+    docs_dir = Path(docs_dir) if docs_dir is not None else docx_path.parent
+    if not md_path.is_file():
+        return docx_path if docx_path.is_file() else None
+
+    manifest = load_doc_manifest(docs_dir)
+    entry = dict(manifest.get(docx_path.name) or {})
+    markdown_sha = doc_sha256_file(md_path)
+
+    if docx_path.is_file():
+        user_supplied = docx_is_user_supplied(docx_path, docs_dir)
+        if user_supplied and not overwrite_user_docx:
+            return docx_path
+        if not user_supplied and not force:
+            same_source = str(entry.get("markdown_sha256") or "") == markdown_sha
+            try:
+                newer_than_markdown = (
+                    docx_path.stat().st_mtime >= md_path.stat().st_mtime
+                )
+            except OSError:
+                newer_than_markdown = True
+            if same_source and newer_than_markdown:
+                return docx_path
+
+    try:
+        markdown_text = md_path.read_text(encoding="utf-8")
+        blocks = markdown_blocks(markdown_text)
+        document_title = title or next(
+            (
+                strip_inline_markdown(block.get("text", ""))
+                for block in blocks
+                if block.get("type") == "heading" and int(block.get("level") or 0) == 1
+            ),
+            md_path.stem.replace("_", " "),
+        )
+        write_minimal_docx(blocks, docx_path, title=document_title)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        # A read-only folder, an exotic filesystem or malformed Markdown must not
+        # break the Hub: serve the existing Word file when there is one.
+        return docx_path if docx_path.is_file() else None
+
+    manifest[docx_path.name] = {
+        "markdown": md_path.name,
+        "markdown_sha256": markdown_sha,
+        "docx_sha256": doc_sha256_file(docx_path),
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generator": "phasepix-minimal-openxml/1.0",
+    }
+    save_doc_manifest(manifest, docs_dir)
+    return docx_path
+
+
+def _docx_local_tag(element: Any) -> str:
+    """Return the local (namespace-free) tag name of an lxml/ElementTree node."""
+    tag = getattr(element, "tag", "")
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _docx_paragraph_text(element: Any) -> str:
+    """Collect the visible text of one ``<w:p>`` element."""
+    pieces: List[str] = []
+    for node in element.iter():
+        tag = _docx_local_tag(node)
+        if tag == "t" and node.text:
+            pieces.append(node.text)
+        elif tag == "tab":
+            pieces.append("\t")
+        elif tag in {"br", "cr"}:
+            pieces.append("\n")
+    return "".join(pieces).strip()
+
+
+def _docx_table_rows(element: Any) -> List[List[str]]:
+    """Extract a ``<w:tbl>`` element as a list of rows of cell strings."""
+    rows: List[List[str]] = []
+    for row in element:
+        if _docx_local_tag(row) != "tr":
+            continue
+        cells: List[str] = []
+        for cell in row:
+            if _docx_local_tag(cell) != "tc":
+                continue
+            cell_text = " ".join(
+                _docx_paragraph_text(paragraph)
+                for paragraph in cell
+                if _docx_local_tag(paragraph) == "p"
+            ).strip()
+            cells.append(re.sub(r"\s{2,}", " ", cell_text))
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _docx_blocks_from_python_docx(docx_path: Path) -> Optional[List[Dict[str, Any]]]:
+    """Read ordered body blocks with ``python-docx`` (``None`` when unavailable)."""
+    try:
+        from docx import Document as PythonDocxDocument  # type: ignore
+        from docx.table import Table as PythonDocxTable  # type: ignore
+        from docx.text.paragraph import Paragraph as PythonDocxParagraph  # type: ignore
+    except Exception:
+        return None
+    try:
+        document = PythonDocxDocument(str(docx_path))
+        blocks: List[Dict[str, Any]] = []
+        for child in document.element.body.iterchildren():
+            tag = _docx_local_tag(child)
+            if tag == "p":
+                text = PythonDocxParagraph(child, document).text.strip()
+                if text:
+                    blocks.append({"type": "paragraph", "text": text})
+            elif tag == "tbl":
+                table = PythonDocxTable(child, document)
+                rows = [
+                    [(cell.text or "").strip() for cell in row.cells]
+                    for row in table.rows
+                ]
+                rows = [row for row in rows if any(cell for cell in row)]
+                if rows:
+                    blocks.append({"type": "table", "rows": rows})
+        return blocks or None
+    except Exception:
+        return None
+
+
+def _docx_blocks_from_openxml(docx_path: Path) -> List[Dict[str, Any]]:
+    """Dependency-free ordered reader: ``zipfile`` + ``ElementTree``."""
+    with zipfile.ZipFile(docx_path) as archive:
+        document_xml = archive.read("word/document.xml")
+    root = ElementTree.fromstring(document_xml)
+    body = next((child for child in root if _docx_local_tag(child) == "body"), root)
+    blocks: List[Dict[str, Any]] = []
+    for child in body:
+        tag = _docx_local_tag(child)
+        if tag == "p":
+            text = _docx_paragraph_text(child)
+            if text:
+                blocks.append({"type": "paragraph", "text": text})
+        elif tag == "tbl":
+            rows = _docx_table_rows(child)
+            if rows:
+                blocks.append({"type": "table", "rows": rows})
+    return blocks
+
+
+def extract_docx_content(docx_path: Path) -> Optional[Dict[str, Any]]:
+    """Read paragraphs *and* tables from a Word file, preserving body order.
+
+    ``python-docx`` is used when it is importable (it understands styles and
+    merged cells); otherwise a dependency-free OpenXML reader parses
+    ``word/document.xml`` directly, so a laboratory Word file can always be
+    displayed by the Hub even when the Markdown twin is missing.
+
+    Returns:
+        ``{"blocks": [...], "paragraphs": [...], "tables": [...],
+        "engine": "python-docx" | "openxml"}`` or ``None`` when the file is not
+        a readable ``.docx`` package.
+    """
+    docx_path = Path(docx_path)
+    if not docx_path.is_file():
+        return None
+    blocks = _docx_blocks_from_python_docx(docx_path)
+    engine = "python-docx"
+    if not blocks:
+        try:
+            blocks = _docx_blocks_from_openxml(docx_path)
+        except (OSError, KeyError, ElementTree.ParseError, zipfile.BadZipFile):
+            return None
+        engine = "openxml"
+    paragraphs = [
+        block.get("text", "") for block in blocks if block.get("type") == "paragraph"
+    ]
+    tables = [
+        block.get("rows") or [] for block in blocks if block.get("type") == "table"
+    ]
+    return {
+        "blocks": blocks,
+        "paragraphs": paragraphs,
+        "tables": tables,
+        "engine": engine,
+    }
+
+
+def docx_blocks_to_markdown(
+    blocks: List[Dict[str, Any]],
+    title: str = "",
+    heading: Optional[str] = None,
+) -> str:
+    """Render extracted Word blocks as Markdown for the Hub's on-screen view.
+
+    Used when a user drops a custom ``SOP_*.docx`` / ``Methodology_*.docx`` into
+    ``docs/`` without a Markdown twin: paragraphs become text lines and tables
+    become GitHub-flavoured pipe tables, so nothing is silently hidden.
+    """
+    lines: List[str] = []
+    if heading or title:
+        lines.extend([f"# {heading or title}", ""])
+    for block in blocks:
+        if block.get("type") == "table":
+            rows = [list(row) for row in (block.get("rows") or [])]
+            if not rows:
+                continue
+            width = max(len(row) for row in rows)
+            normalized = [row + [""] * (width - len(row)) for row in rows]
+
+            def escape_cell(value: Any) -> str:
+                return str(value).replace("|", r"\|").replace("\n", " ")
+
+            lines.append("| " + " | ".join(escape_cell(c) for c in normalized[0]) + " |")
+            lines.append("|" + "|".join([" --- "] * width) + "|")
+            for row in normalized[1:]:
+                lines.append("| " + " | ".join(escape_cell(c) for c in row) + " |")
+            lines.append("")
+        else:
+            lines.extend([str(block.get("text", "")), ""])
+    return "\n".join(lines).strip()
+
+
+def documentation_status(
+    doc_kind: str,
+    modality: str,
+    docs_dir: Path = DOCS_DIR,
+) -> Dict[str, Any]:
+    """Describe one ``(kind, modality)`` pair without touching the disk.
+
+    Returns a dictionary with the resolved paths, per-format availability flags,
+    whether the Word file is user-supplied (and therefore authoritative), and
+    whether the Markdown is newer than the Word twin (a rebuild is pending).
+    """
+    docs_dir = Path(docs_dir)
+    kind = normalize_document_kind(doc_kind)
+    modality = normalize_document_modality(modality)
+    stem = f"{kind}_{modality}"
+    markdown_path = find_document_path(kind, modality, ".md", docs_dir)
+    docx_path = find_document_path(kind, modality, ".docx", docs_dir)
+    user_supplied = bool(docx_path) and docx_is_user_supplied(docx_path, docs_dir)
+    rebuild_pending = False
+    if markdown_path and docx_path and not user_supplied:
+        try:
+            rebuild_pending = (
+                markdown_path.stat().st_mtime > docx_path.stat().st_mtime
+            ) or (
+                str(
+                    (load_doc_manifest(docs_dir).get(docx_path.name) or {}).get(
+                        "markdown_sha256"
+                    )
+                    or ""
+                )
+                != doc_sha256_file(markdown_path)
+            )
+        except OSError:
+            rebuild_pending = False
+    elif markdown_path and not docx_path:
+        rebuild_pending = True
+    return {
+        "kind": kind,
+        "modality": modality,
+        "stem": stem,
+        "kind_label": DOC_KIND_LABELS.get(kind, kind),
+        "modality_label": DOC_MODALITY_LABELS.get(modality, modality),
+        "icon": DOC_MODALITY_ICONS.get(modality, "📄"),
+        "markdown_path": markdown_path,
+        "docx_path": docx_path,
+        "has_markdown": markdown_path is not None,
+        "has_docx": docx_path is not None,
+        "docx_is_user_supplied": user_supplied,
+        "rebuild_pending": rebuild_pending,
+        "label": f"{DOC_MODALITY_ICONS.get(modality, '📄')} {kind} · {modality}",
+    }
+
+
+def read_document(
+    doc_kind: str,
+    modality: str,
+    docs_dir: Path = DOCS_DIR,
+    ensure_word: bool = True,
+) -> Dict[str, Any]:
+    """Load one modality document in every format the Hub can offer.
+
+    This is the single entry point the 📚 SOP & Methodology tab and the Sidebar
+    Quick-Help use, so both always show identical content:
+
+    * the Markdown source is returned for live rendering (LaTeX included);
+    * the Word file is (re)generated from that Markdown when it is missing or
+      stale, unless the laboratory supplied its own copy;
+    * when the Markdown twin is absent, the Word file's paragraphs *and* tables
+      are converted to Markdown so the document is still readable on screen;
+    * raw ``.docx`` bytes are returned ready for ``st.download_button``.
+
+    Args:
+        doc_kind: ``"SOP"`` or ``"Methodology"`` (labels/emoji tolerated).
+        modality: ``"SEM"``, ``"Light"`` or ``"CLSM"`` (labels/emoji tolerated).
+        docs_dir: Documentation folder, defaults to :data:`DOCS_DIR`.
+        ensure_word: When ``True`` (default) a missing/stale ``.docx`` is
+            rebuilt so a download is always available.
+
+    Returns:
+        A dictionary with ``markdown``, ``markdown_source`` (``"markdown"`` or
+        ``"docx"``), ``markdown_path``, ``docx_path``, ``docx_bytes``,
+        ``docx_paragraphs``, ``docx_tables``, ``docx_engine``,
+        ``docx_is_user_supplied``, ``has_markdown``, ``has_docx`` and the
+        descriptive ``kind``/``modality``/``label`` fields.
+    """
+    docs_dir = ensure_docs_dir(docs_dir)
+    kind = normalize_document_kind(doc_kind)
+    modality_key = normalize_document_modality(modality)
+    stem = f"{kind}_{modality_key}"
+
+    markdown_path = find_document_path(kind, modality_key, ".md", docs_dir)
+    docx_path = find_document_path(kind, modality_key, ".docx", docs_dir)
+    if docx_path is None and markdown_path is not None:
+        docx_path = docs_dir / f"{stem}.docx"
+
+    if ensure_word and markdown_path is not None and docx_path is not None:
+        resolved = ensure_docx_from_markdown(
+            markdown_path, docx_path, docs_dir=docs_dir
+        )
+        docx_path = resolved or (docx_path if docx_path.is_file() else None)
+
+    markdown_text: Optional[str] = None
+    if markdown_path is not None:
+        try:
+            markdown_text = markdown_path.read_text(encoding="utf-8")
+        except OSError:
+            markdown_text = None
+
+    docx_content = extract_docx_content(docx_path) if docx_path is not None else None
+    markdown_source = "markdown"
+    if not markdown_text and docx_content:
+        markdown_text = docx_blocks_to_markdown(
+            docx_content["blocks"],
+            heading=f"{DOC_KIND_LABELS.get(kind, kind)} · "
+            f"{DOC_MODALITY_LABELS.get(modality_key, modality_key)}",
+        )
+        markdown_source = "docx"
+
+    docx_bytes: Optional[bytes] = None
+    if docx_path is not None and docx_path.is_file():
+        try:
+            docx_bytes = docx_path.read_bytes()
+        except OSError:
+            docx_bytes = None
+
+    return {
+        "kind": kind,
+        "modality": modality_key,
+        "stem": stem,
+        "label": f"{DOC_MODALITY_ICONS.get(modality_key, '📄')} {kind} · {modality_key}",
+        "kind_label": DOC_KIND_LABELS.get(kind, kind),
+        "modality_label": DOC_MODALITY_LABELS.get(modality_key, modality_key),
+        "markdown": markdown_text,
+        "markdown_source": markdown_source,
+        "markdown_path": markdown_path,
+        "docx_path": docx_path if docx_path is not None and docx_path.is_file() else None,
+        "docx_bytes": docx_bytes,
+        "docx_paragraphs": docx_content["paragraphs"] if docx_content else [],
+        "docx_tables": docx_content["tables"] if docx_content else [],
+        "docx_engine": docx_content["engine"] if docx_content else None,
+        "docx_is_user_supplied": bool(docx_path)
+        and docx_is_user_supplied(docx_path, docs_dir),
+        "has_markdown": markdown_path is not None,
+        "has_docx": docx_bytes is not None,
+    }
+
+
+def documentation_inventory(docs_dir: Path = DOCS_DIR) -> List[Dict[str, Any]]:
+    """Return :func:`documentation_status` for all six shipped documents."""
+    ensure_docs_dir(docs_dir)
+    return [
+        documentation_status(kind, modality, docs_dir)
+        for modality in DOC_MODALITIES
+        for kind in DOC_KINDS
+    ]
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")

@@ -57,6 +57,12 @@ Phasepix_code_2.txt
 .phasepix_image_stamp
 Icon_full.ico
 
+# Documentation hub: the Markdown sources and the curated Word files in docs/
+# are tracked deliberately, but the per-machine generation manifest (hashes +
+# timestamps) and interrupted writes are not.
+docs/.docx_generation_manifest.json
+docs/*.docx.tmp
+
 # OS specific
 .DS_Store
 *.rtf
