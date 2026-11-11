@@ -3737,17 +3737,17 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v1.8.8) ----------------
+# ---------------- BUILD IDENTITY (v2.0.1) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v2.0.0"
-PHASEPIX_BUILD_DATE = "2026.11.09"
-PHASEPIX_BUILD_TITLE = "PhasePix 2.0 — Confocal Fluorescence (CLSM) & Silica Cluster Analytics"
+PHASEPIX_BUILD_VERSION = "v2.0.1"
+PHASEPIX_BUILD_DATE = "2026.11.11"
+PHASEPIX_BUILD_TITLE = "PhasePix 2.0.1 — Built-in SOP & Methodology Hub + Auto-Update"
 
 
 # =============================================================================
-# 📚 DOCUMENTATION, SOP & METHODOLOGY HUB (v2.1.0)
+# 📚 DOCUMENTATION, SOP & METHODOLOGY HUB (v2.0.1)
 # =============================================================================
 # The repository ships a ``docs/`` folder that is the *single source of truth*
 # for every laboratory procedure (``SOP_*``) and every equation
@@ -5122,6 +5122,593 @@ render_sop_methodology_dialog = (
     if _SOP_DIALOG_FACTORY is not None
     else None
 )
+
+# Options of the Documentation Hub tab. The exact strings requested by the UI
+# specification are kept verbatim; ``normalize_document_modality`` and
+# ``normalize_document_kind`` map them back onto SEM/Light/CLSM and SOP/Methodology.
+SOP_HUB_MODALITY_OPTIONS: Tuple[str, ...] = (
+    "🔬 SEM Micrograph",
+    "💡 Light Microscopy",
+    "🔦 Confocal Fluorescence",
+)
+SOP_HUB_KIND_OPTIONS: Tuple[str, ...] = (
+    "📋 Standard Operating Procedure (SOP)",
+    "📐 Mathematical Methodology",
+)
+SOP_HUB_PRINTABLE_NOTE = (
+    "MathJax typesets the equations (internet needed on first load); text, "
+    "colour emojis and tables render offline."
+)
+
+
+def _html_escape(value: Any) -> str:
+    """Escape a value for HTML text and attribute context."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _html_inline(text: str) -> str:
+    """Convert inline Markdown to HTML while leaving LaTeX for MathJax.
+
+    Only the constructs used by the bundled documents are handled; ``$ ... $``
+    spans are deliberately untouched so MathJax receives the original source,
+    including ``\\text{}``, ``_{}`` and ``\\frac{}{}``.
+    """
+    escaped = _html_escape(text)
+    escaped = re.sub(
+        r"!\[([^\]]*)\]\(([^)]+)\)",
+        r'<img alt="\1" src="\2" style="max-width:100%">',
+        escaped,
+    )
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def markdown_to_html_fragment(markdown_text: str) -> str:
+    """Render Markdown to an HTML fragment for the printable view.
+
+    Display equations are stashed before block parsing so a multi-line
+    ``$$ ... $$`` stays one MathJax text node; splitting it across ``<p>`` tags
+    is the classic reason printable SOPs show raw dollar signs.
+    """
+    equations: List[str] = []
+
+    def _stash(match: "re.Match[str]") -> str:
+        equations.append(match.group(1).strip())
+        return f"@@PHASEPIX_MATH_{len(equations) - 1}@@"
+
+    stashed = re.sub(
+        r"\$\$(.+?)\$\$", _stash, str(markdown_text or ""), flags=re.DOTALL
+    )
+    html_parts: List[str] = []
+    for block in markdown_blocks(stashed):
+        block_type = block.get("type")
+        if block_type == "heading":
+            level = min(max(int(block.get("level") or 1), 1), 4)
+            html_parts.append(
+                f"<h{level}>{_html_inline(block.get('text', ''))}</h{level}>"
+            )
+        elif block_type == "bullet":
+            indent = 18 * int(block.get("level") or 0)
+            html_parts.append(
+                f'<p class="bullet" style="margin-left:{indent}px">'
+                f"• {_html_inline(block.get('text', ''))}</p>"
+            )
+        elif block_type == "table":
+            rows = [list(row) for row in (block.get("rows") or [])]
+            if not rows:
+                continue
+            header = "".join(f"<th>{_html_inline(cell)}</th>" for cell in rows[0])
+            body = "".join(
+                "<tr>"
+                + "".join(f"<td>{_html_inline(cell)}</td>" for cell in row)
+                + "</tr>"
+                for row in rows[1:]
+            )
+            html_parts.append(
+                f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+            )
+        elif block_type == "code":
+            html_parts.append(
+                f"<pre><code>{_html_escape(block.get('text', ''))}</code></pre>"
+            )
+        else:
+            text = str(block.get("text", ""))
+            math_match = re.fullmatch(r"@@PHASEPIX_MATH_(\d+)@@", text.strip())
+            if math_match:
+                latex = equations[int(math_match.group(1))]
+                html_parts.append(f'<div class="mathblock">$${latex}$$</div>')
+            else:
+                for index, latex in enumerate(equations):
+                    text = text.replace(f"@@PHASEPIX_MATH_{index}@@", f"$${latex}$$")
+                html_parts.append(f"<p>{_html_inline(text)}</p>")
+    return "\n".join(html_parts)
+
+
+    return "\n".join(html_parts)
+
+
+_PRINTABLE_MATHJAX_HEAD = """<script>
+window.MathJax = {
+  tex: { inlineMath: [['$', '$']], displayMath: [['$$', '$$']], processEscapes: true },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+  svg: { fontCache: 'global' }
+};
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+"""
+
+_PRINTABLE_STYLE = """<style>
+  :root { color-scheme: light; }
+  body { margin: 0 auto; max-width: 60rem; padding: 2.2rem 1.6rem 4rem;
+         font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue",
+                      Arial, "Noto Sans", sans-serif;
+         font-size: 15.5px; line-height: 1.55; color: #1f2328; background: #ffffff;
+         font-variant-emoji: emoji; }
+  h1, h2, h3, h4 { line-height: 1.25; margin: 1.6em 0 .5em; }
+  h1 { font-size: 1.9rem; border-bottom: 3px solid #d0d7de; padding-bottom: .4rem; }
+  h2 { font-size: 1.45rem; border-bottom: 1px solid #eaeef2; padding-bottom: .3rem; }
+  h3 { font-size: 1.2rem; }
+  .subtitle { color: #57606a; margin-top: -.4rem; }
+  code { background: #f6f8fa; padding: .12em .35em; border-radius: 4px;
+         font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }
+  pre { background: #f6f8fa; padding: .8rem; border-radius: 6px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95em; }
+  th, td { border: 1px solid #d0d7de; padding: .4rem .55rem; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  .mathblock { margin: 1.1rem 0; overflow-x: auto; }
+  .bullet { margin: .25rem 0; }
+  .toolbar { position: sticky; top: 0; background: #ffffff; padding: .5rem 0;
+             border-bottom: 1px solid #d0d7de; margin-bottom: 1rem; color: #57606a; }
+  @media print { .toolbar { display: none; } body { max-width: none; } }
+</style>
+"""
+
+_PRINTABLE_OPENER_TEMPLATE = """<style>
+  #phasepix-print-open { width: 100%; padding: 0.55rem 0.75rem; border-radius: 0.5rem;
+    border: 1px solid rgba(49, 51, 63, 0.2); background: #ffffff; color: #262730;
+    font: 400 1rem/1.2 "Source Sans Pro", sans-serif; cursor: pointer; }
+  #phasepix-print-open:hover { border-color: #ff4b4b; color: #ff4b4b; }
+  #phasepix-print-hint { margin-top: 4px; font: 12px/1.35 "Source Sans Pro", sans-serif;
+    color: #808495; }
+</style>
+<button id="phasepix-print-open" type="button">__LABEL__</button>
+<div id="phasepix-print-hint"></div>
+<script>
+(function () {
+  var html = __PAYLOAD__;
+  var hint = document.getElementById('phasepix-print-hint');
+  document.getElementById('phasepix-print-open').addEventListener('click', function () {
+    try {
+      var blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var opened = window.open(url, '_blank');
+      if (!opened) {
+        hint.textContent = 'Popup blocked - use the printable HTML download instead.';
+      } else {
+        hint.textContent = 'Opened in a new browser tab.';
+        setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+      }
+    } catch (err) {
+      hint.textContent = 'Could not open a new tab: ' + err;
+    }
+  });
+})();
+</script>
+"""
+
+
+def build_printable_html(
+    markdown_text: str,
+    title: str,
+    subtitle: str = "",
+) -> str:
+    """Build a self-contained, print-ready HTML page with MathJax and emojis."""
+    body = markdown_to_html_fragment(markdown_text)
+    subtitle_html = (
+        f'<p class="subtitle">{_html_escape(subtitle)}</p>' if subtitle else ""
+    )
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{_html_escape(title)}</title>\n"
+        + _PRINTABLE_MATHJAX_HEAD
+        + _PRINTABLE_STYLE
+        + "</head>\n<body>\n"
+        + '<div class="toolbar">🖨️ Press <strong>Ctrl/Cmd + P</strong> to print or '
+        "save as PDF · "
+        + _html_escape(SOP_HUB_PRINTABLE_NOTE)
+        + "</div>\n"
+        + f"<h1>{_html_escape(title)}</h1>\n"
+        + subtitle_html
+        + body
+        + "\n</body>\n</html>\n"
+    )
+
+
+def build_printable_opener_html(
+    printable_html: str,
+    label: str = "🌐 Open Printable View in New Browser Tab",
+) -> str:
+    """Wrap a printable page in a button that opens it in a new browser tab.
+
+    The page is turned into a ``Blob`` at click time (``data:`` URLs are blocked
+    for top-level navigation by modern browsers). Streamlit's component iframe is
+    sandboxed with ``allow-popups`` + ``allow-popups-to-escape-sandbox``, so the
+    new tab opens unsandboxed and MathJax runs normally.
+    """
+    payload = json.dumps(printable_html).replace("</", "<\\/")
+    return (
+        _PRINTABLE_OPENER_TEMPLATE.replace("__LABEL__", _html_escape(label))
+        .replace("__PAYLOAD__", payload)
+    )
+
+
+def split_markdown_sections(markdown_text: str) -> List[Dict[str, Any]]:
+    """Split a document into heading-scoped sections (fenced code aware)."""
+    sections: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {"level": 0, "title": "Document preamble", "lines": []}
+    in_fence = False
+
+    def _finalize(raw: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "level": int(raw["level"]),
+            "title": str(raw["title"]),
+            "text": "\n".join(raw["lines"]).strip(),
+        }
+
+    for line in str(markdown_text or "").replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+        heading = None if in_fence else re.match(r"^(#{1,4})\s+(.+)$", stripped)
+        if heading:
+            if current["lines"]:
+                sections.append(_finalize(current))
+            current = {
+                "level": len(heading.group(1)),
+                "title": heading.group(2).strip(),
+                "lines": [line],
+            }
+        else:
+            current["lines"].append(line)
+    if current["lines"]:
+        sections.append(_finalize(current))
+    return sections
+
+
+def filter_markdown_sections(
+    markdown_text: str,
+    query: str,
+) -> Dict[str, Any]:
+    """Keep only the sections that match ``query`` (title/preamble always kept).
+
+    Returns a dictionary with the filtered ``markdown``, the number of matching
+    sections, the total number of sections and the matching section records (so
+    the caller can render highlighted excerpts).
+    """
+    sections = split_markdown_sections(markdown_text)
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return {
+            "markdown": "\n\n".join(section["text"] for section in sections),
+            "matched": len(sections),
+            "total": len(sections),
+            "sections": sections,
+            "query": "",
+        }
+    matching = [
+        section
+        for section in sections
+        if section["level"] <= 1 or needle in section["text"].casefold()
+    ]
+    return {
+        "markdown": "\n\n".join(section["text"] for section in matching),
+        "matched": len(matching),
+        "total": len(sections),
+        "sections": matching,
+        "query": str(query).strip(),
+    }
+
+
+def extract_latex_equations(markdown_text: str) -> List[Dict[str, str]]:
+    """Collect every display equation (``$$ ... $$``) with its section label."""
+    text = str(markdown_text or "")
+    equations: List[Dict[str, str]] = []
+    seen: set = set()
+    for match in re.finditer(r"\$\$(.+?)\$\$", text, flags=re.DOTALL):
+        latex = match.group(1).strip()
+        if not latex or latex in seen:
+            continue
+        seen.add(latex)
+        headings = list(
+            re.finditer(r"^#{2,4}\s+(.+)$", text[: match.start()], flags=re.MULTILINE)
+        )
+        label = (
+            strip_inline_markdown(headings[-1].group(1)).strip()
+            if headings
+            else "Document"
+        )
+        equations.append({"label": label, "latex": latex})
+    return equations
+
+
+def render_latex_formula_bank(markdown_text: str) -> None:
+    """🧮 Copyable LaTeX & Word Formula Bank (Streamlit's ``st.code`` copies)."""
+    equations = extract_latex_equations(markdown_text)
+    with st.expander("🧮 Copyable LaTeX & Word Formula Bank", expanded=False):
+        st.caption(
+            "Every core equation of this methodology. Use the copy icon of a block "
+            "and paste it into Word (**Insert → Equation**, `Alt+=`), LaTeX or "
+            "Overleaf — no retyping of `\\frac` or `_` subscripts."
+        )
+        if not equations:
+            st.info("This document contains no display equations.")
+            return
+        st.caption(f"{len(equations)} equations · the section each equation belongs to is shown above it.")
+        for index, equation in enumerate(equations, start=1):
+            st.markdown(f"**{index}. {equation['label']}**")
+            st.code(equation["latex"], language="latex")
+
+
+def render_printable_view(document: Dict[str, Any], key_prefix: str) -> None:
+    """🌐 Printable-view button (new browser tab) with an HTML-file fallback."""
+    markdown_text = document.get("markdown") or ""
+    if not markdown_text:
+        st.button(
+            "🌐 Open Printable View in New Browser Tab",
+            disabled=True,
+            use_container_width=True,
+            key=f"{key_prefix}_printable_disabled",
+            help="No document is available for this modality / document type.",
+        )
+        return
+    title = (
+        f"{document.get('kind_label', 'Document')} · {document.get('modality', '')}"
+    ).strip()
+    source_path = document.get("markdown_path") or document.get("docx_path")
+    printable_html = build_printable_html(
+        markdown_text,
+        title=title,
+        subtitle=f"PhasePix {PHASEPIX_BUILD_VERSION} · source: {source_path or 'docs/'}",
+    )
+    components.html(
+        build_printable_opener_html(printable_html),
+        height=72,
+        scrolling=False,
+    )
+    st.download_button(
+        "💾 Save Printable HTML",
+        data=printable_html.encode("utf-8"),
+        file_name=f"{document.get('stem', 'phasepix_document')}_printable.html",
+        mime="text/html",
+        use_container_width=True,
+        key=f"{key_prefix}_printable_download",
+        help="Same page as a file — open it in any browser, or print it to PDF.",
+    )
+
+
+def highlight_section_excerpts(
+    section_text: str,
+    query: str,
+    max_snippets: int = 2,
+    radius: int = 70,
+) -> List[str]:
+    """Return HTML snippets with every ``query`` occurrence wrapped in ``<mark>``."""
+    needle = str(query or "").strip()
+    if not needle:
+        return []
+    haystack = str(section_text or "").replace("\n", " ")
+    lowered = haystack.casefold()
+    needle_lower = needle.casefold()
+    escaped_needle = re.escape(_html_escape(needle))
+    excerpts: List[str] = []
+    start = 0
+    while len(excerpts) < max_snippets:
+        index = lowered.find(needle_lower, start)
+        if index < 0:
+            break
+        left = max(0, index - radius)
+        right = min(len(haystack), index + len(needle) + radius)
+        snippet = _html_escape(haystack[left:right])
+        snippet = re.sub(
+            escaped_needle,
+            lambda match: f"<mark>{match.group(0)}</mark>",
+            snippet,
+            flags=re.IGNORECASE,
+        )
+        excerpts.append(
+            ("…" if left > 0 else "")
+            + snippet
+            + ("…" if right < len(haystack) else "")
+        )
+        start = index + max(len(needle), 1)
+    return excerpts
+
+
+def render_sop_methodology_tab(default_modality: str = "SEM") -> None:
+    """📚 SOP & Methodology tab: modality/type controls, downloads and reader.
+
+    Rendered from the same ``docs/`` files the sidebar serves, so the tab, the
+    modal viewer and the downloadable Word documents can never disagree. It works
+    with **and** without a loaded micrograph, because nothing here depends on
+    segmentation output.
+    """
+    default_key = normalize_document_modality(default_modality)
+    st.subheader("📚 SOP & Methodology")
+    st.caption(
+        "Every procedure and every equation behind PhasePix, rendered from `docs/` — "
+        "the same files the download buttons serve. Available with or without a "
+        "loaded micrograph."
+    )
+
+    modality_col, kind_col, search_col = st.columns([1.15, 1.25, 1.6])
+    with modality_col:
+        default_index = next(
+            (
+                index
+                for index, label in enumerate(SOP_HUB_MODALITY_OPTIONS)
+                if normalize_document_modality(label) == default_key
+            ),
+            0,
+        )
+        modality_label = st.radio(
+            "Modality",
+            options=list(SOP_HUB_MODALITY_OPTIONS),
+            index=default_index,
+            horizontal=True,
+            key="sop_hub_modality_radio",
+            help="Defaults to the modality selected in Sidebar → 0. Imaging Modality.",
+        )
+    with kind_col:
+        kind_label = st.radio(
+            "Document Type",
+            options=list(SOP_HUB_KIND_OPTIONS),
+            index=0,
+            horizontal=True,
+            key="sop_hub_doc_kind_radio",
+        )
+    with search_col:
+        query = st.text_input(
+            "🔍 Filter / Search in Document",
+            value="",
+            placeholder="e.g. D[3,2], Fractal, Watershed, Calibration...",
+            key="sop_hub_search_input",
+            help=(
+                "Keeps only the sections that mention the term and highlights every "
+                "match — the document title is always kept."
+            ),
+        )
+
+    modality_key = normalize_document_modality(modality_label)
+    doc_kind = normalize_document_kind(kind_label)
+    document = read_document(doc_kind, modality_key)
+    markdown_text = document.get("markdown") or ""
+
+    docx_col, markdown_col, printable_col = st.columns([1.05, 1.15, 1.5])
+    with docx_col:
+        docx_path = document.get("docx_path")
+        if document.get("docx_bytes") and docx_path is not None:
+            st.download_button(
+                "📥 Download Word Document (.docx)",
+                data=document["docx_bytes"],
+                file_name=docx_path.name,
+                mime=DOC_DOWNLOAD_MIME,
+                use_container_width=True,
+                key="sop_hub_download_docx",
+                help=(
+                    "Opens in Microsoft Word or LibreOffice — copy formulas and "
+                    "tables straight into a manuscript."
+                ),
+            )
+        else:
+            st.button(
+                "📥 Download Word Document (.docx)",
+                disabled=True,
+                use_container_width=True,
+                key="sop_hub_download_docx",
+                help=f"No Word file is available for {doc_kind} · {modality_key}.",
+            )
+    with markdown_col:
+        markdown_path = document.get("markdown_path")
+        if markdown_text:
+            st.download_button(
+                "📥 Download Markdown / LaTeX Source (.md)",
+                data=markdown_text.encode("utf-8"),
+                file_name=(
+                    markdown_path.name
+                    if markdown_path is not None
+                    else f"{document['stem']}.md"
+                ),
+                mime="text/markdown",
+                use_container_width=True,
+                key="sop_hub_download_markdown",
+                help=(
+                    "Raw Markdown with the original LaTeX — ideal for Overleaf or a "
+                    "LaTeX manuscript."
+                ),
+            )
+        else:
+            st.button(
+                "📥 Download Markdown / LaTeX Source (.md)",
+                disabled=True,
+                use_container_width=True,
+                key="sop_hub_download_markdown",
+                help="Only a Word file was supplied for this document.",
+            )
+    with printable_col:
+        render_printable_view(document, "sop_hub")
+
+    st.divider()
+
+    # ---------------- Reader area ----------------
+    if not markdown_text:
+        st.warning(
+            f"⚠️ No **{doc_kind}** document is available for **{modality_key}**. Add "
+            f"`docs/{canonical_document_stem(doc_kind, modality_key)}.md` (or the "
+            "matching `.docx`) and reload this tab."
+        )
+        return
+
+    filtered = filter_markdown_sections(markdown_text, query)
+    matching_content = [
+        section for section in filtered["sections"] if int(section["level"]) > 1
+    ]
+    st.caption(
+        f"📄 **{document.get('kind_label', doc_kind)}** · "
+        f"{document.get('modality_label', modality_key)} · "
+        f"{len(markdown_text):,} characters · equations typeset with KaTeX"
+    )
+
+    if filtered["query"]:
+        st.caption(
+            f"🔍 **{len(matching_content)} matching section(s)** for "
+            f"“{filtered['query']}” out of {filtered['total']} — the document title is "
+            "always kept, so the heading above the matches stays in context."
+        )
+        if matching_content:
+            with st.expander("🔍 Highlighted matches", expanded=True):
+                for section in matching_content:
+                    st.markdown(f"**{section['title']}**")
+                    for excerpt in highlight_section_excerpts(
+                        section["text"], filtered["query"]
+                    ):
+                        st.markdown(
+                            '<div style="margin:0 0 .35rem 0;color:#4a4a4a">'
+                            f"{excerpt}</div>",
+                            unsafe_allow_html=True,
+                        )
+        else:
+            st.info(
+                "No section mentions that term — showing the complete document instead."
+            )
+
+    if filtered["query"] and matching_content:
+        st.markdown(filtered["markdown"])
+    else:
+        st.markdown(markdown_text)
+
+    if doc_kind == "Methodology":
+        render_latex_formula_bank(markdown_text)
+
+    st.caption(
+        f"📄 Markdown: `{document.get('markdown_path') or '—'}` · Word: "
+        f"`{document.get('docx_path') or '—'}` · "
+        + (
+            "user-supplied Word file (authoritative, never regenerated)"
+            if document.get("docx_is_user_supplied")
+            else "PhasePix Word file"
+        )
+    )
 
 
 @st.cache_data(show_spinner="Running Cellpose AI segmentation...")
@@ -8628,7 +9215,7 @@ with st.sidebar:
         with col_sb3:
             sb_thick = st.slider("Thickness", min_value=1, max_value=10, value=3)
 
-    # ── ❓ Quick SOP, Docs & Updates (Documentation Hub entry point, v2.1.0) ──
+    # ── ❓ Quick SOP, Docs & Updates (Documentation Hub entry point, v2.0.1) ──
     # Deliberately the LAST sidebar block: it is reachable from every tab and it
     # always reflects the modality selected in Section 0.  The two download
     # buttons serve the curated Word files from ``docs/`` (a missing or stale one
@@ -8707,6 +9294,11 @@ else:
 
 if image_bytes is None:
     st.info("👆 Please select an image from the 'images/' folder or upload one via the sidebar to begin analysis.")
+    # The Documentation Hub needs no segmentation data, so it stays fully usable
+    # before any micrograph is selected: the reader, the downloads and the LaTeX
+    # formula bank are rendered directly here (they also live in their own tab
+    # once an image is loaded).
+    render_sop_methodology_tab(imaging_mode)
 else:
     clean_stem = Path(image_name).stem
 
@@ -10015,6 +10607,9 @@ else:
         "🛡️ Interfacial Analytics",
         "🍇 Cluster & Coalescence Analytics",
         "💾 Reproducibility & Export",
+        # Documentation Hub — always available (never filtered out below), so the
+        # SOP / Methodology library can be opened at any point of an analysis.
+        SOP_HUB_TAB_LABEL,
     ]
     if is_light_mode or is_clsm_mode:
         # Single-phase Light / CLSM acquisitions contain no air bubbles, so the
@@ -13435,3 +14030,9 @@ div[data-testid="stVerticalBlock"] > div:has(div.sticky-toolbar-marker) {
                 use_container_width=True,
                 help="Exports original micrograph and 3 specialized 16-bit TIFF mask variants (combined fat-on-top, air-only, fat-only) for Cellpose retraining.",
             )
+
+    elif active_tab == SOP_HUB_TAB_LABEL:
+        # 📚 SOP & Methodology — documentation only, independent of the analysis
+        # state. ``imaging_mode`` pre-selects the modality so the Hub opens on the
+        # procedure the operator is actually running.
+        render_sop_methodology_tab(imaging_mode)
