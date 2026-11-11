@@ -50,6 +50,240 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.ndimage import binary_fill_holes, find_objects
 
+
+# =============================================================================
+# 🔄 ZERO-TOUCH AUTO-UPDATE ON BOOT (v2.0.2)
+# =============================================================================
+# Lab PCs are distributed on a USB stick and started from a shortcut, so nobody
+# may ever be asked to open a terminal.  This block runs BEFORE the heavy
+# application modules (``cellpose_model``, ``analyzer``, ``visualizer``) are
+# imported: when an update is applied the script reruns and imports the *new*
+# files, so a single launch moves the whole installation forward.
+#
+# Rules that make it safe to run unattended:
+#   * it only ever fast-forwards - a checkout with local commits, or with
+#     modifications to TRACKED files, is left completely untouched;
+#   * ``origin/main`` must be a descendant of ``HEAD`` (``merge-base
+#     --is-ancestor``), so ``reset --hard`` can never destroy anyone's work;
+#   * ``git fetch`` gets a hard 6 s timeout, so an offline laptop just starts;
+#   * locally saved ``*_presets.json`` recipes are parked in memory and written
+#     back after the reset, so no calibration is ever lost;
+#   * the whole thing is wrapped in ``st.cache_resource`` - it executes exactly
+#     once per Streamlit server process, not on every rerun;
+#   * ``PHASEPIX_DISABLE_AUTO_UPDATE=1`` switches it off entirely.
+APP_REPO_DIR = Path(__file__).resolve().parent
+AUTO_UPDATE_TIMEOUT_S = 6
+AUTO_UPDATE_PRESET_PATTERNS: Tuple[str, ...] = ("*_presets.json",)
+
+
+def _find_git_binary(repo_dir: Path) -> Optional[str]:
+    """Return the git executable: portable bundle first, then ``PATH``."""
+    repo_dir = Path(repo_dir)
+    for relative in (
+        "../git/cmd/git.exe",  # PhasePix_Portable layout (app/ + git/cmd/)
+        "../git/cmd/git",
+        "../git/bin/git.exe",
+        "../git/bin/git",
+    ):
+        candidate = (repo_dir / relative).resolve()
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("git")
+
+
+def _build_version_on_disk(repo_dir: Path) -> str:
+    """Read ``PHASEPIX_BUILD_VERSION`` from the ``app.py`` currently on disk."""
+    try:
+        source = (Path(repo_dir) / "app.py").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    match = re.search(r'PHASEPIX_BUILD_VERSION\s*=\s*"([^"]+)"', source)
+    return match.group(1) if match else ""
+
+
+def _format_auto_update_result(result: Dict[str, Any]) -> str:
+    """One-line human summary of the boot update, for the server log."""
+    return (
+        f"[PhasePix] boot auto-update: status={result.get('status')} "
+        f"{result.get('from_version') or '?'} -> {result.get('to_version') or '?'}"
+        f" | presets kept: {', '.join(result.get('preserved') or []) or 'none'}"
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _auto_self_update_on_boot(
+    repo_dir: str,
+    timeout_seconds: int = AUTO_UPDATE_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Silently fast-forward this checkout to ``origin/main`` (once per process).
+
+    Args:
+        repo_dir: Repository root (``app.py``'s folder) as a string, because
+            ``st.cache_resource`` hashes the arguments.
+        timeout_seconds: Hard limit for every git subprocess (default 6 s), so an
+            offline or throttled PC never hangs on startup.
+
+    Returns:
+        A dictionary with ``status`` (``"updated"``, ``"up-to-date"``,
+        ``"offline"``, ``"diverged"``, ``"dirty-worktree"``, ``"detached-head"``,
+        ``"not-a-repository"``, ``"git-missing"``, ``"reset-failed"``,
+        ``"disabled"`` or ``"skipped"``), ``updated``, ``branch``,
+        ``from_version``, ``to_version``, ``preserved`` and ``detail``.
+    """
+    result: Dict[str, Any] = {
+        "status": "skipped",
+        "updated": False,
+        "repo_dir": str(repo_dir),
+        "branch": "",
+        "from_version": "",
+        "to_version": "",
+        "preserved": [],
+        "detail": "",
+    }
+    if str(os.environ.get("PHASEPIX_DISABLE_AUTO_UPDATE", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        result["status"] = "disabled"
+        return result
+
+    repo = Path(repo_dir)
+    if not (repo / ".git").exists():
+        result["status"] = "not-a-repository"
+        return result
+    git_exe = _find_git_binary(repo)
+    if git_exe is None:
+        result["status"] = "git-missing"
+        return result
+
+    def _git(args: List[str]) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(
+                [git_exe, "-c", "safe.directory=*", *args],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    def _out(completed: Optional[subprocess.CompletedProcess]) -> str:
+        if completed is None or completed.returncode != 0:
+            return ""
+        return (completed.stdout or "").strip()
+
+    probe = _git(["rev-parse", "--is-inside-work-tree"])
+    if _out(probe).lower() != "true":
+        result["status"] = "not-a-repository"
+        result["detail"] = (
+            (probe.stderr or "") if probe is not None else ""
+        ).strip()[:400]
+        return result
+
+    branch = _out(_git(["rev-parse", "--abbrev-ref", "HEAD"]))
+    result["branch"] = branch
+    if branch in ("", "HEAD"):
+        result["status"] = "detached-head"
+        return result
+
+    result["from_version"] = _build_version_on_disk(repo)
+
+    # Untracked files (presets, model weights, micrographs) must never block:
+    # only modifications to TRACKED files mean "somebody is editing this checkout".
+    dirty = _out(_git(["status", "--porcelain", "--untracked-files=no"]))
+    if dirty:
+        result["status"] = "dirty-worktree"
+        result["detail"] = dirty[:400]
+        return result
+
+    fetch = _git(["fetch", "--quiet", "origin", "main"])
+    if fetch is None or fetch.returncode != 0:
+        result["status"] = "offline"
+        return result
+
+    local_head = _out(_git(["rev-parse", "HEAD"]))
+    remote_head = _out(_git(["rev-parse", "origin/main"])) or _out(
+        _git(["rev-parse", "FETCH_HEAD"])
+    )
+    if not local_head or not remote_head or local_head == remote_head:
+        result["status"] = "up-to-date"
+        result["to_version"] = result["from_version"]
+        return result
+
+    ancestor = _git(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+    if ancestor is None or ancestor.returncode != 0:
+        result["status"] = "diverged"
+        result["detail"] = (
+            "origin/main is not a fast-forward of HEAD (local commits). "
+            "Use the sidebar 🔄 button after committing."
+        )
+        return result
+
+    # Park every locally saved preset/calibration file (the app rewrites them).
+    preserved: Dict[str, bytes] = {}
+    for pattern in AUTO_UPDATE_PRESET_PATTERNS:
+        for candidate in sorted(repo.glob(pattern)):
+            if not candidate.is_file():
+                continue
+            try:
+                preserved[candidate.name] = candidate.read_bytes()
+            except OSError:
+                continue
+
+    reset = _git(["reset", "--hard", "origin/main"])
+    if reset is None or reset.returncode != 0:
+        result["status"] = "reset-failed"
+        result["detail"] = (
+            (reset.stderr or "") if reset is not None else ""
+        ).strip()[:400]
+        return result
+
+    restored: List[str] = []
+    for name, payload in preserved.items():
+        try:
+            (repo / name).write_bytes(payload)
+            restored.append(name)
+        except OSError:
+            continue
+
+    result.update(
+        {
+            "status": "updated",
+            "updated": True,
+            "to_version": _build_version_on_disk(repo),
+            "preserved": restored,
+        }
+    )
+    return result
+
+
+# Executed once per server process, before the heavy modules are imported.
+AUTO_UPDATE_RESULT: Dict[str, Any] = _auto_self_update_on_boot(str(APP_REPO_DIR))
+print(_format_auto_update_result(AUTO_UPDATE_RESULT), flush=True)
+if AUTO_UPDATE_RESULT.get("updated"):
+    _auto_update_from = str(AUTO_UPDATE_RESULT.get("from_version") or "previous build")
+    _auto_update_to = str(AUTO_UPDATE_RESULT.get("to_version") or "latest build")
+    # Drop every cached artefact of the previous build and re-execute this very
+    # script from disk, so the running session immediately uses the new code.
+    st.cache_data.clear()
+    try:
+        st.cache_resource.clear()
+    except Exception:  # noqa: BLE001 - cache clearing must never block the boot
+        pass
+    try:
+        st.session_state["_auto_update_notice"] = (
+            f"🔄 **PhasePix updated itself on startup:** {_auto_update_from} → "
+            f"**{_auto_update_to}**. No restart and no terminal were needed."
+        )
+    except Exception:  # noqa: BLE001 - the notice must never block the rerun
+        pass
+    st.rerun()
+
+
 # Internal application modules
 from cellpose_model import get_cellpose_model, run_inference, get_device, detect_hardware, cached_segment_air_bubbles_auto, cached_segment_fat_in_bubbles_deepscan, cached_segment_crystallized_multiscale, cached_segment_clsm_microspheres, smooth_internal_crystals, to_grayscale_2d
 from analyzer import (
@@ -3737,13 +3971,13 @@ st.set_page_config(
 )
 
 
-# ---------------- BUILD IDENTITY (v2.0.1) ----------------
+# ---------------- BUILD IDENTITY (v2.0.2) ----------------
 # One source of truth for the sidebar build badge *and* the exported session manifest,
 # so a manuscript can always be traced back to the exact PhasePix build that produced
 # its numbers (together with the source-image SHA-256 recorded in Tab 4).
-PHASEPIX_BUILD_VERSION = "v2.0.1"
+PHASEPIX_BUILD_VERSION = "v2.0.2"
 PHASEPIX_BUILD_DATE = "2026.11.11"
-PHASEPIX_BUILD_TITLE = "PhasePix 2.0.1 — Built-in SOP & Methodology Hub + Auto-Update"
+PHASEPIX_BUILD_TITLE = "PhasePix 2.0.2 — Zero-Touch Auto-Update & Preset Protection"
 
 
 # =============================================================================
@@ -4864,16 +5098,6 @@ GIT_PRESERVED_FILES: Tuple[str, ...] = (
     "parameter_presets.json",
     "light_calibration_presets.json",
 )
-
-
-def _build_version_on_disk(repo: Path) -> str:
-    """Read ``PHASEPIX_BUILD_VERSION`` from the app.py that is on disk right now."""
-    try:
-        source = (Path(repo) / "app.py").read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return ""
-    match = re.search(r'PHASEPIX_BUILD_VERSION\s*=\s*"([^"]+)"', source)
-    return match.group(1) if match else ""
 
 
 def run_git_pull(
@@ -9418,6 +9642,12 @@ with st.sidebar:
     # USB-drive copy of the project from ``origin/main``.
     st.divider()
     quick_docs_status = st.empty()
+    # One-shot confirmation that the zero-touch boot updater moved this PC to a
+    # newer build (set by the startup block, consumed exactly once here).
+    auto_update_notice = st.session_state.pop("_auto_update_notice", None)
+    if auto_update_notice:
+        with quick_docs_status.container():
+            st.success(auto_update_notice)
     pending_git_report = st.session_state.pop("_git_pull_report", None)
     if pending_git_report:
         with quick_docs_status.container():

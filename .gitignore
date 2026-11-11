@@ -66,6 +66,15 @@ docs/*.docx.tmp
 # Temporary backups written by the one-click updater while presets are parked
 *.upd
 
+# Local calibration / parameter recipes. app.py seeds every one of them from its
+# built-in defaults (default_parameter_presets, DEFAULT_LIGHT_OBJECTIVES,
+# DEFAULT_CLSM_OBJECTIVES), so they are NOT version-controlled: a lab PC's saved
+# presets can therefore never block a `git pull` / `reset` and are never
+# overwritten by an update.
+parameter_presets.json
+light_calibration_presets.json
+clsm_calibration_presets.json
+
 # OS specific
 .DS_Store
 *.rtf

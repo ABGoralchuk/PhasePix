@@ -46,17 +46,18 @@ if not exist "%APP_DIR%\.git" goto :no_git
 cd /d "%APP_DIR%"
 if exist "parameter_presets.json" copy /y "parameter_presets.json" "parameter_presets.json.tmp" >nul 2>&1
 if exist "light_calibration_presets.json" copy /y "light_calibration_presets.json" "light_calibration_presets.json.tmp" >nul 2>&1
+if exist "clsm_calibration_presets.json" copy /y "clsm_calibration_presets.json" "clsm_calibration_presets.json.tmp" >nul 2>&1
 
 rem A stalled connection aborts after 60 s of no data instead of hanging the launch.
-"%GIT_EXE%" -c safe.directory="%APP_DIR%" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=60 fetch --all --quiet
+"%GIT_EXE%" -c safe.directory="%APP_DIR%" -c safe.directory="%CD%" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=60 fetch --all --quiet
 if errorlevel 1 goto :offline
 
-"%GIT_EXE%" -c safe.directory="%APP_DIR%" reset --hard origin/main >nul 2>&1
+"%GIT_EXE%" -c safe.directory="%APP_DIR%" -c safe.directory="%CD%" reset --hard origin/main >nul 2>&1
 if errorlevel 1 goto :try_master
 goto :restore_presets
 
 :try_master
-"%GIT_EXE%" -c safe.directory="%APP_DIR%" reset --hard origin/master >nul 2>&1
+"%GIT_EXE%" -c safe.directory="%APP_DIR%" -c safe.directory="%CD%" reset --hard origin/master >nul 2>&1
 if errorlevel 1 goto :update_failed
 
 :restore_presets
@@ -65,13 +66,18 @@ copy /y "parameter_presets.json.tmp" "parameter_presets.json" >nul 2>&1
 del /q "parameter_presets.json.tmp" >nul 2>&1
 
 :restore_light
-if not exist "light_calibration_presets.json.tmp" goto :updated
+if not exist "light_calibration_presets.json.tmp" goto :restore_clsm
 copy /y "light_calibration_presets.json.tmp" "light_calibration_presets.json" >nul 2>&1
 del /q "light_calibration_presets.json.tmp" >nul 2>&1
 
+:restore_clsm
+if not exist "clsm_calibration_presets.json.tmp" goto :updated
+copy /y "clsm_calibration_presets.json.tmp" "clsm_calibration_presets.json" >nul 2>&1
+del /q "clsm_calibration_presets.json.tmp" >nul 2>&1
+
 :updated
 echo Code synchronised with GitHub:
-"%GIT_EXE%" log -1 --oneline 2>nul
+"%GIT_EXE%" -c safe.directory="%APP_DIR%" -c safe.directory="%CD%" log -1 --oneline 2>nul
 goto :req_check
 
 :offline
@@ -93,9 +99,14 @@ copy /y "parameter_presets.json.tmp" "parameter_presets.json" >nul 2>&1
 del /q "parameter_presets.json.tmp" >nul 2>&1
 
 :restore_light_offline
-if not exist "light_calibration_presets.json.tmp" goto :req_check
+if not exist "light_calibration_presets.json.tmp" goto :restore_clsm_offline
 copy /y "light_calibration_presets.json.tmp" "light_calibration_presets.json" >nul 2>&1
 del /q "light_calibration_presets.json.tmp" >nul 2>&1
+
+:restore_clsm_offline
+if not exist "clsm_calibration_presets.json.tmp" goto :req_check
+copy /y "clsm_calibration_presets.json.tmp" "clsm_calibration_presets.json" >nul 2>&1
+del /q "clsm_calibration_presets.json.tmp" >nul 2>&1
 goto :req_check
 
 :no_git
@@ -133,7 +144,13 @@ echo [3/3] Starting PhasePix...
 echo The dashboard opens automatically at http://localhost:8501
 echo Keep this window open while you work. Press Ctrl+C to stop.
 echo.
-"%PY_EXE%" -m streamlit run app.py --server.port=8501 --browser.gatherUsageStats=false
+
+rem A stale server from a previous session would keep serving the OLD code
+rem (the classic "PhasePix did not update" symptom), so port 8501 is freed first.
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING"') do taskkill /f /pid %%P >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+
+"%PY_EXE%" -m streamlit run app.py --server.port=8501 --server.headless=false --browser.gatherUsageStats=false
 if errorlevel 1 goto :run_failed
 
 echo.
